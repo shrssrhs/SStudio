@@ -1,0 +1,3 @@
+ursina
+PySide6>=6.7
+websockets>=16,<18

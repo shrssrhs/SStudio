@@ -1,0 +1,474 @@
+{
+  "format": "nebula-scene",
+  "version": 1,
+  "objects": [
+    {
+      "name": "Camera",
+      "object_type": "Camera",
+      "parent": "Workspace",
+      "id": "09887407671c499a9400cc0e57a3723d",
+      "position": {
+        "x": 18,
+        "y": 18,
+        "z": 24
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 4.0,
+        "y": 4.0,
+        "z": 4.0
+      },
+      "color": "#a3a3a6",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": false,
+      "can_collide": false,
+      "cast_shadow": false,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "Terrain",
+      "object_type": "Terrain",
+      "parent": "Workspace",
+      "id": "4e3a4f11faa64d7b8cd7577db9506b90",
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 128,
+        "y": 1,
+        "z": 128
+      },
+      "color": "#a9b5a4",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": true,
+      "can_collide": true,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "Lighting",
+      "object_type": "Lighting",
+      "parent": "Workspace",
+      "id": "cc954594583d4e66bd32a6bb12ef7269",
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 4.0,
+        "y": 4.0,
+        "z": 4.0
+      },
+      "color": "#a3a3a6",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": false,
+      "can_collide": false,
+      "cast_shadow": false,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "GreyBlock_A",
+      "object_type": "Model",
+      "parent": "Models",
+      "id": "8199c0ea973143a7a11806ead3e5f51f",
+      "position": {
+        "x": -14,
+        "y": 3,
+        "z": -4
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 5,
+        "y": 8,
+        "z": 5
+      },
+      "color": "#b7b8bb",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": true,
+      "can_collide": true,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "GreyBlock_B",
+      "object_type": "Part",
+      "parent": "Models/GreyBlock_B",
+      "id": "a4e8c1ca964d4849a363cef925580d5f",
+      "position": {
+        "x": 12,
+        "y": 4,
+        "z": -8
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 4,
+        "y": 6,
+        "z": 2
+      },
+      "color": "#a3a3a6",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": false,
+      "can_collide": true,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "GreyBlock_C",
+      "object_type": "Part",
+      "parent": "Models/GreyBlock_C",
+      "id": "930177a358f44b159b6a4ff0b7589823",
+      "position": {
+        "x": 0,
+        "y": 4,
+        "z": 4
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 8.0,
+        "y": 9.0,
+        "z": 6
+      },
+      "color": "#c0c1c4",
+      "material": "Plastic",
+      "transparency": 0.5,
+      "reflectance": 1.0,
+      "anchored": true,
+      "can_collide": true,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "PinkMarker_1",
+      "object_type": "Part",
+      "parent": "PinkMarkers",
+      "id": "e5521f75d13d4f7fb0bc40fc3c1c611d",
+      "position": {
+        "x": -6,
+        "y": 2,
+        "z": 1
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 2,
+        "y": 2,
+        "z": 2
+      },
+      "color": "#e8a6aa",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": true,
+      "can_collide": true,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "PinkMarker_2",
+      "object_type": "Part",
+      "parent": "PinkMarkers",
+      "id": "836786be7b474dbf9422858eb71a34ca",
+      "position": {
+        "x": -3,
+        "y": 5,
+        "z": 0
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 2,
+        "y": 2,
+        "z": 2
+      },
+      "color": "#e8a6aa",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": true,
+      "can_collide": true,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "PinkMarker_3",
+      "object_type": "Part",
+      "parent": "PinkMarkers",
+      "id": "2aa84af1740c4eefb621899b4dff4cca",
+      "position": {
+        "x": -8,
+        "y": 6,
+        "z": -3
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 2,
+        "y": 2,
+        "z": 2
+      },
+      "color": "#e8a6aa",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": true,
+      "can_collide": true,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "Baseplate",
+      "object_type": "Baseplate",
+      "parent": "Workspace",
+      "id": "4bb44598dcd24557918465a8d5f76820",
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 128,
+        "y": 1,
+        "z": 128
+      },
+      "color": "#adb6aa",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": true,
+      "can_collide": true,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "Mesh",
+      "object_type": "Mesh",
+      "parent": "Workspace",
+      "id": "978e932c9b1e4533b1b40df906ccf1b6",
+      "position": {
+        "x": 0,
+        "y": 4,
+        "z": 0
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 5,
+        "y": 5,
+        "z": 5
+      },
+      "color": "#8fb8c9",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": false,
+      "can_collide": true,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "UI",
+      "object_type": "UI",
+      "parent": "Workspace",
+      "id": "c5bd8be3731a4ddc8ce482b1f8f90a50",
+      "position": {
+        "x": 0,
+        "y": 4,
+        "z": 0
+      },
+      "rotation": {
+        "x": 4.5,
+        "y": 0.8,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 6,
+        "y": 3,
+        "z": 0.2
+      },
+      "color": "#dd0700",
+      "material": "Neon",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": false,
+      "can_collide": false,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    },
+    {
+      "name": "Part",
+      "object_type": "Part",
+      "parent": "Workspace",
+      "id": "a29999ef15d24c14913e05dc6b2f5146",
+      "position": {
+        "x": 0,
+        "y": 4,
+        "z": 0
+      },
+      "rotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "scale": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "size": {
+        "x": 4,
+        "y": 4,
+        "z": 4
+      },
+      "color": "#a3a3a6",
+      "material": "Plastic",
+      "transparency": 0.0,
+      "reflectance": 0.0,
+      "anchored": false,
+      "can_collide": true,
+      "cast_shadow": true,
+      "locked": false,
+      "tags": [],
+      "attributes": {}
+    }
+  ]
+}

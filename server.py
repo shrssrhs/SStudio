@@ -1,0 +1,568 @@
+import asyncio
+import json
+import logging
+import secrets
+from typing import Any
+
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
+
+from shared import object_registry, protocol
+from shared.instance import (
+    DEFAULT_PART_PROPERTIES,
+    Instance,
+    destroy_cascade,
+    sanitize_part_properties,
+    serialize_world,
+)
+
+PART_LIKE_TYPES = ("Part", "SpawnPoint")
+
+
+HOST = "0.0.0.0"
+PORT = 8765
+TICK_RATE = 20
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+clients: dict[str, ServerConnection] = {}
+players: dict[str, dict[str, Any]] = {}
+
+# Источник правды о построенном мире. Ключ — Instance.id.
+# Клиенты никогда не хранят "оригинал" — только то, что им прислал сервер.
+world: dict[str, Instance] = {}
+
+state_lock = asyncio.Lock()
+
+
+def create_player(player_id: str) -> dict[str, Any]:
+    spawn_index = len(players)
+
+    return {
+        "id": player_id,
+        "name": f"Player-{player_id[:4]}",
+        "position": [
+            float((spawn_index % 4) * 3),
+            3.0,
+            float((spawn_index // 4) * 3),
+        ],
+        "rotation_y": 0.0,
+        "rotation_x": 0.0,
+    }
+
+
+def is_valid_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and -100_000 <= float(value) <= 100_000
+    )
+
+
+def validate_transform_message(
+    message: dict[str, Any],
+) -> bool:
+    position = message.get("position")
+    rotation_y = message.get("rotation_y")
+    rotation_x = message.get("rotation_x", 0.0)
+
+    if not isinstance(position, list):
+        return False
+
+    if len(position) != 3:
+        return False
+
+    if not all(
+        is_valid_number(value)
+        for value in position
+    ):
+        return False
+
+    if not is_valid_number(rotation_y):
+        return False
+
+    if not is_valid_number(rotation_x):
+        return False
+
+    return True
+
+
+async def send_json(
+    websocket: ServerConnection,
+    payload: dict[str, Any],
+) -> bool:
+    try:
+        await websocket.send(
+            json.dumps(payload)
+        )
+        return True
+
+    except ConnectionClosed:
+        return False
+
+    except Exception:
+        logging.exception(
+            "Ошибка отправки сообщения"
+        )
+        return False
+
+
+async def broadcast_to_all(payload: dict[str, Any]) -> None:
+    """
+    Рассылает payload всем подключённым клиентам. В отличие от
+    broadcast_world_state (который шлёт позиции игроков по тик-рейту),
+    это разовая рассылка события — используется для part_created/
+    part_updated/part_deleted, которые должны прийти сразу, а не ждать
+    следующего тика.
+    """
+
+    async with state_lock:
+        connections = list(clients.items())
+
+    for player_id, websocket in connections:
+        await send_json(websocket, payload)
+
+
+async def broadcast_world_state() -> None:
+    while True:
+        await asyncio.sleep(1 / TICK_RATE)
+
+        async with state_lock:
+            if not clients:
+                continue
+
+            payload = {
+                "type": "world_state",
+                "players": players,
+            }
+
+            connections = list(
+                clients.items()
+            )
+
+        encoded_payload = json.dumps(payload)
+
+        disconnected_ids: list[str] = []
+
+        for player_id, websocket in connections:
+            try:
+                await websocket.send(
+                    encoded_payload
+                )
+
+            except ConnectionClosed:
+                disconnected_ids.append(
+                    player_id
+                )
+
+            except Exception:
+                logging.exception(
+                    "Не удалось отправить состояние игроку %s",
+                    player_id,
+                )
+
+                disconnected_ids.append(
+                    player_id
+                )
+
+        if disconnected_ids:
+            async with state_lock:
+                for player_id in disconnected_ids:
+                    clients.pop(
+                        player_id,
+                        None,
+                    )
+
+                    players.pop(
+                        player_id,
+                        None,
+                    )
+
+
+async def handle_message(
+    player_id: str,
+    message: dict[str, Any],
+) -> None:
+    message_type = message.get("type")
+
+    if message_type == "transform":
+        if not validate_transform_message(message):
+            logging.warning(
+                "Игрок %s прислал неправильный transform",
+                player_id,
+            )
+            return
+
+        async with state_lock:
+            player = players.get(player_id)
+
+            if player is None:
+                return
+
+            player["position"] = [
+                float(message["position"][0]),
+                float(message["position"][1]),
+                float(message["position"][2]),
+            ]
+
+            player["rotation_y"] = float(
+                message["rotation_y"]
+            )
+
+            player["rotation_x"] = float(
+                message.get(
+                    "rotation_x",
+                    0.0,
+                )
+            )
+
+    elif message_type == "set_name":
+        requested_name = str(
+            message.get(
+                "name",
+                "",
+            )
+        ).strip()
+
+        if not requested_name:
+            return
+
+        safe_name = requested_name[:20]
+
+        async with state_lock:
+            player = players.get(player_id)
+
+            if player is not None:
+                player["name"] = safe_name
+
+    elif message_type == protocol.CREATE_PART:
+        await handle_create_part(player_id, message)
+
+    elif message_type == protocol.UPDATE_PROPERTY:
+        await handle_update_property(player_id, message)
+
+    elif message_type == protocol.DELETE_PART:
+        await handle_delete_part(player_id, message)
+
+
+async def handle_create_part(
+    player_id: str,
+    message: dict[str, Any],
+) -> None:
+    raw_properties = message.get("properties", {})
+
+    if not isinstance(raw_properties, dict):
+        logging.warning(
+            "Игрок %s прислал неправильный create_part",
+            player_id,
+        )
+        return
+
+    class_name = str(message.get("class_name") or "Part")
+    definition = object_registry.get_object_type(class_name)
+
+    if definition is None or not definition.creatable:
+        logging.warning(
+            "Игрок %s запросил неизвестный/некреатируемый тип '%s'; создаю Part",
+            player_id,
+            class_name,
+        )
+        class_name = "Part"
+        definition = object_registry.get_object_type("Part")
+
+    if class_name in PART_LIKE_TYPES:
+        clean_properties = sanitize_part_properties(raw_properties)
+        base_defaults = DEFAULT_PART_PROPERTIES if class_name == "Part" else definition.default_properties
+    else:
+        clean_properties = object_registry.sanitize_properties_for_type(class_name, raw_properties)
+        base_defaults = definition.default_properties if definition is not None else {}
+
+    properties = dict(base_defaults)
+    properties.update(clean_properties)
+
+    parent_id = message.get("parent_id")
+    if not isinstance(parent_id, str) or not parent_id:
+        parent_id = None
+
+    requested_name = str(message.get("name", "")).strip()
+    default_name = definition.display_name if definition is not None else class_name
+    part = Instance(
+        class_name=class_name,
+        name=(requested_name[:32] if requested_name else default_name),
+        parent_id=parent_id,
+        properties=properties,
+    )
+
+    async with state_lock:
+        world[part.id] = part
+
+    logging.info(
+        "Игрок %s создал %s %s (%s)",
+        player_id,
+        class_name,
+        part.id,
+        part.name,
+    )
+
+    await broadcast_to_all(
+        {
+            "type": protocol.PART_CREATED,
+            "part": part.to_dict(),
+        }
+    )
+
+
+async def handle_update_property(
+    player_id: str,
+    message: dict[str, Any],
+) -> None:
+    part_id = str(message.get("id", ""))
+
+    if not part_id:
+        return
+
+    async with state_lock:
+        existing = world.get(part_id)
+        class_name = existing.class_name if existing is not None else None
+
+    if class_name is None:
+        return
+
+    raw_properties = message.get("properties", {})
+    clean_properties: dict[str, Any] = {}
+    if isinstance(raw_properties, dict) and raw_properties:
+        if class_name in PART_LIKE_TYPES:
+            clean_properties = sanitize_part_properties(raw_properties)
+        else:
+            clean_properties = object_registry.sanitize_properties_for_type(class_name, raw_properties)
+
+    clean_name: str | None = None
+    raw_name = message.get("name")
+    if isinstance(raw_name, str):
+        candidate = raw_name.strip()[:32]
+        if candidate:
+            clean_name = candidate
+
+    clean_enabled: bool | None = None
+    raw_enabled = message.get("enabled")
+    if isinstance(raw_enabled, bool):
+        clean_enabled = raw_enabled
+
+    if not clean_properties and clean_name is None and clean_enabled is None:
+        return
+
+    async with state_lock:
+        part = world.get(part_id)
+
+        if part is None:
+            return
+
+        if clean_properties:
+            part.properties.update(clean_properties)
+        if clean_name is not None:
+            part.rename(clean_name)
+        if clean_enabled is not None:
+            part.enabled = clean_enabled
+
+    payload: dict[str, Any] = {
+        "type": protocol.PART_UPDATED,
+        "id": part_id,
+    }
+    if clean_properties:
+        payload["properties"] = clean_properties
+    if clean_name is not None:
+        payload["name"] = clean_name
+    if clean_enabled is not None:
+        payload["enabled"] = clean_enabled
+
+    await broadcast_to_all(payload)
+
+
+async def handle_delete_part(
+    player_id: str,
+    message: dict[str, Any],
+) -> None:
+    part_id = str(message.get("id", ""))
+
+    if not part_id:
+        return
+
+    async with state_lock:
+        if part_id not in world:
+            return
+        removed_ids = destroy_cascade(world, part_id)
+
+    logging.info(
+        "Игрок %s удалил %s (и %d потомков)",
+        player_id,
+        part_id,
+        len(removed_ids) - 1,
+    )
+
+    for removed_id in removed_ids:
+        await broadcast_to_all(
+            {
+                "type": protocol.PART_DELETED,
+                "id": removed_id,
+            }
+        )
+
+
+async def client_handler(
+    websocket: ServerConnection,
+) -> None:
+    player_id = secrets.token_hex(4)
+
+    async with state_lock:
+        clients[player_id] = websocket
+
+        players[player_id] = create_player(
+            player_id
+        )
+
+        initial_player = dict(
+            players[player_id]
+        )
+
+    logging.info(
+        "Игрок %s подключился: %s",
+        player_id,
+        websocket.remote_address,
+    )
+
+    connected = await send_json(
+        websocket,
+        {
+            "type": "connected",
+            "player_id": player_id,
+            "player": initial_player,
+        },
+    )
+
+    if not connected:
+        async with state_lock:
+            clients.pop(
+                player_id,
+                None,
+            )
+
+            players.pop(
+                player_id,
+                None,
+            )
+
+        return
+
+    async with state_lock:
+        world_snapshot = serialize_world(world)
+
+    await send_json(
+        websocket,
+        {
+            "type": protocol.WORLD_SNAPSHOT,
+            "parts": world_snapshot,
+        },
+    )
+
+    try:
+        async for raw_message in websocket:
+            try:
+                message = json.loads(
+                    raw_message
+                )
+
+            except json.JSONDecodeError:
+                logging.warning(
+                    "Игрок %s прислал неправильный JSON",
+                    player_id,
+                )
+                continue
+
+            if not isinstance(
+                message,
+                dict,
+            ):
+                continue
+
+            await handle_message(
+                player_id,
+                message,
+            )
+
+    except ConnectionClosed:
+        pass
+
+    except Exception:
+        logging.exception(
+            "Ошибка соединения с игроком %s",
+            player_id,
+        )
+
+    finally:
+        async with state_lock:
+            clients.pop(
+                player_id,
+                None,
+            )
+
+            players.pop(
+                player_id,
+                None,
+            )
+
+        logging.info(
+            "Игрок %s отключился",
+            player_id,
+        )
+
+
+async def main() -> None:
+    logging.info(
+        "Запуск сервера на ws://%s:%s",
+        HOST,
+        PORT,
+    )
+
+    logging.info(
+        "Для локального теста используй "
+        "ws://127.0.0.1:%s",
+        PORT,
+    )
+
+    async with serve(
+        client_handler,
+        HOST,
+        PORT,
+        ping_interval=20,
+        ping_timeout=20,
+        max_size=64 * 1024,
+    ):
+        broadcast_task = asyncio.create_task(
+            broadcast_world_state()
+        )
+
+        try:
+            await asyncio.Future()
+
+        finally:
+            broadcast_task.cancel()
+
+            try:
+                await broadcast_task
+
+            except asyncio.CancelledError:
+                pass
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        logging.info(
+            "Сервер остановлен"
+        )   
