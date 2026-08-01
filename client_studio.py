@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from panda3d.core import Filename, TransparencyAttrib
+from panda3d.core import Filename, TransparencyAttrib, WindowProperties
 from ursina import (
     AmbientLight,
     Cone,
@@ -153,6 +153,12 @@ MAX_PITCH = 80.0
 # ------------------------------------------------------------
 
 DEBUG_MOUSE_LOOK = False
+
+# Логирует container/native-window геометрию вокруг событий, которые, как
+# выяснилось, портят размер встроенного Panda3D-окна (см. коммент у
+# MultiplayerGame._sync_panda_window_to_container). Временный диагностический
+# флаг — включать вручную для отладки, в проде должен быть False.
+DEBUG_VIEWPORT_GEOMETRY = False
 
 QT_LOOK_SENSITIVITY_X = 0.08
 QT_LOOK_SENSITIVITY_Y = 0.08
@@ -916,11 +922,98 @@ class MultiplayerGame(Entity):
             return self._qt_look_last_pos is not None
         return mouse.locked
 
+    # --------------------------------------------------------
+    # ГЕОМЕТРИЯ ВСТРОЕННОГО ОКНА (см. подробный разбор бага в отчёте задачи)
+    #
+    # Корень проблемы: ursina.window — это САМ объект WindowProperties
+    # (класс Window наследуется от WindowProperties, не оборачивает его), и
+    # это единственный на весь процесс общий экземпляр. mouse.visible /
+    # mouse.locked (ursina/mouse.py) при каждом переключении делают
+    # application.base.win.requestProperties(window) — то есть шлют Panda3D
+    # ВЕСЬ накопленный на этом объекте набор свойств, включая size, который
+    # был выставлен один раз при Ursina(size=(1100, 700), ...) в main() и
+    # с тех пор ни разу не обновлялся. Qt меняет реальный размер встроенного
+    # нативного окна напрямую через WinAPI при ресайзе контейнера — Panda3D
+    # (и тем более WindowProperties-синглтон ursina) об этом не узнаёт. В
+    # результате ЛЮБОЙ вызов requestProperties(window) (mouse.visible при
+    # RMB-обзоре, mouse.visible при входе в Play) откатывает нативное окно
+    # обратно к протухшему 1100x700 — отсюда "усыхание" вьюпорта. Клик ЛКМ
+    # ничего не чинит напрямую: его "чинящий" эффект — случайный побочный
+    # эффект PandaWindowFocusFilter.requestActivate() на foreign QWindow,
+    # которая пересобирает геометрию дочернего окна по данным Qt.
+    #
+    # Исправление — в двух точках:
+    #  1) держим сам window.size синхронным с реальным размером контейнера
+    #     при каждом Resize контейнера (см. PandaWindowFocusFilter) — тогда
+    #     будущие requestProperties(window) из любого места несут уже
+    #     актуальный size, а не протухший;
+    #  2) на случай, если requestProperties сработает раньше первого Resize
+    #     (маловероятно, но дёшево подстраховаться) — принудительно
+    #     досинхронизируем сразу после переключений mouse.visible.
+    # --------------------------------------------------------
+
+    def _log_viewport_geometry(self, label: str) -> None:
+        if not DEBUG_VIEWPORT_GEOMETRY:
+            return
+
+        container = self.qt_viewport_container
+        container_geom = None
+        parent_geom = None
+        if container is not None:
+            container_geom = (container.x(), container.y(), container.width(), container.height())
+            parent = container.parentWidget()
+            if parent is not None:
+                parent_geom = (parent.x(), parent.y(), parent.width(), parent.height())
+
+        native_size = None
+        panda_window = getattr(application.base, "win", None)
+        if panda_window is not None:
+            try:
+                props = panda_window.getProperties()
+                native_size = (props.getXSize(), props.getYSize())
+            except Exception as error:
+                native_size = f"<error: {error}>"
+
+        focus_widget = QApplication.focusWidget()
+        focus_name = type(focus_widget).__name__ if focus_widget is not None else None
+
+        print(
+            f"[VIEWPORT_GEOMETRY] {label}: playing={self.studio_playing} "
+            f"container_geom={container_geom} parent_geom={parent_geom} "
+            f"native_size={native_size} focus={focus_name}"
+        )
+
+    def _sync_panda_window_to_container(self, reason: str) -> None:
+        container = self.qt_viewport_container
+        if container is None:
+            return
+
+        panda_window = getattr(application.base, "win", None)
+        if panda_window is None:
+            return
+
+        target_width = max(1, container.width())
+        target_height = max(1, container.height())
+
+        self._log_viewport_geometry(f"before sync [{reason}]")
+
+        # Обновляем сам синглтон ursina.window — это и есть настоящий фикс
+        # (см. комментарий выше): без этого следующий requestProperties(window)
+        # из mouse.py снова протащит старый размер.
+        window.setSize(target_width, target_height)
+
+        props = WindowProperties()
+        props.setSize(target_width, target_height)
+        panda_window.requestProperties(props)
+
+        self._log_viewport_geometry(f"after sync [{reason}]")
+
     def _start_mouse_look(self) -> None:
         # Скрытие курсора трогает только cursor_hidden окна Panda3D,
         # не mouse_mode — это безопасно и для встроенного, и для
         # отдельного окна (в отличие от mouse.locked).
         mouse.visible = False
+        self._sync_panda_window_to_container("start_mouse_look")
 
         if self._qt_look_available():
             container = self.qt_viewport_container
@@ -933,6 +1026,7 @@ class MultiplayerGame(Entity):
 
     def _stop_mouse_look(self) -> None:
         mouse.visible = True
+        self._sync_panda_window_to_container("stop_mouse_look")
 
         if self._qt_look_available():
             self._qt_look_last_pos = None
@@ -2183,10 +2277,11 @@ class MultiplayerStudioAdapter:
 
 
 class PandaWindowFocusFilter(QObject):
-    def __init__(self, container: QWidget, foreign_window: QWindow) -> None:
+    def __init__(self, container: QWidget, foreign_window: QWindow, game: "MultiplayerGame") -> None:
         super().__init__(container)
         self.container = container
         self.foreign_window = foreign_window
+        self.game = game
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if event.type() in {
@@ -2196,6 +2291,11 @@ class PandaWindowFocusFilter(QObject):
         }:
             self.container.setFocus(Qt.FocusReason.MouseFocusReason)
             self.foreign_window.requestActivate()
+        elif event.type() == QEvent.Type.Resize:
+            # Держит ursina.window.size синхронным с реальным размером
+            # контейнера при КАЖДОМ ресайзе (окно студии, доки, maximize) —
+            # см. подробности в MultiplayerGame._sync_panda_window_to_container.
+            self.game._sync_panda_window_to_container("container resize")
         return False
 
 
@@ -2229,7 +2329,7 @@ def embed_panda_window(
     container.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     container.setMouseTracking(True)
 
-    focus_filter = PandaWindowFocusFilter(container, foreign_window)
+    focus_filter = PandaWindowFocusFilter(container, foreign_window, game)
     container.installEventFilter(focus_filter)
 
     studio._panda_foreign_window = foreign_window
@@ -2237,6 +2337,11 @@ def embed_panda_window(
     studio._panda_focus_filter = focus_filter
     studio.install_engine_viewport(container)
     game.set_qt_viewport_container(container)
+    # Контейнер мог уже получить свой первый Resize до того, как мы успели
+    # навесить event filter (порядок layout-прохода Qt не гарантирован) —
+    # досинхронизируем сразу, чтобы ursina.window.size не остался протухшим
+    # с самого старта.
+    game._sync_panda_window_to_container("initial embed")
     bridge.log("info", f"Ursina viewport embedded. Native handle: {handle}")
     return True
 
