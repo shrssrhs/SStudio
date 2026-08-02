@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from panda3d.core import Filename, TransparencyAttrib
+from panda3d.core import Filename, Quat, TransparencyAttrib
 from ursina import (
     AmbientLight,
     Cone,
@@ -516,6 +516,12 @@ class _GizmoTimingProbe:
 # Explorer drag-and-drop). Временный диагностический флаг — включать
 # вручную для отладки, в проде должен быть False.
 DEBUG_REPARENTING = False
+
+# Stage 2.2: диагностика Model pivot + каскадного transform'а потомков.
+# Логирует частоту локального обновления гизмо, число трансформируемых
+# потомков, время на квaternion-математику/обновление Entity/bridge-sync,
+# частоту сетевой отправки/эха. Временный флаг — по умолчанию False.
+DEBUG_MODEL_TRANSFORMS = False
 
 QT_LOOK_SENSITIVITY_X = 0.08
 QT_LOOK_SENSITIVITY_Y = 0.08
@@ -1221,6 +1227,37 @@ class MultiplayerGame(Entity):
         self._gizmo_dragging_instance_id: str | None = None
         self._gizmo_timing = _GizmoTimingProbe()
 
+        # Stage 2.2: Model pivot + каскадный transform потомков.
+        #
+        # model_gizmo_proxy — невидимая Entity (нет model=), к которой
+        # гизмо цепляется, когда выбран Model: TransformGizmo умеет тащить
+        # только Entity.position/.rotation, ничего не зная про Model —
+        # никаких изменений в transform_gizmo.py не потребовалось.
+        #
+        # transform_scratch — вторая невидимая Entity, используемая ТОЛЬКО
+        # как конвертер Euler XYZ <-> Panda Quat через реальный
+        # NodePath.set_quat()/.rotation (Ursina), а не через самостоятельно
+        # выведенную формулу — так гарантированно совпадает с тем, как
+        # Ursina реально держит ориентацию (см. ROTATION_SIGN в
+        # transform_gizmo.py: Ursina уже имеет неочевидные знаковые правила
+        # на этих осях, повторять их вручную рискованно).
+        self.model_gizmo_proxy = Entity(eternal=True)
+        self._transform_scratch = Entity(eternal=True)
+
+        # Состояние активного каскадного Model-drag (None вне драга).
+        # "descendant_relative" — id -> (relative_pos: Vec3, relative_quat:
+        # Quat), захваченные в момент begin_drag: смещение/ориентация
+        # потомка В ЛОКАЛЬНОЙ РАМКЕ пивота на старте драга. Это НЕ
+        # персистентное поле — чисто временный снэпшот на время одного
+        # драга (см. отчёт Stage 2.2, раздел про local/world дизайн).
+        self._model_drag_state: dict[str, Any] | None = None
+        self._model_drag_last_network_send = 0.0
+        # id потомков (и самой Model), чьё серверное эхо MODEL_TRANSFORMED
+        # подавляется, пока локальный драг активен — тот же приём, что и
+        # _gizmo_dragging_instance_id для одиночного Part.
+        self._model_drag_suppressed_ids: set[str] = set()
+        self._model_selection_highlights: list[Entity] = []
+
         self.create_world()
         self.create_first_person_player()
         self.create_local_visual()
@@ -1722,12 +1759,29 @@ class MultiplayerGame(Entity):
 
     def select_part(self, part_id: str, notify_studio: bool = True) -> None:
         entity = self.parts.get(part_id)
-        if entity is None:
-            self.deselect_part(notify_studio=notify_studio)
+        record = self.instances.get(part_id)
+        is_model = entity is None and record is not None and record.class_name == "Model"
+
+        if entity is None and not is_model:
+            # Ни 3D Entity (Part/SpawnPoint), ни Model — например Folder/
+            # Script выбраны из Explorer. Гизмо нечего показывать, но
+            # выбор всё равно сохраняем, чтобы Inspector продолжал видеть
+            # актуальный selected_part_id (это не регрессия: раньше такой
+            # выбор тоже не давал гизмо, просто полностью сбрасывался).
+            if record is None:
+                self.deselect_part(notify_studio=notify_studio)
+                return
+            self.selected_part_id = part_id
+            self._clear_selection_highlights()
+            if notify_studio and self.studio_adapter is not None:
+                self.studio_adapter.on_game_selection_changed(part_id)
             return
 
         self.selected_part_id = part_id
-        self.update_selection_highlight(entity)
+        if is_model:
+            self._update_model_selection_highlight(part_id)
+        else:
+            self.update_selection_highlight(entity)
         if notify_studio and self.studio_adapter is not None:
             self.studio_adapter.on_game_selection_changed(part_id)
 
@@ -1742,10 +1796,12 @@ class MultiplayerGame(Entity):
         if self.selection_highlight is not None:
             destroy(self.selection_highlight)
             self.selection_highlight = None
+        self._clear_selection_highlights()
         if notify_studio and self.studio_adapter is not None:
             self.studio_adapter.on_game_selection_changed(None)
 
     def update_selection_highlight(self, entity: Entity) -> None:
+        self._clear_selection_highlights()
         if self.selection_highlight is not None:
             destroy(self.selection_highlight)
 
@@ -1758,6 +1814,37 @@ class MultiplayerGame(Entity):
             unlit=True,
             enabled=not self.studio_playing,
         )
+
+    def _clear_selection_highlights(self) -> None:
+        for highlight in self._model_selection_highlights:
+            destroy(highlight)
+        self._model_selection_highlights = []
+
+    def _update_model_selection_highlight(self, model_id: str) -> None:
+        """Stage 2.2: подсветка выбранного Model — по wireframe-кубу на
+        каждый трансформируемый потомок (а не один куб вокруг несуществующей
+        3D-геометрии самого Model), плюс сам гизмо на пивоте показывает,
+        куда фактически цепляется drag."""
+        if self.selection_highlight is not None:
+            destroy(self.selection_highlight)
+            self.selection_highlight = None
+        self._clear_selection_highlights()
+
+        for descendant_id in self._collect_transformable_descendants(model_id):
+            entity = self.parts.get(descendant_id)
+            if entity is None:
+                continue
+            self._model_selection_highlights.append(
+                Entity(
+                    model="wireframe_cube",
+                    color=color.azure,
+                    position=entity.position,
+                    scale=entity.scale * 1.02,
+                    rotation=entity.rotation,
+                    unlit=True,
+                    enabled=not self.studio_playing,
+                )
+            )
 
     def handle_editor_click(self) -> None:
         hovered = mouse.hovered_entity
@@ -1789,8 +1876,289 @@ class MultiplayerGame(Entity):
         if value > 0:
             self.gizmo_snap_size = value
 
+    # --------------------------------------------------------
+    # Stage 2.2: MODEL PIVOT + CASCADING DESCENDANT TRANSFORMS
+    #
+    # These helpers use real Panda3D quaternions (panda3d.core.Quat) for
+    # all composition, never manual Euler addition — see the Stage 2.2
+    # report for why (Ursina's per-axis rotation has non-obvious sign
+    # flips, see ROTATION_SIGN in transform_gizmo.py). Euler<->Quat
+    # conversion always round-trips through a real Entity/NodePath
+    # (self._transform_scratch) rather than a hand-derived formula, so it
+    # is guaranteed to match how Ursina actually renders rotation.
+    # --------------------------------------------------------
+
+    def _euler_xyz_to_quat(self, rotation_xyz) -> Quat:
+        self._transform_scratch.rotation = Vec3(
+            float(rotation_xyz[0]), float(rotation_xyz[1]), float(rotation_xyz[2]),
+        )
+        return Quat(self._transform_scratch.get_quat())
+
+    def _quat_to_euler_xyz(self, quat: Quat) -> list[float]:
+        self._transform_scratch.set_quat(quat)
+        r = self._transform_scratch.rotation
+        return [float(r.x), float(r.y), float(r.z)]
+
+    @staticmethod
+    def _compose_quat(outer: Quat, inner: Quat) -> Quat:
+        """Returns the quaternion for 'apply inner, then outer' -- i.e.
+        compose(outer, inner).xform(v) == outer.xform(inner.xform(v)).
+        Panda3D's `*` composes as (A*B).xform(v) == B.xform(A.xform(v))
+        (verified empirically, not assumed), hence the swapped order here."""
+        return inner * outer
+
+    def _collect_transformable_descendants(self, root_id: str) -> list[str]:
+        """All ids transitively parented under root_id that themselves own
+        a transform (Part/SpawnPoint Position+Rotation, or a nested Model's
+        pivot) — recurses THROUGH non-spatial containers (Folder/Script)
+        without including them. Mirrors shared/instance.py's
+        get_descendant_ids() graph walk, but filtered to transformable
+        types and working off the client's own InstanceRecord map (no
+        round-trip to the server needed for local gizmo math)."""
+        children_by_parent: dict[str, list[str]] = {}
+        for record in self.instances.values():
+            children_by_parent.setdefault(record.parent_id or "Workspace", []).append(record.id)
+        result: list[str] = []
+        frontier = [root_id]
+        while frontier:
+            current = frontier.pop()
+            for child_id in children_by_parent.get(current, []):
+                child_record = self.instances.get(child_id)
+                if child_record is not None and child_record.class_name in ("Part", "SpawnPoint", "Model"):
+                    result.append(child_id)
+                frontier.append(child_id)
+        return result
+
+    def _model_pivot_world(self, model_id: str) -> tuple[Vec3, Quat]:
+        """World pivot position/orientation for a Model. If
+        PivotIsExplicit, returns the persisted PivotPosition/PivotRotation
+        verbatim. Otherwise this is a LAZY, NEVER-PERSISTED estimate (the
+        AABB midpoint of transformable descendants' current world
+        positions, identity rotation) purely for gizmo placement/display —
+        see Stage 2.2 report, 'lazy auto pivot'. An empty/never-touched
+        Model's default pivot is the world origin, documented there too."""
+        record = self.instances.get(model_id)
+        if record is None:
+            return Vec3(0, 0, 0), Quat()
+
+        if bool(record.properties.get("PivotIsExplicit", False)):
+            position = record.properties.get("PivotPosition", [0.0, 0.0, 0.0])
+            rotation = record.properties.get("PivotRotation", [0.0, 0.0, 0.0])
+            pos_vec = Vec3(float(position[0]), float(position[1]), float(position[2]))
+            return pos_vec, self._euler_xyz_to_quat(rotation)
+
+        points: list[list[float]] = []
+        for descendant_id in self._collect_transformable_descendants(model_id):
+            descendant_record = self.instances.get(descendant_id)
+            if descendant_record is None:
+                continue
+            if descendant_record.class_name == "Model":
+                points.append(descendant_record.properties.get("PivotPosition", [0.0, 0.0, 0.0]))
+            else:
+                points.append(descendant_record.properties.get("Position", [0.0, 0.0, 0.0]))
+        if not points:
+            return Vec3(0, 0, 0), Quat()
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        zs = [p[2] for p in points]
+        center = Vec3(
+            (min(xs) + max(xs)) / 2.0,
+            (min(ys) + max(ys)) / 2.0,
+            (min(zs) + max(zs)) / 2.0,
+        )
+        return center, Quat()
+
+    def _refresh_model_gizmo_proxy(self, model_id: str) -> None:
+        position, quat = self._model_pivot_world(model_id)
+        self.model_gizmo_proxy.position = position
+        self.model_gizmo_proxy.set_quat(quat)
+
+    def _begin_model_drag_capture(self, model_id: str) -> None:
+        """Snapshot every transformable descendant's offset/orientation in
+        the pivot's OWN rotated frame at drag-start (a transient local
+        transform, never persisted — see Stage 2.2 report). Reconstructed
+        every frame in _apply_model_gizmo_result() as the pivot moves, which
+        is what keeps the group rigid."""
+        pivot_pos, pivot_quat = self._model_pivot_world(model_id)
+        pivot_quat_inv = pivot_quat.conjugate()
+
+        descendant_relative: dict[str, tuple[Vec3, Quat]] = {}
+        for descendant_id in self._collect_transformable_descendants(model_id):
+            descendant_record = self.instances.get(descendant_id)
+            if descendant_record is None:
+                continue
+            if descendant_record.class_name == "Model":
+                child_pos_raw = descendant_record.properties.get("PivotPosition", [0.0, 0.0, 0.0])
+                child_rot_raw = descendant_record.properties.get("PivotRotation", [0.0, 0.0, 0.0])
+            else:
+                child_pos_raw = descendant_record.properties.get("Position", [0.0, 0.0, 0.0])
+                child_rot_raw = descendant_record.properties.get("Rotation", [0.0, 0.0, 0.0])
+            child_pos = Vec3(float(child_pos_raw[0]), float(child_pos_raw[1]), float(child_pos_raw[2]))
+            child_quat = self._euler_xyz_to_quat(child_rot_raw)
+
+            relative_pos = Vec3(pivot_quat_inv.xform(child_pos - pivot_pos))
+            relative_quat = self._compose_quat(pivot_quat_inv, child_quat)
+            descendant_relative[descendant_id] = (relative_pos, relative_quat)
+
+        self._model_drag_state = {"model_id": model_id, "descendant_relative": descendant_relative}
+        self._model_drag_suppressed_ids = {model_id, *descendant_relative.keys()}
+        if DEBUG_MODEL_TRANSFORMS:
+            print(
+                f"[MODEL_TRANSFORMS] begin_drag model={model_id} "
+                f"descendants={len(descendant_relative)} pivot_pos={pivot_pos} explicit={bool(self.instances[model_id].properties.get('PivotIsExplicit', False))}"
+            )
+            self._model_drag_frame_count = 0
+            self._model_drag_network_sends = 0
+            self._model_drag_timing_start = time.perf_counter()
+
+    def _apply_model_gizmo_result(self, force_network: bool) -> None:
+        if self._model_drag_state is None:
+            return
+        frame_start = time.perf_counter() if DEBUG_MODEL_TRANSFORMS else 0.0
+
+        model_id = self._model_drag_state["model_id"]
+        descendant_relative: dict[str, tuple[Vec3, Quat]] = self._model_drag_state["descendant_relative"]
+
+        pivot_pos_new = Vec3(self.model_gizmo_proxy.position)
+        pivot_quat_new = Quat(self.model_gizmo_proxy.get_quat())
+
+        math_start = time.perf_counter() if DEBUG_MODEL_TRANSFORMS else 0.0
+        computed: dict[str, tuple[Vec3, list[float]]] = {}
+        for descendant_id, (relative_pos, relative_quat) in descendant_relative.items():
+            child_pos_new = pivot_pos_new + Vec3(pivot_quat_new.xform(relative_pos))
+            child_quat_new = self._compose_quat(pivot_quat_new, relative_quat)
+            child_rotation_euler = self._quat_to_euler_xyz(child_quat_new)
+            computed[descendant_id] = (child_pos_new, child_rotation_euler)
+        math_ms = (time.perf_counter() - math_start) * 1000.0 if DEBUG_MODEL_TRANSFORMS else 0.0
+
+        entity_start = time.perf_counter() if DEBUG_MODEL_TRANSFORMS else 0.0
+        for descendant_id, (child_pos_new, child_rotation_euler) in computed.items():
+            entity = self.parts.get(descendant_id)
+            if entity is not None:
+                entity.position = child_pos_new
+                entity.rotation = Vec3(*child_rotation_euler)
+        entity_ms = (time.perf_counter() - entity_start) * 1000.0 if DEBUG_MODEL_TRANSFORMS else 0.0
+
+        bridge_start = time.perf_counter() if DEBUG_MODEL_TRANSFORMS else 0.0
+        pivot_position_list = [float(pivot_pos_new.x), float(pivot_pos_new.y), float(pivot_pos_new.z)]
+        pivot_rotation_list = self._quat_to_euler_xyz(pivot_quat_new)
+        model_record = self.instances.get(model_id)
+        if model_record is not None:
+            model_record.properties["PivotPosition"] = pivot_position_list
+            model_record.properties["PivotRotation"] = pivot_rotation_list
+            model_record.properties["PivotIsExplicit"] = True
+            if self.studio_adapter is not None:
+                self.studio_adapter.on_instance_transform_live(model_record, "Position", pivot_position_list)
+                self.studio_adapter.on_instance_transform_live(model_record, "Rotation", pivot_rotation_list)
+
+        for descendant_id, (child_pos_new, child_rotation_euler) in computed.items():
+            descendant_record = self.instances.get(descendant_id)
+            if descendant_record is None:
+                continue
+            position_list = [float(child_pos_new.x), float(child_pos_new.y), float(child_pos_new.z)]
+            if descendant_record.class_name == "Model":
+                descendant_record.properties["PivotPosition"] = position_list
+                descendant_record.properties["PivotRotation"] = child_rotation_euler
+                descendant_record.properties["PivotIsExplicit"] = True
+            else:
+                descendant_record.properties["Position"] = position_list
+                descendant_record.properties["Rotation"] = child_rotation_euler
+            entity = self.parts.get(descendant_id)
+            if entity is not None:
+                entity.instance_properties["Position"] = position_list
+                entity.instance_properties["Rotation"] = child_rotation_euler
+            if self.studio_adapter is not None:
+                self.studio_adapter.on_instance_transform_live(descendant_record, "Position", position_list)
+                self.studio_adapter.on_instance_transform_live(descendant_record, "Rotation", child_rotation_euler)
+        bridge_ms = (time.perf_counter() - bridge_start) * 1000.0 if DEBUG_MODEL_TRANSFORMS else 0.0
+
+        self._update_model_selection_highlight(model_id)
+
+        now = time.monotonic()
+        interval = 1.0 / GIZMO_NETWORK_SEND_RATE
+        sent = False
+        if force_network or (now - self._model_drag_last_network_send) >= interval:
+            self._model_drag_last_network_send = now
+            self.request_transform_model(
+                model_id,
+                pivot_position_list,
+                pivot_rotation_list,
+                {
+                    descendant_id: {
+                        "Position": [float(pos.x), float(pos.y), float(pos.z)],
+                        "Rotation": rot,
+                    }
+                    for descendant_id, (pos, rot) in computed.items()
+                },
+            )
+            sent = True
+            if DEBUG_MODEL_TRANSFORMS:
+                self._model_drag_network_sends = getattr(self, "_model_drag_network_sends", 0) + 1
+
+        if DEBUG_MODEL_TRANSFORMS:
+            self._model_drag_frame_count = getattr(self, "_model_drag_frame_count", 0) + 1
+            total_ms = (time.perf_counter() - frame_start) * 1000.0
+            print(
+                f"[MODEL_TRANSFORMS] frame={self._model_drag_frame_count} "
+                f"descendants={len(computed)} math={math_ms:.3f}ms entity={entity_ms:.3f}ms "
+                f"bridge={bridge_ms:.3f}ms total={total_ms:.3f}ms sent={sent}"
+            )
+
+    def request_transform_model(
+        self,
+        model_id: str,
+        pivot_position: list[float],
+        pivot_rotation: list[float],
+        descendants: dict[str, dict[str, list[float]]],
+    ) -> bool:
+        if not self.network.connected_event.is_set():
+            return False
+        self.network.send({
+            "type": protocol.TRANSFORM_MODEL,
+            "id": model_id,
+            "pivot": {"Position": pivot_position, "Rotation": pivot_rotation},
+            "descendants": descendants,
+        })
+        return True
+
+    def request_transform_model_pivot(
+        self,
+        model_id: str,
+        pivot_position: list[float] | None,
+        pivot_rotation: list[float] | None,
+    ) -> bool:
+        """One-shot (non-drag) pivot edit — used by Inspector's Pivot
+        Position/Rotation fields. Reuses the exact same cascading-transform
+        machinery as the gizmo (_begin_model_drag_capture +
+        _apply_model_gizmo_result) for a single synthetic 'frame' instead
+        of a live per-frame drag loop, so the two entry points can never
+        drift apart mathematically."""
+        record = self.instances.get(model_id)
+        if record is None or record.class_name != "Model":
+            return False
+        self._begin_model_drag_capture(model_id)
+        if pivot_position is not None:
+            self.model_gizmo_proxy.position = Vec3(
+                float(pivot_position[0]), float(pivot_position[1]), float(pivot_position[2]),
+            )
+        if pivot_rotation is not None:
+            self.model_gizmo_proxy.set_quat(self._euler_xyz_to_quat(pivot_rotation))
+        self._apply_model_gizmo_result(force_network=True)
+        self._model_drag_state = None
+        self._model_drag_suppressed_ids = set()
+        return True
+
     def update_gizmo(self) -> None:
-        target = self.parts.get(self.selected_part_id) if self.selected_part_id else None
+        selected_record = self.instances.get(self.selected_part_id) if self.selected_part_id else None
+        is_model_target = selected_record is not None and selected_record.class_name == "Model"
+
+        if is_model_target:
+            target = self.model_gizmo_proxy
+            if not self.gizmo.dragging:
+                self._refresh_model_gizmo_proxy(self.selected_part_id)
+        else:
+            target = self.parts.get(self.selected_part_id) if self.selected_part_id else None
+
         if target is not self.gizmo.current_target:
             self.gizmo.set_target(target)
 
@@ -1822,7 +2190,10 @@ class MultiplayerGame(Entity):
             if result is not None:
                 if DEBUG_GIZMO_TIMING:
                     self._gizmo_timing.tick("entity_transform")
-                self._apply_gizmo_result(target, result, force_network=False)
+                if is_model_target:
+                    self._apply_model_gizmo_result(force_network=False)
+                else:
+                    self._apply_gizmo_result(target, result, force_network=False)
         else:
             ray_origin, ray_direction = mouse_world_ray()
             if ray_origin is not None:
@@ -1841,12 +2212,37 @@ class MultiplayerGame(Entity):
             # Position/Rotation назад поверх уже более новой локальной
             # позиции — целиком клиентская защита, без изменений протокола.
             self._gizmo_dragging_instance_id = self.selected_part_id
+            selected_record = self.instances.get(self.selected_part_id) if self.selected_part_id else None
+            if selected_record is not None and selected_record.class_name == "Model":
+                self._begin_model_drag_capture(self.selected_part_id)
+            else:
+                self._model_drag_state = None
+                self._model_drag_suppressed_ids = set()
             if DEBUG_GIZMO_TIMING:
                 self._gizmo_timing.begin()
         return started
 
     def end_gizmo_drag(self) -> None:
         result = self.gizmo.end_drag()
+        if self._model_drag_state is not None:
+            if result is not None:
+                self._apply_model_gizmo_result(force_network=True)
+            if DEBUG_MODEL_TRANSFORMS:
+                elapsed = time.perf_counter() - getattr(self, "_model_drag_timing_start", time.perf_counter())
+                frames = getattr(self, "_model_drag_frame_count", 0)
+                sends = getattr(self, "_model_drag_network_sends", 0)
+                hz = frames / elapsed if elapsed > 0 else 0.0
+                print(
+                    f"[MODEL_TRANSFORMS] end_drag frames={frames} ({hz:.1f}Hz) "
+                    f"network_sends={sends} elapsed={elapsed:.2f}s"
+                )
+            self._model_drag_state = None
+            self._model_drag_suppressed_ids = set()
+            self._gizmo_dragging_instance_id = None
+            if DEBUG_GIZMO_TIMING:
+                self._gizmo_timing.end_and_report()
+            return
+
         if result is None:
             self._gizmo_dragging_instance_id = None
             return
@@ -2193,6 +2589,65 @@ class MultiplayerGame(Entity):
                     print(f"[REPARENTING] rejected: {message.get('id')}: {reason}")
                 if self.studio_adapter is not None:
                     self.studio_adapter.log("warning", reason)
+            elif message_type == protocol.MODEL_TRANSFORMED:
+                self.apply_model_transformed(message)
+            elif message_type == protocol.TRANSFORM_MODEL_REJECTED:
+                reason = str(message.get("reason", "Model transform rejected by server."))
+                if DEBUG_MODEL_TRANSFORMS:
+                    print(f"[MODEL_TRANSFORMS] rejected: {message.get('id')}: {reason}")
+                if self.studio_adapter is not None:
+                    self.studio_adapter.log("warning", reason)
+
+    def apply_model_transformed(self, message: dict[str, Any]) -> None:
+        """Receives an atomic MODEL_TRANSFORMED batch (our own confirmed
+        drag echoing back, or another client's Model transform). Applies
+        every descendant + the pivot, then does exactly ONE full-scene
+        sync at the end — never one rebuild per descendant, which would
+        turn a 100-Part batch into 100 Explorer/Inspector rebuilds."""
+        model_id = str(message.get("id", ""))
+        if not model_id:
+            return
+
+        if model_id in self._model_drag_suppressed_ids:
+            # Наше собственное эхо активного драга — локальное состояние
+            # уже новее (та же защита, что и для одиночного Part, см.
+            # _gizmo_dragging_instance_id / update_instance()).
+            if DEBUG_MODEL_TRANSFORMS:
+                print(f"[MODEL_TRANSFORMS] suppressed self-echo for {model_id}")
+            return
+
+        pivot = message.get("pivot")
+        if isinstance(pivot, dict):
+            model_record = self.instances.get(model_id)
+            if model_record is not None:
+                if isinstance(pivot.get("Position"), list):
+                    model_record.properties["PivotPosition"] = pivot["Position"]
+                if isinstance(pivot.get("Rotation"), list):
+                    model_record.properties["PivotRotation"] = pivot["Rotation"]
+                model_record.properties["PivotIsExplicit"] = True
+
+        descendants = message.get("descendants")
+        if isinstance(descendants, dict):
+            for descendant_id, transform in descendants.items():
+                if not isinstance(transform, dict):
+                    continue
+                record = self.instances.get(str(descendant_id))
+                if record is None:
+                    continue
+                if record.class_name == "Model":
+                    if isinstance(transform.get("Position"), list):
+                        record.properties["PivotPosition"] = transform["Position"]
+                    if isinstance(transform.get("Rotation"), list):
+                        record.properties["PivotRotation"] = transform["Rotation"]
+                    record.properties["PivotIsExplicit"] = True
+                else:
+                    self._apply_instance_properties(record, transform, replace=False)
+
+        if self.selected_part_id == model_id:
+            self._refresh_model_gizmo_proxy(model_id)
+            self._update_model_selection_highlight(model_id)
+        if self.studio_adapter is not None:
+            self.studio_adapter.sync_full_scene()
 
     def load_world_snapshot(self, parts: list[dict[str, Any]]) -> None:
         incoming_ids = {str(item.get("id", "")) for item in parts if isinstance(item, dict)}
@@ -2664,6 +3119,20 @@ class MultiplayerStudioAdapter:
                 properties=dict(properties),
             )
 
+        if record.class_name == "Model":
+            # Stage 2.2: show the SAME lazily-computed auto-pivot the gizmo
+            # would attach to (see MultiplayerGame._model_pivot_world) —
+            # showing the raw stored default [0,0,0] here instead would be
+            # misleading for a non-explicit pivot the gizmo actually places
+            # at the descendant-bounds midpoint. Nothing is written back;
+            # this is display-only, exactly like the gizmo's own read path.
+            pivot_pos_vec, pivot_quat = self.game._model_pivot_world(record.id)
+            pivot_position_tuple = (pivot_pos_vec.x, pivot_pos_vec.y, pivot_pos_vec.z)
+            pivot_rotation_tuple = tuple(self.game._quat_to_euler_xyz(pivot_quat))
+        else:
+            pivot_position_tuple = (0.0, 0.0, 0.0)
+            pivot_rotation_tuple = (0.0, 0.0, 0.0)
+
         return SceneObject(
             id=record.id,
             name=record.name,
@@ -2673,6 +3142,9 @@ class MultiplayerStudioAdapter:
             anchored=True,
             can_collide=False,
             cast_shadow=False,
+            pivot_position=self._as_editor_vec3(list(pivot_position_tuple), (0, 0, 0)),
+            pivot_rotation=self._as_editor_vec3(list(pivot_rotation_tuple), (0, 0, 0)),
+            pivot_is_explicit=bool(properties.get("PivotIsExplicit", False)),
             attributes={"server_id": record.id},
             properties=dict(properties),
         )
@@ -2699,17 +3171,25 @@ class MultiplayerStudioAdapter:
             self.bridge.sync_upsert(self.instance_to_scene_object(record))
 
     _LIVE_TRANSFORM_FIELDS = {"Position": "position", "Rotation": "rotation"}
+    # Stage 2.2: a Model's live-dragged transform is its PIVOT, not a
+    # Position/Rotation property (Model has none) — same SceneObject
+    # live-sync mechanism, different target fields (see SceneObject.
+    # pivot_position docstring in studio_editor_live.py).
+    _LIVE_PIVOT_TRANSFORM_FIELDS = {"Position": "pivot_position", "Rotation": "pivot_rotation"}
 
     def on_instance_transform_live(self, record: "InstanceRecord", property_key: str, value: list[float]) -> None:
         """High-frequency counterpart to on_instance_updated(), used while a
-        gizmo drag is in progress (see MultiplayerGame._apply_gizmo_result).
-        Routes through EngineBridge.sync_transform_live() instead of
-        sync_upsert()/instance_to_scene_object() — the latter rebuilds a
-        fresh SceneObject and triggers a full Explorer+Inspector widget
-        rebuild on every call, which is what caused the jerky drag."""
+        gizmo drag is in progress (see MultiplayerGame._apply_gizmo_result
+        for a single Part, _apply_model_gizmo_result for a Model's pivot +
+        its cascaded descendants). Routes through EngineBridge.
+        sync_transform_live() instead of sync_upsert()/
+        instance_to_scene_object() — the latter rebuilds a fresh SceneObject
+        and triggers a full Explorer+Inspector widget rebuild on every call,
+        which is what caused the jerky drag."""
         if self.bridge is None:
             return
-        field_name = self._LIVE_TRANSFORM_FIELDS.get(property_key)
+        field_map = self._LIVE_PIVOT_TRANSFORM_FIELDS if record.class_name == "Model" else self._LIVE_TRANSFORM_FIELDS
+        field_name = field_map.get(property_key)
         if field_name is None:
             return
         self.bridge.sync_transform_live(record.id, field_name, self._as_editor_vec3(value, (0, 0, 0)))
@@ -2780,6 +3260,18 @@ class MultiplayerStudioAdapter:
         if object_id.startswith("system:"):
             return False
         return self.game.request_set_parent(object_id, parent_id)
+
+    def transform_model(
+        self,
+        model_id: str,
+        pivot_position: list[float] | None,
+        pivot_rotation: list[float] | None,
+    ) -> bool:
+        """Inspector-driven Pivot Position/Rotation edit — same logical
+        group transform as dragging the gizmo (see Stage 2.2 report)."""
+        if model_id.startswith("system:"):
+            return False
+        return self.game.request_transform_model_pivot(model_id, pivot_position, pivot_rotation)
 
     def select_object(self, object_id: str | None) -> bool:
         if object_id is None or object_id.startswith("system:"):

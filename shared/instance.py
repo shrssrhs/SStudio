@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 import secrets
 from dataclasses import dataclass, field
 from typing import Any
@@ -179,8 +180,15 @@ def is_valid_vector3(value: Any) -> bool:
     if not isinstance(value, list) or len(value) != 3:
         return False
 
+    # math.isfinite() rejects NaN/Infinity, which otherwise pass the plain
+    # isinstance(x, float) check silently (Stage 2.2: batch model-transform
+    # payloads make it much easier for a malformed/malicious client to slip
+    # a non-finite value into a Position/Rotation than the old single-field
+    # update_property path did, so this gap is closed here for everyone).
     return all(
-        isinstance(component, (int, float)) and not isinstance(component, bool)
+        isinstance(component, (int, float))
+        and not isinstance(component, bool)
+        and math.isfinite(component)
         for component in value
     )
 
