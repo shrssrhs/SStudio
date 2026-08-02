@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from panda3d.core import Filename, TransparencyAttrib, WindowProperties
+from panda3d.core import Filename, TransparencyAttrib
 from ursina import (
     AmbientLight,
     Cone,
@@ -174,6 +174,197 @@ def _force_native_child_parenting(native_hwnd: int, parent_hwnd: int, width: int
         return _win32_window_info(native_hwnd)
     except Exception as error:
         return {"error": str(error)}
+
+
+def _reposition_native_child(native_hwnd: int, width: int, height: int) -> None:
+    """Lightweight resize/reposition for a window ALREADY confirmed to be a
+    real WS_CHILD of the right parent — plain SetWindowPos, no SetParent, no
+    GWL_STYLE change, no Panda3D requestProperties() call. Deliberately not
+    routed through Panda3D's Python API: that's what was causing Panda3D to
+    silently reset the window back to a parentless top-level popup on every
+    call (see _sync_panda_window_to_container). A same-parent SetWindowPos
+    doesn't touch the window's parent/style, so it doesn't trigger that."""
+    if not native_hwnd:
+        return
+    try:
+        ctypes.windll.user32.SetWindowPos(
+            ctypes.c_void_p(native_hwnd),
+            None,
+            0, 0, int(width), int(height),
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------
+# ПОЛНАЯ ИНВЕНТАРИЗАЦИЯ (диагностика дублирующегося render-surface)
+#
+# Не предполагаем, что один HWND = одна видимая картинка. Здесь мы
+# перечисляем buквально ВСЁ: все GraphicsOutput у Panda3D (не только
+# base.win) и все окна процесса на уровне Win32 — чтобы доказать, что
+# именно дублируется, а не гадать.
+# ------------------------------------------------------------
+
+GWL_EXSTYLE = -20
+DWMWA_CLOAKED = 14
+
+
+def _dump_panda_graphics_outputs() -> list[dict[str, Any]]:
+    """Каждый GraphicsOutput, который знает graphicsEngine — не только
+    application.base.win. Включает offscreen-буферы (у них getWindowHandle()
+    вернёт None/ошибку — это ожидаемо, не баг)."""
+    engine = getattr(application.base, "graphicsEngine", None)
+    if engine is None:
+        return [{"error": "no graphicsEngine"}]
+
+    results: list[dict[str, Any]] = []
+    try:
+        count = engine.getNumWindows()
+    except Exception as error:
+        return [{"error": f"getNumWindows failed: {error}"}]
+
+    for index in range(count):
+        try:
+            output = engine.getWindow(index)
+        except Exception as error:
+            results.append({"index": index, "error": str(error)})
+            continue
+
+        entry: dict[str, Any] = {
+            "index": index,
+            "type": type(output).__name__,
+            "is_base_win": output == getattr(application.base, "win", None),
+            "size": None,
+            "hwnd": None,
+            "active": None,
+            "display_regions": [],
+        }
+        try:
+            entry["size"] = (output.getXSize(), output.getYSize())
+        except Exception:
+            pass
+        try:
+            entry["active"] = bool(output.isActive())
+        except Exception:
+            pass
+        try:
+            handle = output.getWindowHandle()
+            if handle is not None:
+                entry["hwnd"] = int(handle.getIntHandle())
+        except Exception:
+            pass
+        try:
+            for region_index in range(output.getNumDisplayRegions()):
+                region = output.getDisplayRegion(region_index)
+                camera_node = None
+                try:
+                    camera_path = region.getCamera()
+                    if camera_path and not camera_path.isEmpty():
+                        camera_node = str(camera_path)
+                except Exception:
+                    pass
+                entry["display_regions"].append({
+                    "index": region_index,
+                    "active": bool(region.isActive()) if hasattr(region, "isActive") else None,
+                    "camera": camera_node,
+                })
+        except Exception:
+            pass
+
+        results.append(entry)
+
+    return results
+
+
+def _enumerate_process_windows() -> list[dict[str, Any]]:
+    """Каждое окно (top-level + дочерние, рекурсивно), принадлежащее
+    ТЕКУЩЕМУ процессу — класс, заголовок, parent, стили, rect, видимость,
+    DWM-cloaked. Используется, чтобы найти "лишние" HWND-ы, которые не
+    всплывают через application.base.win/graphicsEngine напрямую."""
+    try:
+        user32 = ctypes.windll.user32
+        current_pid = ctypes.windll.kernel32.GetCurrentProcessId()
+
+        get_style = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+        collected: dict[int, dict[str, Any]] = {}
+
+        def describe(hwnd: int) -> dict[str, Any]:
+            class_buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(ctypes.c_void_p(hwnd), class_buf, 256)
+            title_buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(ctypes.c_void_p(hwnd), title_buf, 256)
+
+            style = get_style(ctypes.c_void_p(hwnd), GWL_STYLE) & 0xFFFFFFFF
+            exstyle = get_style(ctypes.c_void_p(hwnd), GWL_EXSTYLE) & 0xFFFFFFFF
+            parent = user32.GetParent(ctypes.c_void_p(hwnd))
+
+            rect = _RECT()
+            user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect))
+
+            cloaked = ctypes.c_int(0)
+            try:
+                ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                    ctypes.c_void_p(hwnd), DWMWA_CLOAKED,
+                    ctypes.byref(cloaked), ctypes.sizeof(cloaked),
+                )
+            except Exception:
+                pass
+
+            return {
+                "hwnd": hwnd,
+                "class_name": class_buf.value,
+                "title": title_buf.value,
+                "parent_hwnd": int(parent) if parent else None,
+                "is_child": bool(style & WS_CHILD),
+                "is_popup": bool(style & WS_POPUP),
+                "ex_topmost": bool(exstyle & 0x00000008),  # WS_EX_TOPMOST
+                "window_rect": (rect.left, rect.top, rect.right, rect.bottom),
+                "visible": bool(user32.IsWindowVisible(ctypes.c_void_p(hwnd))),
+                "dwm_cloaked": bool(cloaked.value),
+            }
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def enum_child_proc(hwnd, _lparam):
+            hwnd_int = int(hwnd) if hwnd else 0
+            if hwnd_int and hwnd_int not in collected:
+                collected[hwnd_int] = describe(hwnd_int)
+            return True
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def enum_top_proc(hwnd, _lparam):
+            hwnd_int = int(hwnd) if hwnd else 0
+            if not hwnd_int:
+                return True
+            pid = ctypes.c_ulong(0)
+            user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+            if pid.value != current_pid:
+                return True
+            if hwnd_int not in collected:
+                collected[hwnd_int] = describe(hwnd_int)
+            user32.EnumChildWindows(ctypes.c_void_p(hwnd), enum_child_proc, 0)
+            return True
+
+        user32.EnumWindows(enum_top_proc, 0)
+        return list(collected.values())
+    except Exception as error:
+        return [{"error": str(error)}]
+
+
+def _log_full_embedding_inventory(label: str) -> None:
+    print(f"[VIEWPORT_INVENTORY] ===== {label} =====")
+
+    outputs = _dump_panda_graphics_outputs()
+    print(f"[VIEWPORT_INVENTORY] Panda3D GraphicsOutputs ({len(outputs)}):")
+    for entry in outputs:
+        print(f"[VIEWPORT_INVENTORY]   {entry}")
+
+    windows = _enumerate_process_windows()
+    print(f"[VIEWPORT_INVENTORY] Process HWNDs ({len(windows)}):")
+    for entry in windows:
+        print(f"[VIEWPORT_INVENTORY]   {entry}")
+
+    print(f"[VIEWPORT_INVENTORY] ===== end {label} =====")
 
 
 # ============================================================
@@ -1035,36 +1226,51 @@ class MultiplayerGame(Entity):
     # --------------------------------------------------------
     # ГЕОМЕТРИЯ ВСТРОЕННОГО ОКНА (см. подробный разбор бага в отчёте задачи)
     #
-    # Часть 1 (уже была исправлена) — стухший SIZE: ursina.window это САМ
-    # объект WindowProperties (класс Window наследуется от WindowProperties,
-    # не оборачивает его), единственный на процесс. mouse.visible/mouse.locked
-    # (ursina/mouse.py) на каждое переключение делают
-    # application.base.win.requestProperties(window) — шлют Panda3D ВЕСЬ
-    # накопленный на этом объекте набор свойств.
+    # Три слоя бага, найденные по очереди:
     #
-    # Часть 2 (эта причина размера) — ТАКЖЕ стухший ORIGIN: ursina сама
-    # вызывает window.position = Vec2(x, y) при старте (см. "set window
-    # position" в логе) — это ursina/window.py Window.position.setter,
-    # который делает self.setOrigin(x, y) на том же синглтоне. Значение —
-    # координаты ЭКРАНА, актуальные, пока Panda3D владеет top-level окном
-    # (до встраивания). После createWindowContainer() нативное окно становится
-    # ДОЧЕРНИМ окном Qt-контейнера, и Windows интерпретирует origin
-    # WindowProperties для дочернего окна как координаты ОТНОСИТЕЛЬНО
-    # РОДИТЕЛЯ, а не экрана. window.setOrigin() с тех пор ни разу не
-    # обновлялся на (0, 0) — поэтому каждый requestProperties(window) (тот же
-    # mouse.visible) заново прикладывает старые экранные координаты как
-    # локальные координаты внутри контейнера, сдвигая вьюпорт вправо/вниз.
-    # Это и есть баг со скриншота: размер уже был исправлён (часть 1), но
-    # origin — нет.
+    # 1) Стухший SIZE: ursina.window САМ является объектом WindowProperties
+    #    (Window наследуется от WindowProperties), общим на весь процесс.
+    #    mouse.visible/mouse.locked (ursina/mouse.py) на каждое переключение
+    #    делают application.base.win.requestProperties(window) — шлют
+    #    Panda3D ВЕСЬ накопленный на этом объекте набор свойств, включая
+    #    size от исходного Ursina(size=(1100, 700)).
     #
-    # Исправление — держим синхронными И size, И origin:
-    #  1) на каждый Resize контейнера (PandaWindowFocusFilter) синхронизируем
-    #     window.size = размер контейнера, window.origin = (0, 0);
-    #  2) защитный ресинк сразу после переключений mouse.visible (это именно
-    #     то место, где ursina/mouse.py уже вызвал requestProperties() со
-    #     старыми данными — досинхронизация идёт СРАЗУ после, тем же кадром);
-    #  3) собственный WindowProperties-запрос (props) тоже всегда несёт явный
-    #     setOrigin(0, 0) — не полагаемся только на синглтон window.
+    # 2) Стухший ORIGIN: ursina сама вызывает window.position = Vec2(x, y)
+    #    при старте — это экранные координаты, актуальные только для
+    #    top-level окна (до встраивания). После embedding Windows
+    #    интерпретирует тот же origin для ДОЧЕРНЕГО окна как координаты
+    #    ОТНОСИТЕЛЬНО РОДИТЕЛЯ, а не экрана — те же requestProperties(window)
+    #    протаскивают его как локальные координаты, сдвигая вьюпорт.
+    #
+    # 3) Настоящий корень обоих: полная инвентаризация (_dump_panda_graphics_
+    #    outputs + EnumWindows по всему процессу — см. _log_full_embedding_
+    #    inventory) показала, что Panda3D GraphicsOutput всегда РОВНО ОДИН —
+    #    то есть дублирования рендер-поверхности НЕТ. Но createWindowContainer()
+    #    не реально не репарентит нативное окно на этой связке Qt/Windows
+    #    (остаётся top-level WS_POPUP, parent_hwnd=None), И КРОМЕ ТОГО —
+    #    request_properties() САМ ПО СЕБЕ откатывает уже принудительно
+    #    припарентованное окно обратно к тому же состоянию на каждый вызов.
+    #    Раньше мы боролись с этим повторным принудительным репарентингом на
+    #    каждый requestProperties() — а именно частые SetParent/GWL_STYLE-
+    #    вызовы это то, что выглядит на реальном экране как "второй,
+    #    сдвинутый рендер" (DWM-артефакт compositing/ghosting при смене
+    #    родителя окна, который PrintWindow — наш способ скриншотить —
+    #    в принципе не воспроизводит, поэтому мы не видели его на своих
+    #    скриншотах).
+    #
+    # Итоговое решение — не бороться с requestProperties(), а не давать
+    # повода её вызывать:
+    #  1) mouse.visible/mouse.locked для ВСТРОЕННОГО вьюпорта больше не
+    #     трогаем вообще — курсор прячем через Qt (_set_embedded_cursor_hidden),
+    #     это единственный runtime-вызывающий requestProperties() код,
+    #     которым мы управляем;
+    #  2) сами мы тоже не вызываем panda_window.requestProperties() — только
+    #     сырой Win32 SetWindowPos (_reposition_native_child), который не
+    #     проходит через Panda3D API и потому не запускает сброс;
+    #  3) полный (тяжёлый) репарентинг — SetParent + смена стиля — теперь
+    #     нужен только один раз, при embed; на resize просто проверяем, что
+    #     is_child/parent_hwnd всё ещё верны, и делаем только лёгкий
+    #     reposition, если да.
     # --------------------------------------------------------
 
     def _log_viewport_geometry(self, label: str) -> None:
@@ -1149,64 +1355,94 @@ class MultiplayerGame(Entity):
         target_height = max(1, container.height())
 
         self._log_viewport_geometry(f"before sync [{reason}]")
+        if DEBUG_VIEWPORT_GEOMETRY:
+            _log_full_embedding_inventory(f"before sync [{reason}]")
 
-        # Обновляем сам синглтон ursina.window — без этого следующий
-        # requestProperties(window) из mouse.py снова протащит и старый
-        # размер, и старые (ЭКРАННЫЕ) координаты origin как локальные
-        # координаты внутри контейнера (см. комментарий выше).
+        # Обновляем сам синглтон ursina.window — просто чтобы кэш был
+        # согласован для любого стороннего кода, который его читает. НЕ
+        # вызываем requestProperties() отсюда: полная инвентаризация
+        # (_dump_panda_graphics_outputs + EnumWindows по всему процессу)
+        # показала, что GraphicsOutput у Panda3D всегда ровно один — то
+        # есть видимое на реальном экране "дублирование" не второй
+        # рендер-поверхностью, а DWM-артефактом compositing/ghosting от
+        # ЧАСТЫХ SetParent-вызовов, которые раньше делались на каждый
+        # requestProperties(). requestProperties() на Windows сама по себе
+        # откатывает нативное окно к top-level WS_POPUP без родителя
+        # (см. _force_native_child_parenting) — и раньше мы реагировали на
+        # это повторным принудительным репарентингом на каждый вызов, что
+        # и порождало видимые артефакты. Теперь просто не даём поводу
+        # возникнуть: единственный чужой вызов requestProperties() в рантайме
+        # — из ursina/mouse.py при mouse.visible — устранён ниже (Qt-курсор
+        # вместо mouse.visible для встроенного вьюпорта), а сами мы
+        # запрашиваем позицию/размер только через сырой Win32 SetWindowPos
+        # (_reposition_native_child), который НЕ проходит через Panda3D API
+        # и потому не запускает этот сброс.
         window.setSize(target_width, target_height)
         window.setOrigin(0, 0)
 
-        # Свой запрос тоже всегда явно несёт origin=(0, 0) — дочернее окно
-        # не должно сдвигаться относительно контейнера ни при каких условиях.
-        props = WindowProperties()
-        props.setSize(target_width, target_height)
-        props.setOrigin(0, 0)
-        panda_window.requestProperties(props)
-
-        # ВАЖНО: измерено диагностикой, что Panda3D's request_properties()
-        # на Windows сам по себе иногда откатывает нативное окно обратно к
-        # top-level WS_POPUP без родителя (видимо, пересобирает его под
-        # свои же внутренние WindowProperties, которые никогда не знали о
-        # внешнем Qt-репарентинге) — то есть именно ЭТОТ вызов способен
-        # разрушить репарентинг, сделанный при embed. Поэтому переприменяем
-        # принудительный Win32 child-parenting здесь же, на каждый sync, а
-        # не только один раз при embed.
         try:
             native_hwnd = int(panda_window.getWindowHandle().getIntHandle())
             parent_hwnd = int(container.winId())
-            result = _force_native_child_parenting(native_hwnd, parent_hwnd, target_width, target_height)
-            if DEBUG_VIEWPORT_GEOMETRY and not result.get("is_child"):
-                print(f"[VIEWPORT_GEOMETRY] re-parenting still failed after sync [{reason}]: {result}")
+            info = _win32_window_info(native_hwnd)
+            if info.get("is_child") and info.get("parent_hwnd") == parent_hwnd:
+                # Уже корректно припарентовано — только переставляем
+                # позицию/размер, БЕЗ SetParent/смены стиля (это и есть
+                # дешёвая, не вызывающая DWM-артефактов операция).
+                _reposition_native_child(native_hwnd, target_width, target_height)
+            else:
+                # Родитель/стиль реально не те, что нужно — только тогда
+                # делаем полный (более тяжёлый) репарентинг.
+                result = _force_native_child_parenting(native_hwnd, parent_hwnd, target_width, target_height)
+                if DEBUG_VIEWPORT_GEOMETRY and not result.get("is_child"):
+                    print(f"[VIEWPORT_GEOMETRY] re-parenting still failed after sync [{reason}]: {result}")
         except Exception as error:
             if DEBUG_VIEWPORT_GEOMETRY:
                 print(f"[VIEWPORT_GEOMETRY] re-parenting raised after sync [{reason}]: {error}")
 
+        if DEBUG_VIEWPORT_GEOMETRY:
+            _log_full_embedding_inventory(f"after sync [{reason}]")
+
         self._log_viewport_geometry(f"after sync [{reason}]")
 
-    def _start_mouse_look(self) -> None:
-        # Скрытие курсора трогает только cursor_hidden окна Panda3D,
-        # не mouse_mode — это безопасно и для встроенного, и для
-        # отдельного окна (в отличие от mouse.locked).
-        mouse.visible = False
-        self._sync_panda_window_to_container("start_mouse_look")
+    def _set_embedded_cursor_hidden(self, hidden: bool) -> None:
+        """Прячет/показывает курсор через Qt (QWidget.setCursor), а не
+        через ursina mouse.visible. ursina/mouse.py's visible.setter делает
+        application.base.win.requestProperties(window) на КАЖДОЕ
+        переключение — а это именно то, что заставляет Panda3D откатывать
+        нативное окно к top-level WS_POPUP без родителя (см. разбор в
+        _sync_panda_window_to_container). Скрытие курсора чисто на стороне
+        Qt никогда не трогает Panda3D window properties вообще."""
+        container = self.qt_viewport_container
+        if container is None:
+            return
+        if hidden:
+            container.setCursor(Qt.CursorShape.BlankCursor)
+        else:
+            container.unsetCursor()
 
+    def _start_mouse_look(self) -> None:
         if self._qt_look_available():
+            # Всё ещё встроенный вьюпорт — курсор прячем через Qt, НЕ через
+            # mouse.visible (см. _set_embedded_cursor_hidden).
+            self._set_embedded_cursor_hidden(True)
+
             container = self.qt_viewport_container
             assert container is not None
             center_global = container.mapToGlobal(container.rect().center())
             QCursor.setPos(center_global)
             self._qt_look_last_pos = center_global
         else:
+            # Отдельное top-level окно Panda3D (--no-embed) — там весь этот
+            # баг не воспроизводится, штатный ursina-путь безопасен.
+            mouse.visible = False
             mouse.locked = True
 
     def _stop_mouse_look(self) -> None:
-        mouse.visible = True
-        self._sync_panda_window_to_container("stop_mouse_look")
-
         if self._qt_look_available():
+            self._set_embedded_cursor_hidden(False)
             self._qt_look_last_pos = None
         else:
+            mouse.visible = True
             mouse.locked = False
 
     def _poll_qt_look_delta(self) -> tuple[float, float]:
@@ -2500,10 +2736,16 @@ def embed_panda_window(
         bridge.log("error", "Qt could not wrap the Panda3D native window.")
         return False
 
+    if DEBUG_VIEWPORT_GEOMETRY:
+        _log_full_embedding_inventory("before createWindowContainer")
+
     container = QWidget.createWindowContainer(foreign_window)
     container.setMinimumSize(640, 360)
     container.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     container.setMouseTracking(True)
+
+    if DEBUG_VIEWPORT_GEOMETRY:
+        _log_full_embedding_inventory("after createWindowContainer, before force-reparent")
 
     focus_filter = PandaWindowFocusFilter(container, foreign_window, game)
     container.installEventFilter(focus_filter)
@@ -2542,6 +2784,7 @@ def embed_panda_window(
     if DEBUG_VIEWPORT_GEOMETRY:
         print(f"[VIEWPORT_GEOMETRY] native HWND parenting before force: {parenting_before}")
         print(f"[VIEWPORT_GEOMETRY] native HWND parenting after force: {parenting_after}")
+        _log_full_embedding_inventory("after force-reparent + initial sync")
 
     bridge.log("info", f"Ursina viewport embedded. Native handle: {handle}")
     return True
