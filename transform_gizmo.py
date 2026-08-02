@@ -110,6 +110,20 @@ SCALE_HANDLE_HIT_RADIUS = 0.32
 # иначе коэффициент масштабирования мог бы улететь в бесконечность.
 SCALE_UNIFORM_MIN_START_DISTANCE = 0.05
 
+# Bug-report follow-up (uniform handle "instant jump on mouse-down",
+# still reported present after the delta-based factor fix in 4bf1331):
+# a hard pixel-space dead zone for the UNIFORM handle only. Until the
+# physical mouse has moved at least this many screen pixels from its
+# press-time position, _update_uniform_scale_drag returns None — no
+# Size/Position write of ANY kind happens, not even a "factor==1.0,
+# same value" write. This is deliberately independent of (on top of)
+# the world-space delta math: even if some other factor entirely (a
+# second write path, a stale process, camera movement) were still
+# producing a visible jump, gating the write itself on real pixel
+# movement makes that structurally impossible for the uniform handle.
+# Axis handles are NOT touched.
+SCALE_UNIFORM_DEAD_ZONE_PIXELS = 3.0
+
 SCALE_HANDLE_COLOR = color.rgb32(225, 225, 225)
 SCALE_HANDLE_HIGHLIGHT_COLOR = color.rgb32(255, 230, 90)
 
@@ -312,6 +326,8 @@ class TransformGizmo:
         self._drag_start_quat = Quat()
         self._drag_axis_direction = Vec3(1, 0, 0)
         self._drag_start_uniform_distance = 1.0
+        self._drag_start_mouse_pixel = (0.0, 0.0)
+        self._scale_debug_frame_count = 0
         self._last_result: Optional[Union[tuple[str, Vec3], dict[str, Vec3]]] = None
         self._current_scale = 1.0
 
@@ -610,6 +626,15 @@ class TransformGizmo:
         self._reset_colors()
         return True
 
+    @staticmethod
+    def _current_mouse_pixel() -> tuple[float, float]:
+        """Approximate physical screen-pixel mouse position, derived from
+        Ursina's normalized mouse.x/mouse.y and the window's pixel size.
+        Good enough for a "few pixels" dead-zone threshold — not meant to
+        be exact sub-pixel precision."""
+        size = window.size
+        return (float(mouse.x) * size[0], float(mouse.y) * size[1])
+
     def _begin_scale_drag(self, ray_origin: Vec3, ray_direction: Vec3) -> bool:
         key, _ = self._best_scale_handle_hit(ray_origin, ray_direction)
         if key is None:
@@ -617,11 +642,14 @@ class TransformGizmo:
 
         self._drag_scale_handle = key
         self._last_result = None
+        self._scale_debug_frame_count = 0
         self._drag_start_position = Vec3(self._target.position)
         self._drag_start_size = Vec3(self._target.scale)
         self._drag_start_quat = Quat(self._target.get_quat())
+        self._drag_start_mouse_pixel = self._current_mouse_pixel()
 
         if key == _SCALE_UNIFORM_KEY:
+            axis, sign = None, None
             # Stage 2.3 fix: keep the TRUE (unclamped) click-to-center
             # distance separate from the floored value used only to
             # normalize the delta's sensitivity. The old code clamped
@@ -650,6 +678,21 @@ class TransformGizmo:
 
         if DEBUG_GIZMO:
             print(f"[GIZMO] begin_drag scale handle={key} start_size={self._drag_start_size}")
+
+        if DEBUG_SCALE_GIZMO:
+            target_id = getattr(self._target, "part_id", repr(self._target))
+            print(
+                f"[SCALE_GIZMO] PRESS handle_id={key!r} "
+                f"handle_type={'uniform' if key == _SCALE_UNIFORM_KEY else 'axis'} "
+                f"axis={axis!r} sign={sign!r} "
+                f"branch={'uniform-scale' if key == _SCALE_UNIFORM_KEY else 'axis-scale'} "
+                f"target_id={target_id!r} "
+                f"drag_start_position={self._drag_start_position} "
+                f"drag_start_size={self._drag_start_size} "
+                f"mouse=({mouse.x:.6f},{mouse.y:.6f}) "
+                f"mouse_pixel={self._drag_start_mouse_pixel} "
+                f"ray_origin={ray_origin} ray_direction={ray_direction}"
+            )
 
         self._dragging = True
         self._hovered_scale_handle = key
@@ -750,6 +793,7 @@ class TransformGizmo:
         return "Rotation", Vec3(new_rotation)
 
     def _update_scale_drag(self, ray_origin, ray_direction, move_snap_size, snap_enabled):
+        self._scale_debug_frame_count += 1
         if self._drag_scale_handle == _SCALE_UNIFORM_KEY:
             return self._update_uniform_scale_drag(ray_origin, ray_direction, move_snap_size, snap_enabled)
         return self._update_axis_scale_drag(ray_origin, ray_direction, move_snap_size, snap_enabled)
@@ -807,52 +851,88 @@ class TransformGizmo:
         is what keeps original proportions exact). Position is untouched;
         uniform scale is anchored at the Part's own center.
 
-        Stage 2.3 fix (mouse-down jump): the factor is a normalized DELTA
-        from the drag-start reference distance, not a raw ratio of two
-        independently-measured distances. current_distance ==
-        _drag_start_uniform_distance (pointer hasn't moved since
-        mouse-down) makes delta exactly 0 and therefore factor exactly
-        1.0, structurally — it does not depend on how small the true
-        click-to-center distance was. The previous `current_distance /
-        drag_start_uniform_distance` ratio broke this invariant whenever
-        the true click distance was below SCALE_UNIFORM_MIN_START_DISTANCE:
-        _begin_scale_drag floored the DENOMINATOR to that minimum, but
-        current_distance here is recomputed fresh every frame from the
-        real (unclamped) geometry, so on the very first zero-movement
-        frame the numerator no longer matched the artificially-raised
-        denominator, producing a nonzero factor with no mouse movement at
-        all. The floor is still applied, but only to the delta's
-        sensitivity reference, which cannot by itself make delta nonzero."""
+        Bug-report follow-up (uniform handle "instant jump on mouse-down",
+        reported still present after 4bf1331's delta-based factor fix):
+        a HARD PIXEL-SPACE DEAD ZONE now gates every write in this
+        function. Until the physical mouse has moved
+        SCALE_UNIFORM_DEAD_ZONE_PIXELS from its press-time position, this
+        returns None — no Size/Position write happens at all, not even a
+        "factor==1.0, unchanged value" write. This is intentionally a
+        SEPARATE, independent guard on top of the delta-based factor math
+        below (kept from 4bf1331): even if that math were not the true
+        cause of a residual visible jump (stale process, a second write
+        path, camera movement — see the bug report's own list), gating
+        the write on real screen-pixel movement makes a press-only jump
+        structurally impossible here, regardless of cause.
+
+        The world-space delta math (factor = 1.0 + delta / sensitivity)
+        is UNCHANGED and still computed from the immutable drag-start
+        baseline captured once in _begin_scale_drag — the dead-zone check
+        does not feed back into it, so crossing the threshold applies
+        whatever (small, continuous) factor that immutable baseline
+        already implies at that pointer position, not a fresh jump."""
+        frame_no = self._scale_debug_frame_count
+        verbose = DEBUG_SCALE_GIZMO and frame_no <= 5
+
+        current_mouse_pixel = self._current_mouse_pixel()
+        pixel_dx = current_mouse_pixel[0] - self._drag_start_mouse_pixel[0]
+        pixel_dy = current_mouse_pixel[1] - self._drag_start_mouse_pixel[1]
+        pixel_distance = math.hypot(pixel_dx, pixel_dy)
+
+        if verbose:
+            print(
+                f"[SCALE_GIZMO] frame={frame_no} update_fn=_update_uniform_scale_drag "
+                f"active_handle={self._drag_scale_handle!r} "
+                f"mouse=({mouse.x:.6f},{mouse.y:.6f}) mouse_pixel={current_mouse_pixel} "
+                f"press_mouse_pixel={self._drag_start_mouse_pixel} "
+                f"pixel_distance_from_press={pixel_distance:.3f}px "
+                f"snap_enabled={snap_enabled} move_snap_size={move_snap_size}"
+            )
+
+        if pixel_distance < SCALE_UNIFORM_DEAD_ZONE_PIXELS:
+            if verbose:
+                print(
+                    f"[SCALE_GIZMO] frame={frame_no} DEAD ZONE "
+                    f"(pixel_distance={pixel_distance:.3f}px < "
+                    f"{SCALE_UNIFORM_DEAD_ZONE_PIXELS}px) -> NO WRITE"
+                )
+            return None
+
+        size_before = Vec3(self._target.scale)
+        position_before = Vec3(self._target.position)
+
         current_distance = self._point_to_ray_distance(self._drag_start_position, ray_origin, ray_direction)
         delta = current_distance - self._drag_start_uniform_distance
         sensitivity_reference = max(self._drag_start_uniform_distance, SCALE_UNIFORM_MIN_START_DISTANCE)
         factor = 1.0 + delta / sensitivity_reference
-        if DEBUG_SCALE_GIZMO:
+        if verbose:
             print(
-                f"[SCALE_GIZMO] uniform drag_start_size={self._drag_start_size} "
-                f"drag_start_distance={self._drag_start_uniform_distance:.6f} "
-                f"current_distance={current_distance:.6f} delta={delta:.6f} "
-                f"raw_factor={factor:.6f}"
+                f"[SCALE_GIZMO] frame={frame_no} raw_metric(current_distance)={current_distance:.6f} "
+                f"drag_start_metric={self._drag_start_uniform_distance:.6f} "
+                f"delta={delta:.6f} raw_factor={factor:.6f}"
             )
         if not math.isfinite(factor) or factor <= 0:
             return None
 
         start = self._drag_start_size
 
-        # No perceptible pointer movement since mouse-down: Size must stay
-        # EXACTLY the drag-start Size. With snap enabled, re-snapping the
-        # absolute reference dimension to the grid below could otherwise
-        # manufacture a tiny but nonzero jump purely because drag-start
-        # Size wasn't already grid-aligned, even though delta (and the
-        # true factor) is 0 — short-circuiting here keeps the zero-
-        # movement invariant exact regardless of snap settings.
+        # No perceptible WORLD-SPACE movement despite crossing the pixel
+        # dead zone (rare, but geometrically possible depending on camera
+        # angle): Size must stay EXACTLY the drag-start Size. With snap
+        # enabled, re-snapping the absolute reference dimension to the
+        # grid below could otherwise manufacture a tiny but nonzero jump
+        # purely because drag-start Size wasn't already grid-aligned.
         if abs(delta) < 1e-9:
             new_size = Vec3(start)
             self._target.scale = new_size
             if DEBUG_GIZMO:
                 print(f"[GIZMO] scale uniform factor=1.0000 size={new_size}")
-            if DEBUG_SCALE_GIZMO:
-                print(f"[SCALE_GIZMO] uniform snapped_factor=1.000000 resulting_size={new_size}")
+            if verbose:
+                print(
+                    f"[SCALE_GIZMO] frame={frame_no} snapped_factor=1.000000 "
+                    f"size_before={size_before} size_after={new_size} "
+                    f"position_before={position_before} position_after={Vec3(self._target.position)}"
+                )
             return {"Size": Vec3(new_size)}
 
         reference = max(start.x, start.y, start.z)
@@ -875,8 +955,12 @@ class TransformGizmo:
 
         if DEBUG_GIZMO:
             print(f"[GIZMO] scale uniform factor={effective_factor:.4f} size={new_size}")
-        if DEBUG_SCALE_GIZMO:
-            print(f"[SCALE_GIZMO] uniform snapped_factor={effective_factor:.6f} resulting_size={new_size}")
+        if verbose:
+            print(
+                f"[SCALE_GIZMO] frame={frame_no} snapped_factor={effective_factor:.6f} "
+                f"size_before={size_before} size_after={new_size} "
+                f"position_before={position_before} position_after={Vec3(self._target.position)}"
+            )
 
         return {"Size": Vec3(new_size)}
 

@@ -7,6 +7,7 @@ import ctypes
 import json
 import math
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -2607,6 +2608,8 @@ class MultiplayerGame(Entity):
         interval = 1.0 / GIZMO_NETWORK_SEND_RATE
         if force_network or (now - self._gizmo_last_network_send) >= interval:
             self._gizmo_last_network_send = now
+            if DEBUG_SCALE_GIZMO:
+                print(f"[SCALE_GIZMO] client_studio OUTGOING part_id={part_id} force_network={force_network} payload={updated}")
             self.apply_property_edit(part_id, dict(updated))
             if DEBUG_GIZMO_TIMING:
                 self._gizmo_timing.tick("network_send")
@@ -3187,6 +3190,8 @@ class MultiplayerGame(Entity):
         if properties and instance_id == self._gizmo_dragging_instance_id:
             if DEBUG_GIZMO_TIMING:
                 self._gizmo_timing.tick("server_echo")
+            if DEBUG_SCALE_GIZMO:
+                print(f"[SCALE_GIZMO] client_studio INCOMING echo (dragging, filtered) id={instance_id} raw_properties={properties}")
             # Сервер — источник истины ВНЕ активного локального
             # перетаскивания (см. отчёт задачи), но while a drag on THIS
             # instance is in progress, network throttling (см.
@@ -3201,6 +3206,8 @@ class MultiplayerGame(Entity):
             properties = {k: v for k, v in properties.items() if k not in ("Position", "Rotation", "Size")}
 
         if properties:
+            if DEBUG_SCALE_GIZMO and "Size" in properties:
+                print(f"[SCALE_GIZMO] client_studio INCOMING echo (applied) id={instance_id} properties={properties}")
             self._apply_instance_properties(record, properties, replace=False)
         if name is not None:
             record.name = name
@@ -3873,6 +3880,49 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _print_startup_diagnostics() -> None:
+    """Bug-report follow-up (uniform-scale mouse-down jump, reported as
+    'still present after 4bf1331'): prints exactly what source this
+    running process is executing, so a stale packaged .exe (see
+    PickADoor.spec / dist/) or an already-running pre-fix process can be
+    told apart from an actual current-checkout run instead of guessed at.
+    getattr(sys, 'frozen', False) is True specifically inside a
+    PyInstaller-built .exe — a frozen build has no .git directory
+    alongside it, so `git rev-parse HEAD` deliberately isn't attempted
+    there (it would just print a confusing 'not a git repository' error);
+    the frozen line itself already answers the question."""
+    if getattr(sys, "frozen", False):
+        print(
+            f"[STARTUP] FROZEN BUILD (PyInstaller) — running from "
+            f"{sys.executable}, NOT the live source checkout. Source-tree "
+            f"fixes (including transform_gizmo.py's Scale drag fixes) do "
+            f"NOT apply here; rebuild the .exe or run "
+            f"'python client_studio.py' from source instead."
+        )
+        return
+    repo_dir = Path(__file__).resolve().parent
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True, stderr=subprocess.STDOUT,
+        ).strip()
+    except Exception as error:
+        commit = f"<git rev-parse failed: {error}>"
+    try:
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=repo_dir, text=True, stderr=subprocess.STDOUT,
+        ).strip()
+    except Exception:
+        dirty = "<unknown>"
+    print(f"[STARTUP] running from source: {repo_dir}")
+    print(f"[STARTUP] git HEAD: {commit}")
+    print(f"[STARTUP] git working tree dirty: {bool(dirty)!r}")
+    print(f"[STARTUP] sys.executable: {sys.executable}")
+    print(f"[STARTUP] client_studio.py: {Path(__file__).resolve()}")
+    import transform_gizmo as _tg
+    print(f"[STARTUP] transform_gizmo module: {Path(_tg.__file__).resolve()}")
+    print(f"[STARTUP] transform_gizmo.DEBUG_SCALE_GIZMO = {_tg.DEBUG_SCALE_GIZMO}")
+
+
 def main() -> int:
     # На большинстве Windows-машин консоль по умолчанию НЕ в UTF-8 (обычно
     # cp1251/cp1252), а в коде много print() с кириллицей — без этого первый
@@ -3885,6 +3935,8 @@ def main() -> int:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+
+    _print_startup_diagnostics()
 
     arguments = parse_arguments()
 
