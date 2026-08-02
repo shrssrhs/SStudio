@@ -65,6 +65,7 @@ from PySide6.QtGui import (
     QTextCursor,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QColorDialog,
@@ -422,6 +423,72 @@ class EngineBridge(QObject):
             self.selection_changed.emit(None)
         self.scene_changed.emit()
 
+    def descendant_ids(self, root_id: str) -> set[str]:
+        """All ids transitively parented under root_id — used by both the
+        local (non-live) set_parent() validation below and by
+        ExplorerPanel's drag-and-drop preview validation, so there is one
+        place that defines "descendant" instead of two."""
+        children_by_parent: dict[str, list[str]] = {}
+        for item in self.objects:
+            children_by_parent.setdefault(item.parent or "Workspace", []).append(item.id)
+        result: set[str] = set()
+        frontier = [root_id]
+        while frontier:
+            current = frontier.pop()
+            for child_id in children_by_parent.get(current, []):
+                if child_id not in result:
+                    result.add(child_id)
+                    frontier.append(child_id)
+        return result
+
+    def set_parent(self, object_id: str, parent_key: str) -> bool:
+        obj = self.get_object(object_id)
+        if obj is None:
+            return False
+
+        if self.live_mode:
+            accepted = bool(self._adapter_call("set_parent", object_id, parent_key, default=False))
+            if not accepted:
+                self.log("warning", "The live engine rejected the reparent request.")
+            return accepted
+
+        # Non-live/demo mode has no server to validate against — apply the
+        # same rules locally (object_registry.is_parent_allowed + cycle/
+        # self checks) so the standalone demo behaves like the live client.
+        if parent_key == object_id:
+            self.log("warning", "An object cannot be its own parent.")
+            return False
+
+        if parent_key in ROOT_SERVICES:
+            target_type = parent_key
+        else:
+            target_obj = self.get_object(parent_key)
+            if target_obj is None:
+                self.log("warning", "Target parent does not exist.")
+                return False
+            target_type = target_obj.object_type
+            if parent_key in self.descendant_ids(object_id):
+                self.log("warning", f"Cannot parent '{obj.name}' to its own descendant.")
+                return False
+
+        if not object_registry.is_parent_allowed(obj.object_type, target_type):
+            self.log("warning", f"'{obj.object_type}' cannot be parented to '{target_type}'.")
+            return False
+
+        if parent_key not in ROOT_SERVICES:
+            target_definition = object_registry.get_object_type(target_type)
+            if target_definition is None or not target_definition.is_container:
+                self.log("warning", f"'{target_type}' cannot contain children.")
+                return False
+
+        obj.parent = parent_key
+        self.scene_changed.emit()
+        if self.selected_id == obj.id:
+            self.selection_changed.emit(obj)
+        self.set_dirty(True)
+        self.log("info", f'Reparented {obj.object_type} "{obj.name}" to {parent_key}')
+        return True
+
     def new_scene(self) -> None:
         if self.live_mode:
             handled = bool(self._adapter_call("new_scene", default=False))
@@ -690,6 +757,37 @@ class EngineBridge(QObject):
             "objects": migrated_objects,
         }
 
+    @staticmethod
+    def _sanitize_hierarchy(objects: list[SceneObject]) -> list[SceneObject]:
+        """Defends against a hand-edited or corrupted scene file: a parent_id
+        that references a missing object, or a parent chain that cycles back
+        on itself. Both get reset to Workspace with a logged warning rather
+        than silently producing a broken/infinite-looking Explorer tree.
+        Not needed for the live/network path — the server (handle_set_parent)
+        already refuses to ever write a cycle into world in the first place,
+        and live-mode blocks file import entirely (see load_from_file)."""
+        by_id = {obj.id: obj for obj in objects}
+        for obj in objects:
+            parent_key = obj.parent or "Workspace"
+            if parent_key not in ROOT_SERVICES and parent_key not in by_id:
+                print(f"[SCENE] '{obj.name}': parent '{parent_key}' not found — moved to Workspace.")
+                obj.parent = "Workspace"
+                continue
+
+            visited = {obj.id}
+            walker_key = parent_key
+            cyclic = False
+            while walker_key in by_id:
+                if walker_key in visited:
+                    cyclic = True
+                    break
+                visited.add(walker_key)
+                walker_key = by_id[walker_key].parent or "Workspace"
+            if cyclic:
+                print(f"[SCENE] '{obj.name}': parent chain forms a cycle — moved to Workspace.")
+                obj.parent = "Workspace"
+        return objects
+
     def load_from_file(self, path: str | Path) -> None:
         source = Path(path)
         raw = json.loads(source.read_text(encoding="utf-8"))
@@ -697,7 +795,7 @@ class EngineBridge(QObject):
         object_data = raw.get("objects", [])
         if not isinstance(object_data, list):
             raise ValueError("Scene file has no valid 'objects' list.")
-        objects = [SceneObject.from_dict(item) for item in object_data]
+        objects = self._sanitize_hierarchy([SceneObject.from_dict(item) for item in object_data])
 
         if self.live_mode:
             accepted = bool(self._adapter_call("import_scene", objects, default=False))
@@ -1199,6 +1297,77 @@ class Ribbon(QWidget):
 # Scene explorer
 # ---------------------------------------------------------------------------
 
+class ExplorerTree(QTreeWidget):
+    """QTreeWidget with hand-rolled internal drag-and-drop, instead of Qt's
+    built-in InternalMove mode. InternalMove would reparent the QTreeWidgetItem
+    immediately on drop, before any business validation runs — for a
+    server-authoritative hierarchy that's backwards: the tree must only move
+    once the server confirms (see ExplorerPanel.handle_drop /
+    EngineBridge.set_parent). So this only ever *reads* drag state; it never
+    calls the base class's dropEvent, meaning Qt never performs its own
+    reparent — ExplorerPanel decides everything.
+
+    No sibling reordering: a drop is only accepted when the drop indicator
+    position is OnItem (or over empty space, meaning "onto Workspace") — not
+    AboveItem/BelowItem, which Qt uses to mean "insert as sibling here"."""
+
+    def __init__(self, panel: "ExplorerPanel", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._panel = panel
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.source() is self:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _drop_target_item(self, event) -> tuple[Optional[QTreeWidgetItem], bool]:
+        """Returns (target_item, position_is_valid). position_is_valid is
+        False for AboveItem/BelowItem (sibling-reorder positions we don't
+        support) when there IS an item under the cursor; dropping on empty
+        space (no item at all) is always valid and means "onto Workspace"."""
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        item = self.itemAt(pos)
+        if item is None:
+            return None, True
+        indicator = self.dropIndicatorPosition()
+        return item, indicator == QAbstractItemView.DropIndicatorPosition.OnItem
+
+    def dragMoveEvent(self, event) -> None:
+        dragged_item = self.currentItem()
+        target_item, position_ok = self._drop_target_item(event)
+        if not position_ok:
+            event.ignore()
+            return
+        ok, _reason = self._panel.can_reparent(dragged_item, target_item)
+        if ok:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        dragged_item = self.currentItem()
+        target_item, position_ok = self._drop_target_item(event)
+        if not position_ok:
+            event.ignore()
+            return
+        ok, _reason = self._panel.can_reparent(dragged_item, target_item)
+        if not ok:
+            event.ignore()
+            return
+        # Deliberately NOT calling super().dropEvent(event) — see class
+        # docstring. We accept the action so Qt ends the drag cleanly, then
+        # hand off to business logic; the tree item itself doesn't move
+        # until/unless the server confirms.
+        event.acceptProposedAction()
+        self._panel.handle_drop(dragged_item, target_item)
+
+
 class ExplorerPanel(QWidget):
     SYSTEM_PROTECTED_TYPES = {"Baseplate", "Camera", "Lighting", "Terrain"}
 
@@ -1223,7 +1392,7 @@ class ExplorerPanel(QWidget):
         search_row.addWidget(self.add_button)
         layout.addLayout(search_row)
 
-        self.tree = QTreeWidget()
+        self.tree = ExplorerTree(self)
         self.tree.setHeaderHidden(True)
         self.tree.setUniformRowHeights(True)
         self.tree.setIndentation(17)
@@ -1252,7 +1421,28 @@ class ExplorerPanel(QWidget):
     # ПОСТРОЕНИЕ ДЕРЕВА (parent = id объекта или имя корневого сервиса)
     # --------------------------------------------------------
 
+    def _collect_expanded_keys(self) -> set[str]:
+        """Stable key per item: object id for real objects, the root's own
+        name for root/service items (roots have UserRole=None, so text(0) is
+        the only stable identity they have)."""
+        keys: set[str] = set()
+
+        def visit(item: QTreeWidgetItem) -> None:
+            if item.isExpanded():
+                key = item.data(0, Qt.ItemDataRole.UserRole) or item.text(0)
+                keys.add(key)
+            for i in range(item.childCount()):
+                visit(item.child(i))
+
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            visit(root.child(i))
+        return keys
+
     def rebuild(self) -> None:
+        expanded_keys = self._collect_expanded_keys()
+        first_rebuild = not expanded_keys and self.tree.topLevelItemCount() == 0
+
         self._syncing = True
         self.tree.clear()
 
@@ -1271,7 +1461,7 @@ class ExplorerPanel(QWidget):
             item.setData(0, Qt.ItemDataRole.UserRole, obj.id)
             item.setIcon(0, self._icon_for_type(obj.object_type, obj.color))
             if not obj.id.startswith("system:"):
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsDragEnabled)
             object_items[obj.id] = item
 
         for obj in self.bridge.objects:
@@ -1286,8 +1476,12 @@ class ExplorerPanel(QWidget):
 
         for index in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(index)
-            if top.text(0) in {"Workspace", "Players"}:
+            key = top.text(0)
+            if key in expanded_keys or (first_rebuild and key in {"Workspace", "Players"}):
                 top.setExpanded(True)
+        for object_id, item in object_items.items():
+            if object_id in expanded_keys:
+                item.setExpanded(True)
 
         self._syncing = False
         self._sync_selection(self.bridge.get_object(self.bridge.selected_id))
@@ -1469,6 +1663,72 @@ class ExplorerPanel(QWidget):
             )
 
         menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    # --------------------------------------------------------
+    # DRAG AND DROP REPARENTING (Stage 2.1)
+    #
+    # Validation runs here (client-side, for immediate drag feedback) AND
+    # independently on the server (handle_set_parent in server.py) — this
+    # copy exists only for responsive UI (reject cursor / highlight while
+    # hovering), it is never the final authority. A client cannot bypass the
+    # rules by skipping this and sending a hand-built set_parent message:
+    # the server re-validates everything from scratch.
+    # --------------------------------------------------------
+
+    def can_reparent(
+        self, dragged_item: Optional[QTreeWidgetItem], target_item: Optional[QTreeWidgetItem],
+    ) -> tuple[bool, str]:
+        if dragged_item is None:
+            return False, "No object selected."
+
+        dragged_id = dragged_item.data(0, Qt.ItemDataRole.UserRole)
+        if not dragged_id:
+            return False, "System objects cannot be reparented."
+
+        dragged_obj = self.bridge.get_object(dragged_id)
+        if dragged_obj is None:
+            return False, "Object no longer exists."
+
+        if target_item is None:
+            target_key = "Workspace"
+            target_type = "Workspace"
+        else:
+            target_id = target_item.data(0, Qt.ItemDataRole.UserRole)
+            if target_id is None:
+                # A root/service item — its display text IS its stable key.
+                target_key = target_item.text(0)
+                target_type = target_key
+            else:
+                if target_id == dragged_id:
+                    return False, "An object cannot be its own parent."
+                target_obj = self.bridge.get_object(target_id)
+                if target_obj is None:
+                    return False, "Target object no longer exists."
+                if target_id in self.bridge.descendant_ids(dragged_id):
+                    return False, f"Cannot parent '{dragged_obj.name}' to its own descendant."
+                target_key = target_id
+                target_type = target_obj.object_type
+
+        if not object_registry.is_parent_allowed(dragged_obj.object_type, target_type):
+            return False, f"'{dragged_obj.object_type}' cannot be parented to '{target_type}'."
+
+        if target_key not in ROOT_SERVICES:
+            target_definition = object_registry.get_object_type(target_type)
+            if target_definition is None or not target_definition.is_container:
+                return False, f"'{target_type}' cannot contain children."
+
+        if (dragged_obj.parent or "Workspace") == target_key:
+            return False, "Already there."
+
+        return True, target_key
+
+    def handle_drop(self, dragged_item: Optional[QTreeWidgetItem], target_item: Optional[QTreeWidgetItem]) -> None:
+        ok, result = self.can_reparent(dragged_item, target_item)
+        if not ok:
+            self.bridge.log("warning", result)
+            return
+        dragged_id = dragged_item.data(0, Qt.ItemDataRole.UserRole)
+        self.bridge.set_parent(dragged_id, result)
 
 
 # ---------------------------------------------------------------------------

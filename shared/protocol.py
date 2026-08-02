@@ -22,3 +22,12 @@ WORLD_SNAPSHOT = "world_snapshot"     # сервер -> клиент: весь �
 PART_CREATED = "part_created"         # сервер -> все клиенты: часть появилась
 PART_DELETED = "part_deleted"         # сервер -> все клиенты: часть удалена
 PART_UPDATED = "part_updated"         # сервер -> все клиенты: свойство поменялось
+                                       # (включая необязательное поле parent_id
+                                       # при успешном реродителении)
+
+# Stage 2.1: явный reparenting-запрос — намеренно НЕ часть update_property:
+# требует валидации циклов/allowed_parent_types на сервере, а не просто
+# санитайза произвольных properties (клиент не может обойти правила, послав
+# parent_id через generic update_property — сервер его там не читает).
+SET_PARENT = "set_parent"                     # клиент -> сервер: запрос на перенос
+SET_PARENT_REJECTED = "set_parent_rejected"   # сервер -> только запросившему клиенту

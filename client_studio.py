@@ -512,6 +512,11 @@ class _GizmoTimingProbe:
             )
 
 
+# Логирует запросы/подтверждения/отклонения реродителения (Stage 2.1
+# Explorer drag-and-drop). Временный диагностический флаг — включать
+# вручную для отладки, в проде должен быть False.
+DEBUG_REPARENTING = False
+
 QT_LOOK_SENSITIVITY_X = 0.08
 QT_LOOK_SENSITIVITY_Y = 0.08
 
@@ -1933,6 +1938,16 @@ class MultiplayerGame(Entity):
         self.network.send({"type": protocol.DELETE_PART, "id": instance_id})
         return True
 
+    def request_set_parent(self, instance_id: str, parent_id: str) -> bool:
+        if not self.network.connected_event.is_set():
+            if self.studio_adapter is not None:
+                self.studio_adapter.log("warning", "Нет подключения к серверу: перенос отменён.")
+            return False
+        if DEBUG_REPARENTING:
+            print(f"[REPARENTING] request: {instance_id} -> {parent_id}")
+        self.network.send({"type": protocol.SET_PARENT, "id": instance_id, "parent_id": parent_id})
+        return True
+
     def request_create_instance(
         self,
         class_name: str,
@@ -2166,10 +2181,18 @@ class MultiplayerGame(Entity):
                 name = raw_name if isinstance(raw_name, str) else None
                 raw_enabled = message.get("enabled")
                 enabled = raw_enabled if isinstance(raw_enabled, bool) else None
+                raw_parent_id = message.get("parent_id")
+                parent_id = raw_parent_id if isinstance(raw_parent_id, str) else None
                 if instance_id:
-                    self.update_instance(instance_id, properties, name, enabled)
+                    self.update_instance(instance_id, properties, name, enabled, parent_id)
             elif message_type == protocol.PART_DELETED:
                 self.remove_instance(str(message.get("id", "")))
+            elif message_type == protocol.SET_PARENT_REJECTED:
+                reason = str(message.get("reason", "Reparent rejected by server."))
+                if DEBUG_REPARENTING:
+                    print(f"[REPARENTING] rejected: {message.get('id')}: {reason}")
+                if self.studio_adapter is not None:
+                    self.studio_adapter.log("warning", reason)
 
     def load_world_snapshot(self, parts: list[dict[str, Any]]) -> None:
         incoming_ids = {str(item.get("id", "")) for item in parts if isinstance(item, dict)}
@@ -2298,10 +2321,16 @@ class MultiplayerGame(Entity):
         properties: dict[str, Any] | None,
         name: str | None,
         enabled: bool | None = None,
+        parent_id: str | None = None,
     ) -> None:
         record = self.instances.get(instance_id)
         if record is None:
             return
+
+        if parent_id is not None and parent_id != record.parent_id:
+            if DEBUG_REPARENTING:
+                print(f"[REPARENTING] confirmed: {instance_id} {record.parent_id!r} -> {parent_id!r}")
+            record.parent_id = parent_id
 
         if properties and instance_id == self._gizmo_dragging_instance_id:
             if DEBUG_GIZMO_TIMING:
@@ -2742,6 +2771,15 @@ class MultiplayerStudioAdapter:
         if object_id.startswith("system:"):
             return False
         return self.game.delete_instance(object_id)
+
+    def set_parent(self, object_id: str, parent_id: str) -> bool:
+        # Финальная валидация всё равно на сервере (handle_set_parent в
+        # server.py) — здесь только фильтруем то, что клиент даже не должен
+        # пытаться отправлять (system:* объекты не существуют в world сервера
+        # и не имеют смысла как перетаскиваемый объект).
+        if object_id.startswith("system:"):
+            return False
+        return self.game.request_set_parent(object_id, parent_id)
 
     def select_object(self, object_id: str | None) -> bool:
         if object_id is None or object_id.startswith("system:"):

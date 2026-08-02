@@ -12,6 +12,7 @@ from shared.instance import (
     DEFAULT_PART_PROPERTIES,
     Instance,
     destroy_cascade,
+    get_descendant_ids,
     sanitize_part_properties,
     serialize_world,
 )
@@ -248,6 +249,9 @@ async def handle_message(
     elif message_type == protocol.DELETE_PART:
         await handle_delete_part(player_id, message)
 
+    elif message_type == protocol.SET_PARENT:
+        await handle_set_parent(player_id, message)
+
 
 async def handle_create_part(
     player_id: str,
@@ -410,6 +414,115 @@ async def handle_delete_part(
                 "id": removed_id,
             }
         )
+
+
+async def _reject_set_parent(player_id: str, instance_id: str, reason: str) -> None:
+    logging.warning("Отклонён set_parent от %s (%s): %s", player_id, instance_id, reason)
+    async with state_lock:
+        websocket = clients.get(player_id)
+    if websocket is not None:
+        await send_json(
+            websocket,
+            {
+                "type": protocol.SET_PARENT_REJECTED,
+                "id": instance_id,
+                "reason": reason,
+            },
+        )
+
+
+async def handle_set_parent(
+    player_id: str,
+    message: dict[str, Any],
+) -> None:
+    """
+    Реродителение сетевых объектов — единственный путь, которым можно
+    поменять parent_id (generic update_property его сознательно не
+    принимает, см. handle_update_property). Валидация — здесь, а не только
+    в Qt UI клиента: клиент не может обойти правила, послав вручную
+    собранное сообщение с произвольным parent_id.
+    """
+    instance_id = str(message.get("id", ""))
+    if not instance_id:
+        return
+
+    raw_parent_id = message.get("parent_id")
+    parent_id = str(raw_parent_id) if isinstance(raw_parent_id, str) and raw_parent_id else "Workspace"
+
+    async with state_lock:
+        instance = world.get(instance_id)
+
+    if instance is None:
+        await _reject_set_parent(player_id, instance_id, "Object does not exist.")
+        return
+
+    if parent_id == instance_id:
+        await _reject_set_parent(player_id, instance_id, "An object cannot be its own parent.")
+        return
+
+    if parent_id in object_registry.ROOT_SERVICES:
+        target_type_id = parent_id
+    else:
+        async with state_lock:
+            target_instance = world.get(parent_id)
+        if target_instance is None:
+            await _reject_set_parent(player_id, instance_id, "Target parent does not exist.")
+            return
+        target_type_id = target_instance.class_name
+
+        async with state_lock:
+            descendant_ids = set(get_descendant_ids(world, instance_id))
+        if parent_id in descendant_ids:
+            await _reject_set_parent(
+                player_id,
+                instance_id,
+                f"Cannot parent '{instance.name}' to its own descendant.",
+            )
+            return
+
+    if not object_registry.is_parent_allowed(instance.class_name, target_type_id):
+        await _reject_set_parent(
+            player_id,
+            instance_id,
+            f"'{instance.class_name}' cannot be parented to '{target_type_id}'.",
+        )
+        return
+
+    if parent_id not in object_registry.ROOT_SERVICES:
+        target_definition = object_registry.get_object_type(target_type_id)
+        if target_definition is None or not target_definition.is_container:
+            await _reject_set_parent(
+                player_id,
+                instance_id,
+                f"'{target_type_id}' cannot contain children.",
+            )
+            return
+
+    async with state_lock:
+        # Перепроверяем внутри лока — instance мог быть удалён между первой
+        # проверкой и этой точкой (сообщения от других клиентов
+        # обрабатываются конкурентно).
+        instance = world.get(instance_id)
+        if instance is None:
+            return
+        instance.set_parent(parent_id)
+        instance_name = instance.name
+
+    logging.info(
+        "Игрок %s: реродитель %s (%s) -> %s",
+        player_id,
+        instance_id,
+        instance_name,
+        parent_id,
+    )
+
+    await broadcast_to_all(
+        {
+            "type": protocol.PART_UPDATED,
+            "id": instance_id,
+            "parent_id": parent_id,
+        }
+    )
 
 
 async def client_handler(
