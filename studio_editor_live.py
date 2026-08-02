@@ -105,7 +105,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from shared import object_registry
+from shared import object_registry, transform_math
 from shared.object_registry import ObjectTypeDefinition, ROOT_SERVICES
 
 
@@ -162,6 +162,16 @@ class SceneObject:
     enabled: bool = True
     tags: list[str] = field(default_factory=list)
     attributes: dict[str, Any] = field(default_factory=dict)
+    # Stage 2.2: Model's persistent world-space pivot transform. Dedicated
+    # typed fields (not stuffed into `properties`) specifically so the
+    # existing position/rotation live-drag Inspector path (InspectorPanel.
+    # _live_vector_editors / _external_property_changed's isinstance(value,
+    # Vec3) fast path) works for pivot editing with zero changes to that
+    # mechanism — see Stage 2.2 report for the full design. Meaningless
+    # (stays at defaults) for any object_type other than "Model".
+    pivot_position: Vec3 = field(default_factory=Vec3)
+    pivot_rotation: Vec3 = field(default_factory=Vec3)
+    pivot_is_explicit: bool = False
     # Generic bag for type-specific data that doesn't fit the Part-shaped
     # fields above (Script.Source, PointLight.Brightness, ...). Keyed the
     # same way as Instance.properties on the server side.
@@ -173,13 +183,16 @@ class SceneObject:
             "name", "object_type", "parent", "id", "position", "rotation", "scale",
             "size", "color", "material", "transparency", "reflectance", "anchored",
             "can_collide", "cast_shadow", "locked", "enabled", "tags", "attributes",
-            "properties",
+            "pivot_position", "pivot_rotation", "pivot_is_explicit", "properties",
         }
         clean = {key: value for key, value in data.items() if key in allowed}
         clean["position"] = Vec3.from_value(clean.get("position"))
         clean["rotation"] = Vec3.from_value(clean.get("rotation"))
         clean["scale"] = Vec3.from_value(clean.get("scale", {"x": 1, "y": 1, "z": 1}))
         clean["size"] = Vec3.from_value(clean.get("size", {"x": 4, "y": 4, "z": 4}))
+        clean["pivot_position"] = Vec3.from_value(clean.get("pivot_position"))
+        clean["pivot_rotation"] = Vec3.from_value(clean.get("pivot_rotation"))
+        clean["pivot_is_explicit"] = bool(clean.get("pivot_is_explicit", False))
         return cls(**clean)
 
 
@@ -487,6 +500,160 @@ class EngineBridge(QObject):
             self.selection_changed.emit(obj)
         self.set_dirty(True)
         self.log("info", f'Reparented {obj.object_type} "{obj.name}" to {parent_key}')
+        return True
+
+    _TRANSFORMABLE_TYPES = ("Part", "SpawnPoint", "Model")
+
+    def _transformable_descendant_ids(self, root_id: str) -> list[str]:
+        """Like descendant_ids() but filtered to objects that own a
+        transform (Part/SpawnPoint Position+Rotation, or a nested Model's
+        pivot) — recurses THROUGH non-spatial containers (Folder/Script)
+        without including them. Mirrors client_studio.py's
+        _collect_transformable_descendants() for the live path."""
+        return [
+            object_id for object_id in self.descendant_ids(root_id)
+            if (obj := self.get_object(object_id)) is not None and obj.object_type in self._TRANSFORMABLE_TYPES
+        ]
+
+    def _world_bounds_points(self, descendant_id: str) -> list[tuple[float, float, float]]:
+        """Mirrors client_studio.py's _world_bounds_points(): a Part/
+        SpawnPoint contributes its full oriented bounding box (8 corners,
+        scaled by Size, rotated by world Rotation, translated by world
+        Position), not just its center, so the auto-pivot reflects real
+        combined world bounds. A nested Model, or a Part-like with a
+        missing/invalid Size, has no usable visual bounds and falls back
+        to a single point (its world position)."""
+        descendant = self.get_object(descendant_id)
+        if descendant is None:
+            return []
+
+        if descendant.object_type == "Model":
+            # Recurse rather than reading pivot_position directly — see
+            # the rationale in transform_model()'s matching fix.
+            nested_pos, _nested_quat = self._model_pivot_world(descendant)
+            return [nested_pos]
+
+        pos = descendant.position
+        size = descendant.size
+        half = (size.x / 2.0, size.y / 2.0, size.z / 2.0)
+        if not all(h >= 0 and math.isfinite(h) for h in half):
+            return [(pos.x, pos.y, pos.z)]
+
+        rot = descendant.rotation
+        quat = transform_math.from_euler_xyz_degrees((rot.x, rot.y, rot.z))
+        corners: list[tuple[float, float, float]] = []
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                for sz in (-1.0, 1.0):
+                    local = (sx * half[0], sy * half[1], sz * half[2])
+                    rotated = transform_math.rotate_vector(quat, local)
+                    corners.append((pos.x + rotated[0], pos.y + rotated[1], pos.z + rotated[2]))
+        return corners
+
+    def _model_pivot_world(self, model_obj: SceneObject) -> tuple[tuple[float, float, float], "transform_math.Quat"]:
+        if model_obj.pivot_is_explicit:
+            position = (model_obj.pivot_position.x, model_obj.pivot_position.y, model_obj.pivot_position.z)
+            rotation = (model_obj.pivot_rotation.x, model_obj.pivot_rotation.y, model_obj.pivot_rotation.z)
+            return position, transform_math.from_euler_xyz_degrees(rotation)
+
+        points: list[tuple[float, float, float]] = []
+        for descendant_id in self._transformable_descendant_ids(model_obj.id):
+            points.extend(self._world_bounds_points(descendant_id))
+        if not points:
+            return (0.0, 0.0, 0.0), transform_math.IDENTITY
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        zs = [p[2] for p in points]
+        center = ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0, (min(zs) + max(zs)) / 2.0)
+        return center, transform_math.IDENTITY
+
+    def transform_model(
+        self,
+        object_id: str,
+        pivot_position: list[float] | None,
+        pivot_rotation: list[float] | None,
+    ) -> bool:
+        """Model pivot edit + cascade to every transformable descendant —
+        the non-live counterpart of client_studio.py's
+        request_transform_model_pivot(). Same math (shared/transform_math.py
+        instead of Panda3D Quat, see Stage 2.2 report for why two
+        implementations exist), same relative-transform-preserving
+        algorithm, so demo mode behaves like the live client."""
+        obj = self.get_object(object_id)
+        if obj is None or obj.object_type != "Model":
+            return False
+
+        if self.live_mode:
+            accepted = bool(
+                self._adapter_call("transform_model", object_id, pivot_position, pivot_rotation, default=False)
+            )
+            if not accepted:
+                self.log("warning", "The live engine rejected the Model transform request.")
+            return accepted
+
+        old_pivot_pos, old_pivot_quat = self._model_pivot_world(obj)
+        old_pivot_quat_inv = transform_math.conjugate(old_pivot_quat)
+
+        descendant_ids = self._transformable_descendant_ids(object_id)
+        relative: dict[str, tuple[tuple[float, float, float], "transform_math.Quat"]] = {}
+        for descendant_id in descendant_ids:
+            descendant = self.get_object(descendant_id)
+            if descendant is None:
+                continue
+            if descendant.object_type == "Model":
+                # Recurse through _model_pivot_world rather than reading
+                # pivot_position directly: an untouched nested Model's true
+                # position is its own lazy auto-pivot (bounds-center of its
+                # own descendants), not the registry-default (0,0,0) — see
+                # the matching fix in client_studio.py's
+                # _begin_model_drag_capture for the full rationale.
+                child_pos_tuple, child_quat = self._model_pivot_world(descendant)
+                child_pos = Vec3(*child_pos_tuple)
+            else:
+                child_pos = descendant.position
+                child_rot = descendant.rotation
+                child_quat = transform_math.from_euler_xyz_degrees((child_rot.x, child_rot.y, child_rot.z))
+            offset = (child_pos.x - old_pivot_pos[0], child_pos.y - old_pivot_pos[1], child_pos.z - old_pivot_pos[2])
+            relative_pos = transform_math.rotate_vector(old_pivot_quat_inv, offset)
+            relative_quat = transform_math.compose(old_pivot_quat_inv, child_quat)
+            relative[descendant_id] = (relative_pos, relative_quat)
+
+        new_pivot_pos = tuple(pivot_position) if pivot_position is not None else old_pivot_pos
+        new_pivot_quat = (
+            transform_math.from_euler_xyz_degrees(tuple(pivot_rotation))
+            if pivot_rotation is not None
+            else old_pivot_quat
+        )
+
+        obj.pivot_position = Vec3(*new_pivot_pos)
+        obj.pivot_rotation = Vec3(*transform_math.to_euler_xyz_degrees(new_pivot_quat))
+        obj.pivot_is_explicit = True
+
+        for descendant_id, (relative_pos, relative_quat) in relative.items():
+            descendant = self.get_object(descendant_id)
+            if descendant is None:
+                continue
+            rotated_offset = transform_math.rotate_vector(new_pivot_quat, relative_pos)
+            new_pos = (
+                new_pivot_pos[0] + rotated_offset[0],
+                new_pivot_pos[1] + rotated_offset[1],
+                new_pivot_pos[2] + rotated_offset[2],
+            )
+            new_quat = transform_math.compose(new_pivot_quat, relative_quat)
+            new_rot = transform_math.to_euler_xyz_degrees(new_quat)
+            if descendant.object_type == "Model":
+                descendant.pivot_position = Vec3(*new_pos)
+                descendant.pivot_rotation = Vec3(*new_rot)
+                descendant.pivot_is_explicit = True
+            else:
+                descendant.position = Vec3(*new_pos)
+                descendant.rotation = Vec3(*new_rot)
+
+        self.scene_changed.emit()
+        if self.selected_id == obj.id:
+            self.selection_changed.emit(obj)
+        self.set_dirty(True)
+        self.log("info", f'Transformed Model "{obj.name}" ({len(relative)} descendant(s)).')
         return True
 
     def new_scene(self) -> None:
@@ -1942,6 +2109,7 @@ class InspectorPanel(QWidget):
             "appearance": self._build_appearance_section,
             "behavior": self._build_behavior_section,
             "container": self._build_container_section,
+            "pivot": self._build_pivot_section,
             "script": lambda o: self._build_script_section(o, definition),
             "placeholder": lambda o: self._build_placeholder_section(o, definition),
         }
@@ -2070,6 +2238,32 @@ class InspectorPanel(QWidget):
         container.add_row("Children", count_label)
         return container
 
+    def _build_pivot_section(self, obj: SceneObject) -> CollapsibleSection:
+        """Stage 2.2: only meaningful for Model (see inspector_sections in
+        object_registry.py — Folder also uses 'container' but not 'pivot').
+        Editing these fields performs the same cascading group transform as
+        dragging the gizmo — see EngineBridge.transform_model()."""
+        pivot = CollapsibleSection("Pivot")
+
+        descendant_count = len(self.bridge.descendant_ids(obj.id))
+        descendant_label = QLabel(str(descendant_count))
+        descendant_label.setObjectName("MutedLabel")
+        pivot.add_row("Descendant Count", descendant_label)
+
+        status_label = QLabel("Explicit" if obj.pivot_is_explicit else "Auto (from descendant bounds)")
+        status_label.setObjectName("MutedLabel")
+        pivot.add_row("Pivot Status", status_label)
+
+        position = VectorEditor(obj.pivot_position, "pivot_position")
+        rotation = VectorEditor(obj.pivot_rotation, "pivot_rotation")
+        for editor in (position, rotation):
+            editor.value_changed.connect(self._set_pivot_value)
+        self._live_vector_editors.update({"pivot_position": position, "pivot_rotation": rotation})
+
+        pivot.add_row("Pivot Position", position)
+        pivot.add_row("Pivot Rotation", rotation)
+        return pivot
+
     def _build_script_section(self, obj: SceneObject, definition: Optional[ObjectTypeDefinition]) -> CollapsibleSection:
         script = CollapsibleSection("Script")
 
@@ -2169,6 +2363,25 @@ class InspectorPanel(QWidget):
 
     def _toggle_lock(self, checked: bool) -> None:
         self._set_value("locked", bool(checked))
+
+    def _set_pivot_value(self, path: str, value: float) -> None:
+        """Counterpart to _set_value() for the Pivot section's VectorEditors
+        — deliberately does NOT go through bridge.set_property() (a plain
+        single-object write). A pivot edit must cascade to every
+        transformable descendant exactly like a gizmo drag does, so it goes
+        through bridge.transform_model() instead (see Stage 2.2 report)."""
+        if self._building or self.current_object is None:
+            return
+        obj = self.current_object
+        field_name, _, axis = path.partition(".")
+        current = getattr(obj, field_name, None)
+        if not isinstance(current, Vec3) or axis not in ("x", "y", "z"):
+            return
+        updated = Vec3(current.x, current.y, current.z)
+        setattr(updated, axis, value)
+        position = [updated.x, updated.y, updated.z] if field_name == "pivot_position" else None
+        rotation = [updated.x, updated.y, updated.z] if field_name == "pivot_rotation" else None
+        self.bridge.transform_model(obj.id, position, rotation)
 
     def _external_property_changed(self, object_id: str, path: str, value: Any) -> None:
         if self._building or not self.current_object or self.current_object.id != object_id:

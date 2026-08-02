@@ -13,11 +13,20 @@ from shared.instance import (
     Instance,
     destroy_cascade,
     get_descendant_ids,
+    is_valid_vector3,
     sanitize_part_properties,
     serialize_world,
 )
 
 PART_LIKE_TYPES = ("Part", "SpawnPoint")
+
+# Stage 2.2: типы, чей id разрешено появляться в "descendants" батча
+# transform_model. Part-подобные хранят Position/Rotation, Model — свой
+# PivotPosition/PivotRotation (см. object_registry.py). Folder/Script и
+# прочие непространственные типы транзитом проходят через дерево потомков
+# при обходе get_descendant_ids, но сами transform не имеют — их id здесь
+# отклоняются.
+_MODEL_TRANSFORM_DESCENDANT_TYPES = PART_LIKE_TYPES + ("Model",)
 
 
 HOST = "0.0.0.0"
@@ -251,6 +260,9 @@ async def handle_message(
 
     elif message_type == protocol.SET_PARENT:
         await handle_set_parent(player_id, message)
+
+    elif message_type == protocol.TRANSFORM_MODEL:
+        await handle_transform_model(player_id, message)
 
 
 async def handle_create_part(
@@ -521,6 +533,228 @@ async def handle_set_parent(
             "type": protocol.PART_UPDATED,
             "id": instance_id,
             "parent_id": parent_id,
+        }
+    )
+
+
+def _expected_transform_descendant_ids(model_id: str) -> set[str]:
+    """Must be called with state_lock held. The exact set of ids the
+    client's descendants payload is required to match — recomputed fresh
+    on every transform_model, never cached across the await boundary, so a
+    reparent/create/delete that happens mid-drag is caught by a plain set
+    mismatch (see handle_transform_model's single-lock-block rationale)."""
+    return {
+        d_id for d_id in get_descendant_ids(world, model_id)
+        if (d_inst := world.get(d_id)) is not None and d_inst.class_name in _MODEL_TRANSFORM_DESCENDANT_TYPES
+    }
+
+
+def _snapshot_model_transform_state(model_id: str) -> dict[str, Any] | None:
+    """Must be called with state_lock held. Authoritative pivot + every
+    current transformable descendant's transform — attached to rejections
+    so a client whose local preview drifted from a stale hierarchy can
+    self-correct in one pass instead of leaving the Model visually split
+    (see Stage 2.2 report, 'hierarchy consistency')."""
+    model_instance = world.get(model_id)
+    if model_instance is None or model_instance.class_name != "Model":
+        return None
+    descendants_payload: dict[str, dict[str, list[float]]] = {}
+    for descendant_id in _expected_transform_descendant_ids(model_id):
+        descendant_instance = world.get(descendant_id)
+        if descendant_instance is None:
+            continue
+        if descendant_instance.class_name == "Model":
+            descendants_payload[descendant_id] = {
+                "Position": descendant_instance.get_property("PivotPosition", [0.0, 0.0, 0.0]),
+                "Rotation": descendant_instance.get_property("PivotRotation", [0.0, 0.0, 0.0]),
+            }
+        else:
+            descendants_payload[descendant_id] = {
+                "Position": descendant_instance.get_property("Position", [0.0, 0.0, 0.0]),
+                "Rotation": descendant_instance.get_property("Rotation", [0.0, 0.0, 0.0]),
+            }
+    return {
+        "pivot": {
+            "Position": model_instance.get_property("PivotPosition", [0.0, 0.0, 0.0]),
+            "Rotation": model_instance.get_property("PivotRotation", [0.0, 0.0, 0.0]),
+        },
+        "descendants": descendants_payload,
+    }
+
+
+async def _reject_transform_model(
+    player_id: str,
+    model_id: str,
+    reason: str,
+    sequence: Any,
+    current: dict[str, Any] | None,
+) -> None:
+    logging.warning("Отклонён transform_model от %s (%s): %s", player_id, model_id, reason)
+    async with state_lock:
+        websocket = clients.get(player_id)
+    if websocket is not None:
+        await send_json(
+            websocket,
+            {
+                "type": protocol.TRANSFORM_MODEL_REJECTED,
+                "id": model_id,
+                "reason": reason,
+                "sequence": sequence,
+                "current": current,
+            },
+        )
+
+
+def _extract_transform_vectors(raw: Any) -> dict[str, list[float]] | None:
+    """Валидирует {"Position": [...], "Rotation": [...]} — обе стороны
+    опциональны (Move-only и Rotate-only кадры не обязаны слать обе), но
+    хотя бы одна должна быть валидным vector3, иначе запись мусорная."""
+    if not isinstance(raw, dict):
+        return None
+    clean: dict[str, list[float]] = {}
+    position = raw.get("Position")
+    if position is not None:
+        if not is_valid_vector3(position):
+            return None
+        clean["Position"] = [float(v) for v in position]
+    rotation = raw.get("Rotation")
+    if rotation is not None:
+        if not is_valid_vector3(rotation):
+            return None
+        clean["Rotation"] = [float(v) for v in rotation]
+    if not clean:
+        return None
+    return clean
+
+
+async def handle_transform_model(player_id: str, message: dict[str, Any]) -> None:
+    """
+    Атомарный каскадный transform: один Model pivot + произвольное число
+    потомков за один кадр сети, вместо N отдельных update_property (это бы
+    позволило другим клиентам увидеть "развалившуюся" на середине кадра
+    композицию). Сервер не делает никакой кватернионной математики сам —
+    как и с одиночным Part-gizmo drag, финальные Position/Rotation уже
+    посчитаны клиентом; сервер здесь только проверяет принадлежность/
+    форму/конечность значений, то есть остаётся источником правды за счёт
+    валидации, а не пересчёта.
+
+    Всё или ничего, по-настоящему: вся валидация И применение происходят
+    внутри ОДНОГО удержания state_lock, без await между ними — это не
+    просто "перепроверить перед записью" (как в handle_set_parent), а
+    полное устранение TOCTOU-окна. С отдельными приобретениями лока (как
+    было раньше) сообщение от другого клиента могло обработаться МЕЖДУ
+    валидацией и применением и незаметно исказить результат. Здесь это
+    структурно невозможно: пока лок удержан, ни один другой awaitable
+    обработчик не может вклиниться.
+
+    Ожидаемый набор потомков (_expected_transform_descendant_ids) должен
+    ТОЧНО совпадать с присланным — не подмножество. Если между началом
+    drag на клиенте и этим сообщением иерархия изменилась (reparent,
+    create, delete), набор разойдётся и весь батч отклоняется — сервер не
+    молча отфильтровывает лишнее/недостающее и не применяет частичный
+    результат.
+    """
+    model_id = str(message.get("id", ""))
+    sequence = message.get("sequence")
+    if not model_id:
+        return
+
+    raw_pivot = message.get("pivot")
+    clean_pivot = _extract_transform_vectors(raw_pivot)
+    raw_descendants = message.get("descendants", {})
+
+    async with state_lock:
+        model_instance = world.get(model_id)
+
+        if model_instance is None:
+            current = None
+            reason = "Model does not exist."
+        elif model_instance.class_name != "Model":
+            current = None
+            reason = "Target is not a Model."
+        elif clean_pivot is None:
+            current = _snapshot_model_transform_state(model_id)
+            reason = "Malformed or missing pivot transform."
+        elif not isinstance(raw_descendants, dict):
+            current = _snapshot_model_transform_state(model_id)
+            reason = "Malformed descendants payload."
+        else:
+            expected_ids = _expected_transform_descendant_ids(model_id)
+            submitted_ids = {str(k) for k in raw_descendants.keys()}
+            reason = None
+            current = None
+
+            if submitted_ids != expected_ids:
+                missing = expected_ids - submitted_ids
+                extra = submitted_ids - expected_ids
+                reason = (
+                    "Hierarchy changed during drag (descendant set mismatch): "
+                    f"missing={sorted(missing)} extra={sorted(extra)}"
+                )
+                current = _snapshot_model_transform_state(model_id)
+            else:
+                clean_descendants: dict[str, dict[str, list[float]]] = {}
+                for descendant_id in submitted_ids:
+                    descendant_instance = world.get(descendant_id)
+                    if descendant_instance is None or descendant_instance.class_name not in _MODEL_TRANSFORM_DESCENDANT_TYPES:
+                        reason = f"'{descendant_id}' is not a transformable object."
+                        current = _snapshot_model_transform_state(model_id)
+                        break
+                    clean_transform = _extract_transform_vectors(raw_descendants[descendant_id])
+                    if clean_transform is None:
+                        reason = f"Malformed transform for descendant '{descendant_id}'."
+                        current = _snapshot_model_transform_state(model_id)
+                        break
+                    clean_descendants[descendant_id] = clean_transform
+
+                if reason is None:
+                    pivot_properties = dict(clean_pivot)
+                    pivot_properties["PivotPosition"] = pivot_properties.pop(
+                        "Position", model_instance.get_property("PivotPosition"),
+                    )
+                    pivot_properties["PivotRotation"] = pivot_properties.pop(
+                        "Rotation", model_instance.get_property("PivotRotation"),
+                    )
+                    pivot_properties["PivotIsExplicit"] = True
+                    sanitized_pivot = object_registry.sanitize_properties_for_type("Model", pivot_properties)
+                    model_instance.properties.update(sanitized_pivot)
+
+                    applied_descendants: dict[str, dict[str, list[float]]] = {}
+                    for descendant_id, clean_transform in clean_descendants.items():
+                        descendant_instance = world.get(descendant_id)
+                        if descendant_instance is None:
+                            continue
+                        if descendant_instance.class_name == "Model":
+                            model_transform: dict[str, Any] = {}
+                            if "Position" in clean_transform:
+                                model_transform["PivotPosition"] = clean_transform["Position"]
+                            if "Rotation" in clean_transform:
+                                model_transform["PivotRotation"] = clean_transform["Rotation"]
+                            model_transform["PivotIsExplicit"] = True
+                            sanitized = object_registry.sanitize_properties_for_type("Model", model_transform)
+                        else:
+                            sanitized = sanitize_part_properties(clean_transform)
+                        descendant_instance.properties.update(sanitized)
+                        applied_descendants[descendant_id] = clean_transform
+
+    if reason is not None:
+        await _reject_transform_model(player_id, model_id, reason, sequence, current)
+        return
+
+    logging.info(
+        "Игрок %s: transform_model %s (%s потомков)",
+        player_id,
+        model_id,
+        len(applied_descendants),
+    )
+
+    await broadcast_to_all(
+        {
+            "type": protocol.MODEL_TRANSFORMED,
+            "id": model_id,
+            "pivot": clean_pivot,
+            "descendants": applied_descendants,
+            "sequence": sequence,
         }
     )
 

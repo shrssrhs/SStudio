@@ -225,9 +225,27 @@ def _register_defaults() -> None:
         default_parent="Workspace",
         allowed_parent_types=_CONTAINER_PARENTS,
         keywords=("group", "container"),
-        default_properties={},
+        # Stage 2.2: Model gains a persistent world-space pivot transform so
+        # it can behave as a real transformable group (see
+        # SCRIPTING_ARCHITECTURE.md / Stage 2.2 report for the full design).
+        # PivotIsExplicit starts False: an unmoved Model has no meaningful
+        # stored pivot yet, the client derives one lazily from descendant
+        # bounds for gizmo display only, and nothing is written here until
+        # the user actually performs a real move/rotate/pivot edit. This is
+        # why old scenes need no migration — {**defaults, **raw} already
+        # gives every legacy Model a harmless default pivot for free.
+        default_properties={
+            "PivotPosition": [0.0, 0.0, 0.0],
+            "PivotRotation": [0.0, 0.0, 0.0],
+            "PivotIsExplicit": False,
+        },
+        property_schema={
+            "PivotPosition": PropertySpec("vector3"),
+            "PivotRotation": PropertySpec("vector3"),
+            "PivotIsExplicit": PropertySpec("bool"),
+        },
         is_container=True,
-        inspector_sections=("container",),
+        inspector_sections=("container", "pivot"),
     ))
 
     register_object_type(ObjectTypeDefinition(
