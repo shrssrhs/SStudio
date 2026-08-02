@@ -50,6 +50,7 @@ from studio_editor_live import (
     StudioMainWindow,
     Vec3 as EditorVec3,
 )
+import editor_history
 import physics
 from shared import object_registry, protocol
 from shared.instance import DEFAULT_PART_PROPERTIES, MIN_PART_SIZE
@@ -1274,6 +1275,21 @@ class MultiplayerGame(Entity):
         self._physics_world: physics.PhysicsWorld | None = None
         self._physics_snapshot: dict[str, dict[str, list[float]]] = {}
 
+        # Stage 2.5: authoritative Undo/Redo command history (see
+        # editor_history.py for the full design). Sequence counter here is
+        # deliberately SEPARATE from _model_drag_sequence_counter below —
+        # that one guards live-drag echo suppression frame-by-frame; this
+        # one is only ever used when history itself re-sends a Model
+        # transform (Undo/Redo), a completely independent event.
+        self.history = editor_history.CommandManager(self)
+        self._history_transform_sequence_counter = 0
+        # Set at the start of a gizmo drag (Part or Model), consumed at
+        # end_gizmo_drag() to build the before/after command — never
+        # holds Qt widgets or Entities, only plain ids/lists (see Stage
+        # 2.5 report, "Commands should reference stable instance IDs and
+        # serializable scene data").
+        self._history_drag_before: dict[str, Any] | None = None
+
         # Состояние активного каскадного Model-drag (None вне драга).
         # "descendant_relative" — id -> (relative_pos: Vec3, relative_quat:
         # Quat), захваченные в момент begin_drag: смещение/ориентация
@@ -1330,6 +1346,7 @@ class MultiplayerGame(Entity):
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = False
             self._start_physics()
+            self.history.refresh_ui()
         else:
             if preserve_position and self.studio_playing:
                 self.saved_play_position = Vec3(self.local_player.position)
@@ -1344,6 +1361,7 @@ class MultiplayerGame(Entity):
                 self.selection_highlight.enabled = True
             if was_playing:
                 self._stop_physics()
+            self.history.refresh_ui()
 
     def _start_physics(self) -> None:
         """Builds a fresh PhysicsWorld from the CURRENT editor properties
@@ -2190,6 +2208,11 @@ class MultiplayerGame(Entity):
         # offsets are: always derive from drag-start state, never from a
         # previous frame, so repeated small drags can't accumulate drift.
         descendant_start_size: dict[str, Vec3] = {}
+        # Stage 2.5: complete before-snapshot for ModelTransformCommand,
+        # built from the SAME authoritative Position/Rotation/Size (or
+        # recursive pivot) values this loop already computes — not a
+        # second pass, not a Qt/Entity read.
+        history_before_descendants: dict[str, dict[str, list[float]]] = {}
         for descendant_id in self._collect_transformable_descendants(model_id):
             descendant_record = self.instances.get(descendant_id)
             if descendant_record is None:
@@ -2214,10 +2237,28 @@ class MultiplayerGame(Entity):
             relative_quat = self._compose_quat(pivot_quat_inv, child_quat)
             descendant_relative[descendant_id] = (relative_pos, relative_quat)
 
+            entry = {
+                "Position": [float(child_pos.x), float(child_pos.y), float(child_pos.z)],
+                "Rotation": self._quat_to_euler_xyz(child_quat),
+            }
+            if descendant_id in descendant_start_size:
+                size_vec = descendant_start_size[descendant_id]
+                entry["Size"] = [float(size_vec.x), float(size_vec.y), float(size_vec.z)]
+            history_before_descendants[descendant_id] = entry
+
         self._model_drag_state = {
             "model_id": model_id,
             "descendant_relative": descendant_relative,
             "descendant_start_size": descendant_start_size,
+        }
+        self._history_drag_before = {
+            "kind": "model",
+            "model_id": model_id,
+            "pivot": {
+                "Position": [float(pivot_pos.x), float(pivot_pos.y), float(pivot_pos.z)],
+                "Rotation": self._quat_to_euler_xyz(pivot_quat),
+            },
+            "descendants": history_before_descendants,
         }
         self._model_drag_suppressed_ids = {model_id, *descendant_relative.keys()}
         self._model_drag_sequence_counter = 0
@@ -2458,6 +2499,16 @@ class MultiplayerGame(Entity):
                 f"total={total_ms:.3f}ms sent={sent}"
             )
 
+    def next_history_transform_sequence(self) -> int:
+        """Independent sequence counter used ONLY when editor_history.py's
+        ModelTransformCommand re-sends a Model transform for Undo/Redo --
+        see CommandManager/_ModelTransformTracker. Never shared with
+        _model_drag_sequence_counter (that one guards live-drag echo
+        suppression for an in-progress gizmo drag, a completely different
+        event)."""
+        self._history_transform_sequence_counter += 1
+        return self._history_transform_sequence_counter
+
     def request_transform_model(
         self,
         model_id: str,
@@ -2500,6 +2551,7 @@ class MultiplayerGame(Entity):
         if pivot_rotation is not None:
             self.model_gizmo_proxy.set_quat(self._euler_xyz_to_quat(pivot_rotation))
         self._apply_model_gizmo_result(force_network=True)
+        self._push_model_transform_history(model_id, label="Edit Model Pivot")
         # _model_drag_state (relative-offset math snapshot) is only needed
         # while actively computing frames, so it's safe to clear now — but
         # _model_drag_suppressed_ids / _model_drag_awaiting_final stay set
@@ -2585,9 +2637,25 @@ class MultiplayerGame(Entity):
             selected_record = self.instances.get(self.selected_part_id) if self.selected_part_id else None
             if selected_record is not None and selected_record.class_name == "Model":
                 self._begin_model_drag_capture(self.selected_part_id)
+                # Stage 2.5: _begin_model_drag_capture() already stashes a
+                # full before-snapshot into self._history_drag_before (see
+                # that method) -- nothing more to do here.
             else:
                 self._model_drag_state = None
                 self._model_drag_suppressed_ids = set()
+                if selected_record is not None:
+                    properties = selected_record.properties
+                    self._history_drag_before = {
+                        "kind": "part",
+                        "instance_id": self.selected_part_id,
+                        "properties": {
+                            "Position": [float(v) for v in properties.get("Position", [0.0, 0.0, 0.0])],
+                            "Rotation": [float(v) for v in properties.get("Rotation", [0.0, 0.0, 0.0])],
+                            "Size": [float(v) for v in properties.get("Size", [1.0, 1.0, 1.0])],
+                        },
+                    }
+                else:
+                    self._history_drag_before = None
             if DEBUG_GIZMO_TIMING:
                 self._gizmo_timing.begin()
         return started
@@ -2595,11 +2663,13 @@ class MultiplayerGame(Entity):
     def end_gizmo_drag(self) -> None:
         result = self.gizmo.end_drag()
         if self._model_drag_state is not None:
+            model_id_for_history = self._model_drag_state.get("model_id")
             if result is not None:
                 if self.gizmo_mode == "scale":
                     self._apply_model_scale_result(result, force_network=True)
                 else:
                     self._apply_model_gizmo_result(force_network=True)
+                self._push_model_transform_history(model_id_for_history)
             if DEBUG_MODEL_TRANSFORMS:
                 elapsed = time.perf_counter() - getattr(self, "_model_drag_timing_start", time.perf_counter())
                 frames = getattr(self, "_model_drag_frame_count", 0)
@@ -2632,9 +2702,78 @@ class MultiplayerGame(Entity):
                 self._apply_scale_gizmo_result(target, result, force_network=True)
             else:
                 self._apply_gizmo_result(target, result, force_network=True)
+            self._push_part_transform_history()
         self._gizmo_dragging_instance_id = None
         if DEBUG_GIZMO_TIMING:
             self._gizmo_timing.end_and_report()
+
+    def _push_part_transform_history(self) -> None:
+        """Stage 2.5: builds the after-snapshot from CURRENT (just-applied)
+        record.properties and pushes a PartTransformCommand (Move/Rotate)
+        or ResizeCommand (Scale) — see try_begin_gizmo_drag() for the
+        before-snapshot. Never sends anything itself: _apply_gizmo_result/
+        _apply_scale_gizmo_result already sent the real request."""
+        before = self._history_drag_before
+        self._history_drag_before = None
+        if before is None or before.get("kind") != "part":
+            return
+        instance_id = before["instance_id"]
+        record = self.instances.get(instance_id)
+        if record is None:
+            return
+        before_properties = before["properties"]
+        keys = {"move": ("Position",), "rotate": ("Rotation",), "scale": ("Position", "Size")}.get(self.gizmo_mode)
+        if not keys:
+            return
+        after_properties = {
+            key: [float(v) for v in record.properties.get(key, before_properties[key])]
+            for key in keys
+        }
+        before_subset = {key: before_properties[key] for key in keys}
+        label = {"move": "Move Part", "rotate": "Rotate Part", "scale": "Scale Part"}[self.gizmo_mode]
+        command_cls = editor_history.ResizeCommand if self.gizmo_mode == "scale" else editor_history.PartTransformCommand
+        command = command_cls(instance_id, label, before_properties=before_subset, after_properties=after_properties)
+        self.history.push_optimistic(command)
+
+    def _push_model_transform_history(self, model_id: str | None, label: str | None = None) -> None:
+        """Model counterpart of _push_part_transform_history() — see that
+        method and try_begin_gizmo_drag()/_begin_model_drag_capture() for
+        the before-snapshot."""
+        before = self._history_drag_before
+        self._history_drag_before = None
+        if before is None or before.get("kind") != "model" or model_id is None or before.get("model_id") != model_id:
+            return
+        model_record = self.instances.get(model_id)
+        if model_record is None:
+            return
+        after_pivot = {
+            "Position": [float(v) for v in model_record.properties.get("PivotPosition", before["pivot"]["Position"])],
+            "Rotation": [float(v) for v in model_record.properties.get("PivotRotation", before["pivot"]["Rotation"])],
+        }
+        after_descendants: dict[str, dict[str, list[float]]] = {}
+        for descendant_id, before_entry in before["descendants"].items():
+            descendant_record = self.instances.get(descendant_id)
+            if descendant_record is None:
+                continue
+            if descendant_record.class_name == "Model":
+                after_descendants[descendant_id] = {
+                    "Position": [float(v) for v in descendant_record.properties.get("PivotPosition", before_entry["Position"])],
+                    "Rotation": [float(v) for v in descendant_record.properties.get("PivotRotation", before_entry["Rotation"])],
+                }
+            else:
+                entry = {
+                    "Position": [float(v) for v in descendant_record.properties.get("Position", before_entry["Position"])],
+                    "Rotation": [float(v) for v in descendant_record.properties.get("Rotation", before_entry["Rotation"])],
+                }
+                if "Size" in before_entry:
+                    entry["Size"] = [float(v) for v in descendant_record.properties.get("Size", before_entry["Size"])]
+                after_descendants[descendant_id] = entry
+        if label is None:
+            label = {"move": "Move Model", "rotate": "Rotate Model", "scale": "Scale Model"}.get(self.gizmo_mode, "Transform Model")
+        command = editor_history.ModelTransformCommand(
+            model_id, label, before["pivot"], after_pivot, before["descendants"], after_descendants,
+        )
+        self.history.push_optimistic(command)
 
     def _apply_gizmo_result(
         self,
@@ -2835,10 +2974,15 @@ class MultiplayerGame(Entity):
         self.network.send(message)
         return True
 
-    def duplicate_instance(self, instance_id: str) -> bool:
+    def compute_duplicate_properties(self, instance_id: str) -> tuple["InstanceRecord", dict[str, Any]] | None:
+        """Shared by duplicate_instance() (direct, non-history path) and
+        MultiplayerStudioAdapter.duplicate_object() (Stage 2.5 history
+        path, which needs the concrete offset properties up front to
+        build a CreateObjectCommand rather than relying on
+        request_create_instance's own spawn-position auto-fill)."""
         record = self.instances.get(instance_id)
         if record is None:
-            return False
+            return None
         properties = dict(record.properties)
         if "Position" in properties:
             position = list(properties["Position"])
@@ -2847,6 +2991,46 @@ class MultiplayerGame(Entity):
             position[0] = float(position[0]) + 2.0
             position[2] = float(position[2]) + 2.0
             properties["Position"] = position
+        return record, properties
+
+    def build_delete_snapshot(self, instance_id: str) -> list[dict[str, Any]] | None:
+        """Parent-first snapshot of instance_id and every descendant, for
+        DeleteObjectCommand (Stage 2.5) -- must be captured BEFORE the
+        delete is sent, since remove_instance() erases these records as
+        PART_DELETED broadcasts arrive. Mirrors shared/instance.py's
+        server-side get_descendant_ids()/destroy_cascade() traversal, but
+        walks the client's own self.instances mirror instead of the
+        server's world dict."""
+        root_record = self.instances.get(instance_id)
+        if root_record is None:
+            return None
+        ordered_ids = [instance_id]
+        frontier = [instance_id]
+        while frontier:
+            current = frontier.pop(0)
+            children = [record.id for record in self.instances.values() if record.parent_id == current]
+            ordered_ids.extend(children)
+            frontier.extend(children)
+        snapshot: list[dict[str, Any]] = []
+        for oid in ordered_ids:
+            record = self.instances[oid]
+            snapshot.append(
+                {
+                    "old_id": record.id,
+                    "class_name": record.class_name,
+                    "name": record.name,
+                    "parent_id": record.parent_id,
+                    "properties": dict(record.properties),
+                    "enabled": record.enabled,
+                }
+            )
+        return snapshot
+
+    def duplicate_instance(self, instance_id: str) -> bool:
+        result = self.compute_duplicate_properties(instance_id)
+        if result is None:
+            return False
+        record, properties = result
         return self.request_create_instance(
             record.class_name, properties, parent_id=record.parent_id, name=record.name,
         )
@@ -2987,6 +3171,9 @@ class MultiplayerGame(Entity):
     def process_network_messages(self) -> None:
         for message in self.network.receive_all():
             message_type = message.get("type")
+
+            if isinstance(message_type, str):
+                self.history.on_network_message(message_type, message)
 
             if message_type == "connected":
                 self.handle_connected_message(message)
@@ -3187,6 +3374,11 @@ class MultiplayerGame(Entity):
         for part_data in parts:
             if isinstance(part_data, dict):
                 self.spawn_instance(part_data)
+        # A WORLD_SNAPSHOT is a brand-new authoritative world (initial
+        # connect, or a reconnect) -- every stored instance id/parent/
+        # property reference an Undo/Redo command might hold could now be
+        # stale or mean something different. See Stage 2.5 spec §15.
+        self.history.clear()
         if self.studio_adapter is not None:
             self.studio_adapter.sync_full_scene()
 
@@ -3554,6 +3746,36 @@ class MultiplayerStudioAdapter:
         self.game.set_studio_adapter(self)
         self.sync_full_scene()
         self.game.set_studio_playing(False, preserve_position=False)
+        # CommandManager listeners are plain Python callbacks (see
+        # editor_history.py) -- safe to emit a Qt signal directly from one
+        # since the Ursina game loop and the Qt event loop share the same
+        # thread here (panda_timer.timeout.connect(ursina_app.step)).
+        self.game.history.add_state_listener(lambda: bridge.history_state_changed.emit())
+
+    def undo(self) -> bool:
+        if not self.game.history.can_undo:
+            return False
+        label = self.game.history.undo_text
+        self.game.history.undo()
+        self.log("info", f"Undo: {label}")
+        return True
+
+    def redo(self) -> bool:
+        if not self.game.history.can_redo:
+            return False
+        label = self.game.history.redo_text
+        self.game.history.redo()
+        self.log("info", f"Redo: {label}")
+        return True
+
+    def history_state(self) -> dict[str, Any]:
+        history = self.game.history
+        return {
+            "can_undo": history.can_undo,
+            "can_redo": history.can_redo,
+            "undo_text": history.undo_text,
+            "redo_text": history.redo_text,
+        }
 
     def log(self, level: str, message: str) -> None:
         if self.bridge is not None:
@@ -3805,15 +4027,30 @@ class MultiplayerStudioAdapter:
         resolved_parent = parent_id or definition.default_parent
         unique_name = self._unique_sibling_name(definition.display_name, resolved_parent)
 
-        accepted = self.game.request_create_instance(
-            object_type, parent_id=resolved_parent, name=unique_name,
+        # `properties=None` here (NOT {}) so CreateObjectCommand.send_forward
+        # preserves request_create_instance's own spawn-position auto-fill
+        # for the very first creation -- the command's `properties` is
+        # filled in with the server-confirmed canonical values by
+        # _CreateTracker once PART_CREATED arrives, so a later Redo
+        # recreates at the ORIGINAL spawn position rather than wherever the
+        # player happens to be facing when Redo is pressed.
+        command = editor_history.CreateObjectCommand(
+            f"Create {definition.display_name}", object_type, None, resolved_parent, unique_name,
         )
+        accepted = self.game.history.perform(command, optimistic=False)
         if accepted:
             self.pending_create_count += 1
         return accepted
 
     def duplicate_object(self, object_id: str) -> bool:
-        accepted = self.game.duplicate_instance(object_id)
+        result = self.game.compute_duplicate_properties(object_id)
+        if result is None:
+            return False
+        record, properties = result
+        command = editor_history.CreateObjectCommand(
+            f"Duplicate {record.class_name}", record.class_name, properties, record.parent_id, record.name,
+        )
+        accepted = self.game.history.perform(command, optimistic=False)
         if accepted:
             self.pending_create_count += 1
         return accepted
@@ -3821,7 +4058,12 @@ class MultiplayerStudioAdapter:
     def delete_object(self, object_id: str) -> bool:
         if object_id.startswith("system:"):
             return False
-        return self.game.delete_instance(object_id)
+        snapshot = self.game.build_delete_snapshot(object_id)
+        if snapshot is None:
+            return self.game.delete_instance(object_id)
+        label = f"Delete {snapshot[0]['class_name']}"
+        command = editor_history.DeleteObjectCommand(label, snapshot)
+        return self.game.history.perform(command, optimistic=False)
 
     def set_parent(self, object_id: str, parent_id: str) -> bool:
         # Финальная валидация всё равно на сервере (handle_set_parent в
@@ -3830,7 +4072,13 @@ class MultiplayerStudioAdapter:
         # и не имеют смысла как перетаскиваемый объект).
         if object_id.startswith("system:"):
             return False
-        return self.game.request_set_parent(object_id, parent_id)
+        record = self.game.instances.get(object_id)
+        if record is None:
+            return self.game.request_set_parent(object_id, parent_id)
+        command = editor_history.ReparentCommand(
+            object_id, "Reparent", before_parent_id=record.parent_id, after_parent_id=parent_id,
+        )
+        return self.game.history.perform(command, optimistic=False)
 
     def transform_model(
         self,
@@ -3857,48 +4105,94 @@ class MultiplayerStudioAdapter:
         property_path: str,
         value: Any,
     ) -> bool:
+        """Every Inspector edit, rename, and Anchored/CanCollide toggle
+        goes through here -- the single hook point for
+        PropertyEditCommand (Stage 2.5). `obj` already carries the NEW
+        (post-edit) value by the time we get here (EngineBridge writes it
+        before calling the adapter); the OLD value for history comes from
+        `self.game.instances[object_id]`, which is only updated once the
+        server confirms via PART_UPDATED -- i.e. it is still the pre-edit
+        value at this point."""
         if self.bridge is None or object_id.startswith("system:"):
             return False
         obj = self.bridge.get_object(object_id)
         if obj is None:
             return False
 
+        name: str | None = None
+        enabled: bool | None = None
+        properties: dict[str, Any] | None = None
+        label = "Edit Property"
+
         if property_path == "name":
-            return self.game.apply_property_edit(object_id, name=str(value))
-        if property_path == "enabled":
-            return self.game.apply_property_edit(object_id, enabled=bool(value))
-        if property_path.startswith("properties."):
+            name = str(value)
+            label = "Rename"
+        elif property_path == "enabled":
+            enabled = bool(value)
+            label = "Edit Enabled"
+        elif property_path.startswith("properties."):
             key = property_path.split(".", 1)[1]
-            return self.game.apply_property_edit(object_id, properties={key: value})
-
-        properties: dict[str, Any]
-        root = property_path.split(".", 1)[0]
-        if root == "position":
-            properties = {"Position": [obj.position.x, obj.position.y, obj.position.z]}
-        elif root == "rotation":
-            properties = {"Rotation": [obj.rotation.x, obj.rotation.y, obj.rotation.z]}
-        elif root == "size":
-            properties = {"Size": [obj.size.x, obj.size.y, obj.size.z]}
-        elif property_path == "color":
-            properties = {"Color": self._hex_to_rgb(obj.color)}
-        elif property_path == "transparency":
-            properties = {"Transparency": float(obj.transparency)}
-        elif property_path == "material" and "Material" in DEFAULT_PART_PROPERTIES:
-            properties = {"Material": str(obj.material)}
-        elif property_path == "reflectance" and "Reflectance" in DEFAULT_PART_PROPERTIES:
-            properties = {"Reflectance": float(obj.reflectance)}
-        elif property_path == "anchored" and "Anchored" in DEFAULT_PART_PROPERTIES:
-            properties = {"Anchored": bool(obj.anchored)}
-        elif property_path == "can_collide" and "CanCollide" in DEFAULT_PART_PROPERTIES:
-            properties = {"CanCollide": bool(obj.can_collide)}
-        elif property_path == "cast_shadow" and "CastShadow" in DEFAULT_PART_PROPERTIES:
-            properties = {"CastShadow": bool(obj.cast_shadow)}
-        elif property_path == "locked" and "Locked" in DEFAULT_PART_PROPERTIES:
-            properties = {"Locked": bool(obj.locked)}
+            properties = {key: value}
+            label = f"Edit {key}"
         else:
-            return False
+            root = property_path.split(".", 1)[0]
+            if root == "position":
+                properties = {"Position": [obj.position.x, obj.position.y, obj.position.z]}
+                label = "Edit Position"
+            elif root == "rotation":
+                properties = {"Rotation": [obj.rotation.x, obj.rotation.y, obj.rotation.z]}
+                label = "Edit Rotation"
+            elif root == "size":
+                properties = {"Size": [obj.size.x, obj.size.y, obj.size.z]}
+                label = "Edit Size"
+            elif property_path == "color":
+                properties = {"Color": self._hex_to_rgb(obj.color)}
+                label = "Edit Color"
+            elif property_path == "transparency":
+                properties = {"Transparency": float(obj.transparency)}
+                label = "Edit Transparency"
+            elif property_path == "material" and "Material" in DEFAULT_PART_PROPERTIES:
+                properties = {"Material": str(obj.material)}
+                label = "Edit Material"
+            elif property_path == "reflectance" and "Reflectance" in DEFAULT_PART_PROPERTIES:
+                properties = {"Reflectance": float(obj.reflectance)}
+                label = "Edit Reflectance"
+            elif property_path == "anchored" and "Anchored" in DEFAULT_PART_PROPERTIES:
+                properties = {"Anchored": bool(obj.anchored)}
+                label = "Edit Anchored"
+            elif property_path == "can_collide" and "CanCollide" in DEFAULT_PART_PROPERTIES:
+                properties = {"CanCollide": bool(obj.can_collide)}
+                label = "Edit CanCollide"
+            elif property_path == "cast_shadow" and "CastShadow" in DEFAULT_PART_PROPERTIES:
+                properties = {"CastShadow": bool(obj.cast_shadow)}
+                label = "Edit CastShadow"
+            elif property_path == "locked" and "Locked" in DEFAULT_PART_PROPERTIES:
+                properties = {"Locked": bool(obj.locked)}
+                label = "Edit Locked"
+            else:
+                return False
 
-        return self.game.apply_property_edit(object_id, properties)
+        record = self.game.instances.get(object_id)
+        if record is None:
+            # No local record to diff against (should not normally happen
+            # for a live-synced object) -- fall back to a direct,
+            # non-undoable send rather than losing the edit entirely.
+            return self.game.apply_property_edit(object_id, properties=properties, name=name, enabled=enabled)
+
+        before_properties = (
+            {key: record.properties.get(key) for key in properties} if properties else None
+        )
+        command = editor_history.PropertyEditCommand(
+            object_id,
+            label,
+            before_properties=before_properties,
+            after_properties=properties,
+            before_name=record.name if name is not None else None,
+            after_name=name,
+            before_enabled=record.enabled if enabled is not None else None,
+            after_enabled=enabled,
+        )
+        return self.game.history.perform(command, optimistic=True)
 
     def play(self) -> bool:
         self.game.set_studio_playing(True)

@@ -314,6 +314,7 @@ class EngineBridge(QObject):
     log_message = Signal(str, str)
     play_state_changed = Signal(bool)
     dirty_changed = Signal(bool)
+    history_state_changed = Signal()
 
     def __init__(
         self,
@@ -655,6 +656,18 @@ class EngineBridge(QObject):
         self.set_dirty(True)
         self.log("info", f'Transformed Model "{obj.name}" ({len(relative)} descendant(s)).')
         return True
+
+    def undo(self) -> None:
+        self._adapter_call("undo", default=False)
+
+    def redo(self) -> None:
+        self._adapter_call("redo", default=False)
+
+    def history_state(self) -> dict[str, Any]:
+        return self._adapter_call(
+            "history_state",
+            default={"can_undo": False, "can_redo": False, "undo_text": "", "redo_text": ""},
+        )
 
     def new_scene(self) -> None:
         if self.live_mode:
@@ -3278,6 +3291,14 @@ class StudioMainWindow(QMainWindow):
         file_menu.addAction(exit_action)
 
         edit_menu = menu.addMenu("&Edit")
+        self.undo_action = QAction("Undo", self)
+        self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self.undo_action.triggered.connect(self.bridge.undo)
+        self.redo_action = QAction("Redo", self)
+        self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self.redo_action.triggered.connect(self.bridge.redo)
+        edit_menu.addActions([self.undo_action, self.redo_action])
+        edit_menu.addSeparator()
         duplicate_action = QAction("Duplicate", self)
         duplicate_action.setShortcut(QKeySequence("Ctrl+D"))
         duplicate_action.triggered.connect(self.bridge.duplicate_selected)
@@ -3285,6 +3306,9 @@ class StudioMainWindow(QMainWindow):
         delete_action.setShortcut(QKeySequence.StandardKey.Delete)
         delete_action.triggered.connect(self.bridge.delete_selected)
         edit_menu.addActions([duplicate_action, delete_action])
+
+        self.bridge.history_state_changed.connect(self._update_undo_redo_actions)
+        self._update_undo_redo_actions()
 
         view_menu = menu.addMenu("&View")
         reset_layout = QAction("Reset Layout", self)
@@ -3464,6 +3488,17 @@ class StudioMainWindow(QMainWindow):
         else:
             obj = self.bridge.get_object(self.bridge.selected_id)
             self._selection_status(obj)
+
+    def _update_undo_redo_actions(self) -> None:
+        state = self.bridge.history_state()
+        can_undo = bool(state.get("can_undo"))
+        can_redo = bool(state.get("can_redo"))
+        undo_text = state.get("undo_text") or ""
+        redo_text = state.get("redo_text") or ""
+        self.undo_action.setEnabled(can_undo)
+        self.undo_action.setText(f"Undo {undo_text}" if undo_text else "Undo")
+        self.redo_action.setEnabled(can_redo)
+        self.redo_action.setText(f"Redo {redo_text}" if redo_text else "Redo")
 
     def _update_title(self, *_args) -> None:
         name = self.current_file.name if self.current_file else "Untitled Scene"
