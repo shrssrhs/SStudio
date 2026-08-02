@@ -391,6 +391,26 @@ class EngineBridge(QObject):
         if self.selected_id == obj.id:
             self.selection_changed.emit(obj)
 
+    def sync_transform_live(self, object_id: str, field_name: str, value: "Vec3") -> None:
+        """Cheap per-frame path for an actively-dragged gizmo transform.
+
+        Deliberately does NOT call sync_upsert()/emit scene_changed or
+        selection_changed: those drive ExplorerPanel.rebuild() (tears down
+        and rebuilds the entire tree) and InspectorPanel.set_object() (tears
+        down and rebuilds every section, recreating every widget) — doing
+        that on every rendered frame during a drag is what caused the
+        reported jerky ~25-30fps movement, not network throttling or grid
+        snapping. This only mutates the existing SceneObject field in place
+        and emits property_changed, which ExplorerPanel already ignores for
+        non-name paths and InspectorPanel now handles by updating just the
+        relevant spinboxes in place (see VectorEditor.set_values_silently).
+        """
+        obj = self.get_object(object_id)
+        if obj is None or not hasattr(obj, field_name):
+            return
+        setattr(obj, field_name, value)
+        self.property_changed.emit(object_id, field_name, value)
+
     def sync_delete(self, object_id: str) -> None:
         existing = self.get_object(object_id)
         if existing is None:
@@ -1513,6 +1533,19 @@ class VectorEditor(QWidget):
             self.spins[axis] = box
             layout.addWidget(box, 1)
 
+    def set_values_silently(self, value: Vec3) -> None:
+        """Updates the three spinboxes in place without emitting
+        value_changed — used for high-frequency live updates (gizmo drag)
+        where re-triggering the normal edit path would send the value back
+        through EngineBridge.set_property() on every rendered frame."""
+        for axis, component in (("x", value.x), ("y", value.y), ("z", value.z)):
+            box = self.spins[axis]
+            if abs(box.value() - component) < 1e-9:
+                continue
+            box.blockSignals(True)
+            box.setValue(component)
+            box.blockSignals(False)
+
 
 class ColorField(QPushButton):
     color_selected = Signal(str)
@@ -1546,6 +1579,12 @@ class InspectorPanel(QWidget):
         self.bridge = bridge
         self.current_object: Optional[SceneObject] = None
         self._building = False
+        # Заполняется _build_transform_section() при показе объекта с
+        # transform-секцией; позволяет _external_property_changed() при
+        # высокочастотных live-обновлениях (drag гизмо) обновлять значения
+        # существующих спинбоксов на месте, а не пересобирать Inspector —
+        # см. разбор бага "дёрганое перетаскивание" в отчёте задачи.
+        self._live_vector_editors: dict[str, VectorEditor] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1599,6 +1638,7 @@ class InspectorPanel(QWidget):
         self.filter_edit.textChanged.connect(self._apply_filter)
 
     def clear_sections(self) -> None:
+        self._live_vector_editors = {}
         while self.contents_layout.count() > 1:
             item = self.contents_layout.takeAt(0)
             widget = item.widget()
@@ -1709,6 +1749,7 @@ class InspectorPanel(QWidget):
         size = VectorEditor(obj.size, "size")
         for editor in (position, rotation, scale, size):
             editor.value_changed.connect(self._set_value)
+        self._live_vector_editors = {"position": position, "rotation": rotation}
 
         transform.add_row("Position", position)
         transform.add_row("Rotation", rotation)
@@ -1870,8 +1911,23 @@ class InspectorPanel(QWidget):
         self._set_value("locked", bool(checked))
 
     def _external_property_changed(self, object_id: str, path: str, value: Any) -> None:
-        if self.current_object and self.current_object.id == object_id and not self._building:
-            self.set_object(self.current_object)
+        if self._building or not self.current_object or self.current_object.id != object_id:
+            return
+
+        # Высокочастотный путь (drag гизмо): sync_transform_live() шлёт
+        # path="position"/"rotation" целиком с Vec3-значением. Обновляем
+        # только существующие спинбоксы, без пересборки Inspector — полная
+        # пересборка на каждый кадр перетаскивания и была причиной
+        # "дёрганого" движения (см. отчёт задачи). setattr держит
+        # current_object согласованным на случай последующего _apply_filter
+        # или полной пересборки по другой причине.
+        editor = self._live_vector_editors.get(path)
+        if editor is not None and isinstance(value, Vec3):
+            setattr(self.current_object, path, value)
+            editor.set_values_silently(value)
+            return
+
+        self.set_object(self.current_object)
 
     def _apply_filter(self, text: str) -> None:
         query = text.strip().lower()

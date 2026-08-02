@@ -459,6 +459,59 @@ DEBUG_MOUSE_LOOK = False
 # флаг — включать вручную для отладки, в проде должен быть False.
 DEBUG_VIEWPORT_GEOMETRY = False
 
+# Считает частоту (Hz) каждого этапа конвейера трансформации гизмо за одну
+# сессию перетаскивания (mouse down -> mouse up) и печатает сводку по
+# отпусканию кнопки. Не печатает ничего, пока флаг выключен — включать
+# вручную для отладки, в проде должен быть False.
+DEBUG_GIZMO_TIMING = False
+
+
+class _GizmoTimingProbe:
+    """Собирает частоты событий и длительности за одну gizmo-drag сессию.
+    Каждый tick()/record_duration_ms() — это одна операция dict/list, дешёвая
+    даже если бы вызывалась без гейта; begin()/end_and_report() дополнительно
+    вызываются только когда DEBUG_GIZMO_TIMING включён."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self._start = 0.0
+        self._counts: dict[str, int] = {}
+        self._durations_ms: list[float] = []
+
+    def begin(self) -> None:
+        self.active = True
+        self._start = time.perf_counter()
+        self._counts = {}
+        self._durations_ms = []
+
+    def tick(self, name: str) -> None:
+        if not self.active:
+            return
+        self._counts[name] = self._counts.get(name, 0) + 1
+
+    def record_duration_ms(self, milliseconds: float) -> None:
+        if not self.active:
+            return
+        self._durations_ms.append(milliseconds)
+
+    def end_and_report(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        elapsed = max(1e-6, time.perf_counter() - self._start)
+        print(f"[GIZMO_TIMING] drag session: {elapsed * 1000:.0f} ms")
+        for name in sorted(self._counts):
+            count = self._counts[name]
+            print(f"[GIZMO_TIMING]   {name}: {count} events, {count / elapsed:.1f} Hz")
+        if self._durations_ms:
+            print(
+                f"[GIZMO_TIMING]   _apply_gizmo_result duration (ms): "
+                f"min={min(self._durations_ms):.3f} "
+                f"avg={sum(self._durations_ms) / len(self._durations_ms):.3f} "
+                f"max={max(self._durations_ms):.3f}"
+            )
+
+
 QT_LOOK_SENSITIVITY_X = 0.08
 QT_LOOK_SENSITIVITY_Y = 0.08
 
@@ -1156,6 +1209,12 @@ class MultiplayerGame(Entity):
         self.gizmo_mode = "select"
         self.gizmo_snap_size = DEFAULT_MOVE_SNAP
         self._gizmo_last_network_send = 0.0
+        # Instance id, активно перетаскиваемый гизмо ПРЯМО СЕЙЧАС (или None).
+        # См. update_instance() — пока не None, входящие PART_UPDATED для
+        # этого id не позволяют устаревшему серверному эхо откатить
+        # Position/Rotation назад поверх уже более новой локальной позиции.
+        self._gizmo_dragging_instance_id: str | None = None
+        self._gizmo_timing = _GizmoTimingProbe()
 
         self.create_world()
         self.create_first_person_player()
@@ -1736,6 +1795,15 @@ class MultiplayerGame(Entity):
         self.gizmo.refresh_transform(camera.world_position)
 
         if self.gizmo.dragging:
+            if DEBUG_GIZMO_TIMING:
+                # В этой архитектуре "кадр рендера" и "чтение мыши" — одно и
+                # то же событие: gizmo-drag читает mouse.x/mouse.y напрямую
+                # каждый вызов update_gizmo(), а не через отдельные Qt
+                # mouse-move события (те используются только для RMB-обзора
+                # камеры через QCursor, см. _poll_qt_look_delta). Оба
+                # тикаются здесь для честности замера, а не для различения.
+                self._gizmo_timing.tick("rendered_frame")
+                self._gizmo_timing.tick("mouse_read")
             ray_origin, ray_direction = mouse_world_ray()
             if ray_origin is None:
                 return
@@ -1747,6 +1815,8 @@ class MultiplayerGame(Entity):
                 not shift_held,
             )
             if result is not None:
+                if DEBUG_GIZMO_TIMING:
+                    self._gizmo_timing.tick("entity_transform")
                 self._apply_gizmo_result(target, result, force_network=False)
         else:
             ray_origin, ray_direction = mouse_world_ray()
@@ -1759,16 +1829,28 @@ class MultiplayerGame(Entity):
         ray_origin, ray_direction = mouse_world_ray()
         if ray_origin is None:
             return False
-        return self.gizmo.begin_drag(ray_origin, ray_direction)
+        started = self.gizmo.begin_drag(ray_origin, ray_direction)
+        if started:
+            # См. update_instance(): пока перетаскивание активно, устаревшие
+            # PART_UPDATED-эхо сервера для ЭТОГО объекта не должны откатывать
+            # Position/Rotation назад поверх уже более новой локальной
+            # позиции — целиком клиентская защита, без изменений протокола.
+            self._gizmo_dragging_instance_id = self.selected_part_id
+            if DEBUG_GIZMO_TIMING:
+                self._gizmo_timing.begin()
+        return started
 
     def end_gizmo_drag(self) -> None:
         result = self.gizmo.end_drag()
         if result is None:
+            self._gizmo_dragging_instance_id = None
             return
         target = self.parts.get(self.selected_part_id) if self.selected_part_id else None
-        if target is None:
-            return
-        self._apply_gizmo_result(target, result, force_network=True)
+        if target is not None:
+            self._apply_gizmo_result(target, result, force_network=True)
+        self._gizmo_dragging_instance_id = None
+        if DEBUG_GIZMO_TIMING:
+            self._gizmo_timing.end_and_report()
 
     def _apply_gizmo_result(
         self,
@@ -1776,17 +1858,29 @@ class MultiplayerGame(Entity):
         result: tuple[str, Vec3],
         force_network: bool,
     ) -> None:
+        duration_start = time.perf_counter() if DEBUG_GIZMO_TIMING else 0.0
+
         kind, vector = result
         part_id = self.selected_part_id
         if part_id is None:
             return
 
-        # Entity уже обновлена внутри gizmo.update_drag()/end_drag(). Тут
-        # синхронизируем instance_properties (иначе Inspector увидит
-        # старое значение — instance_to_scene_object() читает именно
-        # record.properties, а не entity.position напрямую) и SceneObject в
-        # EngineBridge — через on_instance_updated(), который НЕ дёргает
-        # адаптер повторно (в отличие от bridge.set_property()).
+        # Entity уже обновлена внутри gizmo.update_drag()/end_drag() —
+        # каждый вызов идёт из update_gizmo(), т.е. каждый рендер-кадр (см.
+        # DEBUG_GIZMO_TIMING). Здесь синхронизируем instance_properties
+        # (иначе Inspector увидит старое значение — instance_to_scene_object()
+        # читает именно record.properties, а не entity.position напрямую) и
+        # SceneObject в EngineBridge.
+        #
+        # ВАЖНО: используем on_instance_transform_live(), а НЕ
+        # on_instance_updated() — последний пересобирает целый SceneObject и
+        # эмитит scene_changed/selection_changed, что заставляет Explorer и
+        # Inspector полностью пересобирать себя (все QTreeWidgetItem'ы,
+        # все спинбоксы) НА КАЖДЫЙ РЕНДЕР-КАДР перетаскивания. Это и было
+        # настоящей причиной "дёрганого" движения — не throttling сети и не
+        # grid snap (см. отчёт задачи). on_instance_transform_live() обновляет
+        # SceneObject на месте и обновляет только существующие спинбоксы
+        # Inspector, без пересборки.
         new_value = [float(vector.x), float(vector.y), float(vector.z)]
         entity.instance_properties[kind] = new_value
         record = self.instances.get(part_id)
@@ -1794,13 +1888,21 @@ class MultiplayerGame(Entity):
             record.properties[kind] = new_value
         self.update_selection_highlight(entity)
         if self.studio_adapter is not None and record is not None:
-            self.studio_adapter.on_instance_updated(record)
+            self.studio_adapter.on_instance_transform_live(record, kind, new_value)
+            if DEBUG_GIZMO_TIMING:
+                self._gizmo_timing.tick("bridge_sync")
 
         now = time.monotonic()
         interval = 1.0 / GIZMO_NETWORK_SEND_RATE
         if force_network or (now - self._gizmo_last_network_send) >= interval:
             self._gizmo_last_network_send = now
             self.apply_property_edit(part_id, {kind: entity.instance_properties[kind]})
+            if DEBUG_GIZMO_TIMING:
+                self._gizmo_timing.tick("network_send")
+
+        if DEBUG_GIZMO_TIMING:
+            self._gizmo_timing.tick("apply_gizmo_result")
+            self._gizmo_timing.record_duration_ms((time.perf_counter() - duration_start) * 1000.0)
 
     def apply_property_edit(
         self,
@@ -2201,6 +2303,22 @@ class MultiplayerGame(Entity):
         if record is None:
             return
 
+        if properties and instance_id == self._gizmo_dragging_instance_id:
+            if DEBUG_GIZMO_TIMING:
+                self._gizmo_timing.tick("server_echo")
+            # Сервер — источник истины ВНЕ активного локального
+            # перетаскивания (см. отчёт задачи), но while a drag on THIS
+            # instance is in progress, network throttling (см.
+            # GIZMO_NETWORK_SEND_RATE) means an echo we receive now can
+            # reflect an OLDER intermediate value than what the local drag
+            # has already advanced to this frame — applying it would visibly
+            # snap the object backward. Не трогаем Position/Rotation здесь;
+            # остальные свойства (Color, Name, ...) по-прежнему применяются
+            # нормально. Гвард снимается сразу на отпускании кнопки — тогда
+            # финальный echo (в т.ч. этого же перетаскивания) снова
+            # применяется как обычно.
+            properties = {k: v for k, v in properties.items() if k not in ("Position", "Rotation")}
+
         if properties:
             self._apply_instance_properties(record, properties, replace=False)
         if name is not None:
@@ -2550,6 +2668,22 @@ class MultiplayerStudioAdapter:
     def on_instance_updated(self, record: "InstanceRecord") -> None:
         if self.bridge is not None:
             self.bridge.sync_upsert(self.instance_to_scene_object(record))
+
+    _LIVE_TRANSFORM_FIELDS = {"Position": "position", "Rotation": "rotation"}
+
+    def on_instance_transform_live(self, record: "InstanceRecord", property_key: str, value: list[float]) -> None:
+        """High-frequency counterpart to on_instance_updated(), used while a
+        gizmo drag is in progress (see MultiplayerGame._apply_gizmo_result).
+        Routes through EngineBridge.sync_transform_live() instead of
+        sync_upsert()/instance_to_scene_object() — the latter rebuilds a
+        fresh SceneObject and triggers a full Explorer+Inspector widget
+        rebuild on every call, which is what caused the jerky drag."""
+        if self.bridge is None:
+            return
+        field_name = self._LIVE_TRANSFORM_FIELDS.get(property_key)
+        if field_name is None:
+            return
+        self.bridge.sync_transform_live(record.id, field_name, self._as_editor_vec3(value, (0, 0, 0)))
 
     def on_instance_deleted(self, instance_id: str) -> None:
         if self.bridge is not None:
