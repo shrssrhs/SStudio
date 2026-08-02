@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -1352,31 +1353,71 @@ class MultiplayerGame(Entity):
         shape" without any separate rebuild-tracking (see Stage 2.4
         report, "collision-shape update strategy"). Disabled instances
         are skipped entirely (nothing to simulate for something not
-        rendered)."""
-        self._physics_snapshot = {}
-        self._physics_world = physics.PhysicsWorld()
-        body_count = 0
-        for instance_id, entity in self.parts.items():
-            record = self.instances.get(instance_id)
-            if record is None or not record.enabled:
-                continue
-            properties = record.properties
-            position = properties.get("Position", [0.0, 0.0, 0.0])
-            rotation = properties.get("Rotation", [0.0, 0.0, 0.0])
-            size = properties.get("Size", [1.0, 1.0, 1.0])
-            self._physics_snapshot[instance_id] = {
-                "Position": [float(v) for v in position],
-                "Rotation": [float(v) for v in rotation],
-                "Size": [float(v) for v in size],
-            }
-            anchored = bool(properties.get("Anchored", True))
-            can_collide = bool(properties.get("CanCollide", True))
-            self._physics_world.add_part(
-                instance_id, entity, position, rotation, size, anchored, can_collide,
-            )
-            body_count += 1
+        rendered).
+
+        Wrapped in try/except that ALWAYS prints a full traceback
+        (bug-report follow-up: "Part remains perfectly suspended" in the
+        real GUI) — set_studio_playing() is invoked through
+        EngineBridge._adapter_call(), which catches any exception here,
+        logs one line to the Output panel, and otherwise proceeds as if
+        Play succeeded (self.studio_playing is already True by the time
+        this runs). Without this, a physics-init exception would be
+        completely invisible on the console — Play LOOKS like it
+        started (gizmo hidden, HUD up) while zero bodies were ever
+        created."""
         if physics.DEBUG_PHYSICS:
-            print(f"[PHYSICS] Play start: {body_count} instances handed to physics ({self._physics_world.body_count()} bodies)")
+            repo_dir = Path(__file__).resolve().parent
+            try:
+                commit = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True, stderr=subprocess.STDOUT,
+                ).strip()
+            except Exception as error:
+                commit = f"<git rev-parse failed: {error}>"
+            print(f"[PHYSICS] Play pressed. git HEAD={commit}")
+            print(f"[PHYSICS] physics module: {Path(physics.__file__).resolve()}")
+            print(f"[PHYSICS] studio_playing before={self.studio_playing}")
+
+        self._physics_snapshot = {}
+        try:
+            self._physics_world = physics.PhysicsWorld()
+            body_count = 0
+            for instance_id, entity in self.parts.items():
+                record = self.instances.get(instance_id)
+                if record is None or not record.enabled:
+                    if physics.DEBUG_PHYSICS and record is not None:
+                        print(f"[PHYSICS] skip id={instance_id} name={record.name!r} (disabled)")
+                    continue
+                properties = record.properties
+                position = properties.get("Position", [0.0, 0.0, 0.0])
+                rotation = properties.get("Rotation", [0.0, 0.0, 0.0])
+                size = properties.get("Size", [1.0, 1.0, 1.0])
+                self._physics_snapshot[instance_id] = {
+                    "Position": [float(v) for v in position],
+                    "Rotation": [float(v) for v in rotation],
+                    "Size": [float(v) for v in size],
+                }
+                anchored = bool(properties.get("Anchored", True))
+                can_collide = bool(properties.get("CanCollide", True))
+                if physics.DEBUG_PHYSICS:
+                    print(
+                        f"[PHYSICS] considering id={instance_id} name={record.name!r} "
+                        f"Anchored={anchored} CanCollide={can_collide} "
+                        f"Position={position} Rotation={rotation} Size={size}"
+                    )
+                self._physics_world.add_part(
+                    instance_id, entity, position, rotation, size, anchored, can_collide,
+                )
+                body_count += 1
+        except Exception:
+            print("[PHYSICS] EXCEPTION in _start_physics() -- Play mode continues but physics did NOT initialize:")
+            traceback.print_exc()
+            return
+        if physics.DEBUG_PHYSICS:
+            print(
+                f"[PHYSICS] Play start: {body_count} instances handed to physics "
+                f"({self._physics_world.body_count()} bodies), "
+                f"studio_playing after={self.studio_playing}"
+            )
 
     def _stop_physics(self) -> None:
         """Tears down the physics world completely and restores every

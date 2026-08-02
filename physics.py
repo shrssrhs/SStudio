@@ -115,6 +115,7 @@ class PhysicsWorld:
         self.bullet_world.setGravity(PVec3(0, GRAVITY_Y, 0))
         self._rotation = _RotationScratch()
         self._bodies: dict[str, _PhysicsBody] = {}
+        self._frame_count = 0
         if DEBUG_PHYSICS:
             print(f"[PHYSICS] backend initialized: Bullet, gravity=(0,{GRAVITY_Y},0)")
 
@@ -203,20 +204,47 @@ class PhysicsWorld:
         return len(self._bodies)
 
     def step(self, dt: float) -> None:
+        self._frame_count += 1
+        frame_no = self._frame_count
+        verbose = DEBUG_PHYSICS and frame_no <= 120
+
         if dt <= 0:
+            if verbose:
+                print(f"[PHYSICS] frame={frame_no} dt={dt} -> SKIPPED (dt<=0, world not stepped)")
             return
+
         self.bullet_world.doPhysics(dt, MAX_SUBSTEPS, FIXED_SUBSTEP)
 
         for body in self._bodies.values():
             if body.kind == "dynamic":
                 pos = body.np.getPos()
                 quat = body.np.getQuat()
+                entity_pos_before = Vec3(body.entity.position)
                 body.entity.position = Vec3(pos.x, pos.y, pos.z)
                 body.entity.rotation = Vec3(*self._rotation.quat_to_euler(quat))
+                if verbose:
+                    print(
+                        f"[PHYSICS] frame={frame_no} dt={dt:.5f} id={body.instance_id} "
+                        f"kind=dynamic body_pos=({pos.x:.4f},{pos.y:.4f},{pos.z:.4f}) "
+                        f"entity_pos_before={entity_pos_before} "
+                        f"entity_pos_after={body.entity.position} "
+                        f"active={body.node.isActive()} copied_to_entity=True"
+                    )
             elif body.kind == "ghost":
                 body.velocity_y += GRAVITY_Y * dt
                 body.entity.y += body.velocity_y * dt
-            # "static"/"none": never moves during Play by definition.
+                if verbose:
+                    print(
+                        f"[PHYSICS] frame={frame_no} dt={dt:.5f} id={body.instance_id} "
+                        f"kind=ghost velocity_y={body.velocity_y:.4f} entity_pos_after={body.entity.position}"
+                    )
+            elif verbose and frame_no <= 3:
+                # static/none: log only the first few frames to confirm
+                # they're deliberately skipped, not silently forgotten.
+                print(f"[PHYSICS] frame={frame_no} id={body.instance_id} kind={body.kind} -> not simulated (by design)")
+
+        if verbose:
+            print(f"[PHYSICS] frame={frame_no} world stepped=True accumulated_steps={frame_no} bodies={len(self._bodies)}")
 
     def destroy(self) -> None:
         removed = len(self._bodies)
