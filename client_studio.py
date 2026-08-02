@@ -49,6 +49,7 @@ from studio_editor_live import (
     StudioMainWindow,
     Vec3 as EditorVec3,
 )
+import physics
 from shared import object_registry, protocol
 from shared.instance import DEFAULT_PART_PROPERTIES, MIN_PART_SIZE
 from shared.object_registry import ROOT_SERVICES
@@ -533,6 +534,12 @@ DEBUG_MODEL_TRANSFORMS = False
 # но для _apply_model_scale_result. По умолчанию False, не печатает ничего
 # в проде.
 DEBUG_SCALE_GIZMO = False
+
+# Stage 2.4 cleanup: prints git HEAD / running-source-path proof at
+# startup (see _print_startup_diagnostics) — was unconditional during the
+# uniform-scale bug investigation, now gated off by default like every
+# other DEBUG_* flag here.
+DEBUG_STARTUP = False
 
 QT_LOOK_SENSITIVITY_X = 0.08
 QT_LOOK_SENSITIVITY_Y = 0.08
@@ -1255,6 +1262,17 @@ class MultiplayerGame(Entity):
         self.model_gizmo_proxy = Entity(eternal=True)
         self._transform_scratch = Entity(eternal=True)
 
+        # Stage 2.4: Play Mode runtime physics (see physics.py). Exists
+        # only between set_studio_playing(True) and set_studio_playing
+        # (False) — recreated fresh every Play, fully torn down on every
+        # Stop, never persisted. _physics_snapshot holds each simulated
+        # Part's exact pre-Play Position/Rotation/Size (properties dict
+        # is never mutated by physics itself, but the snapshot is kept
+        # explicit rather than relying on that as an invariant — see
+        # Stage 2.4 report, "Play/Stop snapshot restoration").
+        self._physics_world: physics.PhysicsWorld | None = None
+        self._physics_snapshot: dict[str, dict[str, list[float]]] = {}
+
         # Состояние активного каскадного Model-drag (None вне драга).
         # "descendant_relative" — id -> (relative_pos: Vec3, relative_quat:
         # Quat), захваченные в момент begin_drag: смещение/ориентация
@@ -1310,17 +1328,88 @@ class MultiplayerGame(Entity):
             self.gizmo.set_target(None)
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = False
+            self._start_physics()
         else:
             if preserve_position and self.studio_playing:
                 self.saved_play_position = Vec3(self.local_player.position)
                 self.saved_play_yaw = float(self.player_yaw)
                 self.saved_play_pitch = float(self.player_pitch)
+            was_playing = self.studio_playing
             self.studio_playing = False
             self.editor_look_active = False
             self.hud_root.enabled = False
             self._stop_mouse_look()
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = True
+            if was_playing:
+                self._stop_physics()
+
+    def _start_physics(self) -> None:
+        """Builds a fresh PhysicsWorld from the CURRENT editor properties
+        of every Part-like instance — always reflects whatever Move/
+        Rotate/Scale/Anchored/CanCollide edits happened since the last
+        Play, satisfying "the next Play uses the updated collision
+        shape" without any separate rebuild-tracking (see Stage 2.4
+        report, "collision-shape update strategy"). Disabled instances
+        are skipped entirely (nothing to simulate for something not
+        rendered)."""
+        self._physics_snapshot = {}
+        self._physics_world = physics.PhysicsWorld()
+        body_count = 0
+        for instance_id, entity in self.parts.items():
+            record = self.instances.get(instance_id)
+            if record is None or not record.enabled:
+                continue
+            properties = record.properties
+            position = properties.get("Position", [0.0, 0.0, 0.0])
+            rotation = properties.get("Rotation", [0.0, 0.0, 0.0])
+            size = properties.get("Size", [1.0, 1.0, 1.0])
+            self._physics_snapshot[instance_id] = {
+                "Position": [float(v) for v in position],
+                "Rotation": [float(v) for v in rotation],
+                "Size": [float(v) for v in size],
+            }
+            anchored = bool(properties.get("Anchored", True))
+            can_collide = bool(properties.get("CanCollide", True))
+            self._physics_world.add_part(
+                instance_id, entity, position, rotation, size, anchored, can_collide,
+            )
+            body_count += 1
+        if physics.DEBUG_PHYSICS:
+            print(f"[PHYSICS] Play start: {body_count} instances handed to physics ({self._physics_world.body_count()} bodies)")
+
+    def _stop_physics(self) -> None:
+        """Tears down the physics world completely and restores every
+        simulated instance's Entity to its exact pre-Play Position/
+        Rotation/Size from the explicit snapshot taken in
+        _start_physics() — record.properties (the networked,
+        authoritative state) was never touched during Play, so this is
+        purely a LOCAL visual restore, not a network round-trip."""
+        if self._physics_world is not None:
+            self._physics_world.destroy()
+            self._physics_world = None
+
+        restored = 0
+        for instance_id, snapshot in self._physics_snapshot.items():
+            entity = self.parts.get(instance_id)
+            record = self.instances.get(instance_id)
+            if entity is None or record is None:
+                continue
+            position = snapshot["Position"]
+            rotation = snapshot["Rotation"]
+            size = snapshot["Size"]
+            entity.position = Vec3(position[0], position[1], position[2])
+            entity.rotation = Vec3(rotation[0], rotation[1], rotation[2])
+            entity.scale = Vec3(size[0], size[1], size[2])
+            restored += 1
+        if physics.DEBUG_PHYSICS:
+            print(f"[PHYSICS] Play stop: restored {restored} instances to pre-Play transforms")
+        self._physics_snapshot = {}
+
+    def update_physics(self) -> None:
+        if self._physics_world is None:
+            return
+        self._physics_world.step(ursina_time.dt)
 
     def begin_editor_look(self) -> None:
         if self.studio_playing:
@@ -3069,7 +3158,6 @@ class MultiplayerGame(Entity):
             rotation = properties["Rotation"]
             rgb = properties["Color"]
             transparency = properties["Transparency"]
-            can_collide = bool(properties.get("CanCollide", True))
             return Entity(
                 model="cube",
                 position=Vec3(float(position[0]), float(position[1]), float(position[2])),
@@ -3079,7 +3167,15 @@ class MultiplayerGame(Entity):
                     int(rgb[0]), int(rgb[1]), int(rgb[2]),
                     int(255 * (1.0 - float(transparency))),
                 ),
-                collider="box" if can_collide else None,
+                # Stage 2.4: ALWAYS a picking collider, independent of
+                # CanCollide — this is Ursina's mouse.hovered_entity
+                # raycast target (editor selection), not gameplay
+                # collision. CanCollide now only controls the SEPARATE
+                # Bullet physics body built in physics.py during Play.
+                # Conflating the two here used to make CanCollide=False
+                # objects unselectable, which Stage 2.4 explicitly
+                # requires NOT to happen.
+                collider="box",
             )
         except (TypeError, ValueError, IndexError, KeyError) as error:
             print(f"[WORLD] Не удалось построить Entity: битые properties: {error}")
@@ -3117,8 +3213,10 @@ class MultiplayerGame(Entity):
                     int(rgb[0]), int(rgb[1]), int(rgb[2]),
                     int(255 * (1.0 - float(transparency))),
                 )
-            if replace or "CanCollide" in properties:
-                entity.collider = "box" if bool(merged.get("CanCollide", True)) else None
+            # Stage 2.4: CanCollide no longer touches entity.collider (see
+            # _build_part_entity) — it only affects the Play Mode physics
+            # body, applied fresh from current properties at the start of
+            # each Play (see MultiplayerGame.set_studio_playing).
         except (TypeError, ValueError, IndexError, KeyError) as error:
             print(f"[WORLD] Не удалось обновить {record.id}: {error}")
 
@@ -3369,6 +3467,7 @@ class MultiplayerGame(Entity):
             self.update_flight()
         if self.studio_playing:
             self.send_transform()
+            self.update_physics()
         self.update_remote_smoothing()
         self.update_sky()
 
@@ -3890,7 +3989,15 @@ def _print_startup_diagnostics() -> None:
     PyInstaller-built .exe — a frozen build has no .git directory
     alongside it, so `git rev-parse HEAD` deliberately isn't attempted
     there (it would just print a confusing 'not a git repository' error);
-    the frozen line itself already answers the question."""
+    the frozen line itself already answers the question.
+
+    Gated behind DEBUG_STARTUP (default False, Stage 2.4 cleanup) since
+    normal runs don't need this on every launch — kept rather than
+    deleted because "which checkout/commit is actually running" has
+    already been the deciding fact in two separate bug investigations
+    this project."""
+    if not DEBUG_STARTUP:
+        return
     if getattr(sys, "frozen", False):
         print(
             f"[STARTUP] FROZEN BUILD (PyInstaller) — running from "

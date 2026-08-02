@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 build/
+dist/
 dist_friend/
+*.spec
+*.log
 .idea/
 .DS_Store
