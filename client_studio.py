@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import builtins
+import ctypes
 import json
 import math
 import queue
@@ -66,6 +67,113 @@ try:
 except ImportError:
     simplepbr = None
     SIMPLEPBR_AVAILABLE = False
+
+
+# ============================================================
+# WIN32-ИНТРОСПЕКЦИЯ (только для диагностики embedding-геометрии)
+#
+# Проект работает только на Windows (см. требования задачи) — прямой
+# ctypes-вызов user32 здесь оправдан и не требует кроссплатформенных
+# обходов. Используется исключительно для верификации, что нативное
+# Panda3D-окно ДЕЙСТВИТЕЛЬНО является WS_CHILD дочерним окном Qt-контейнера
+# (а не осталось top-level/WS_POPUP поверх интерфейса) — см. разбор бага
+# в MultiplayerGame._sync_panda_window_to_container.
+# ============================================================
+
+GWL_STYLE = -16
+WS_CHILD = 0x40000000
+WS_POPUP = 0x80000000
+
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+SWP_SHOWWINDOW = 0x0040
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+def _win32_window_info(hwnd: int) -> dict[str, Any]:
+    """Возвращает GetParent/GWL_STYLE/GetWindowRect/GetClientRect для hwnd.
+    Не бросает исключений наружу — это диагностика, а не критический путь."""
+    if not hwnd:
+        return {"error": "no hwnd"}
+
+    try:
+        user32 = ctypes.windll.user32
+        parent = user32.GetParent(ctypes.c_void_p(hwnd))
+
+        get_style = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+        style = get_style(ctypes.c_void_p(hwnd), GWL_STYLE)
+        # GetWindowLongW может вернуть отрицательное значение как signed —
+        # приводим к unsigned 32 бита для корректной проверки битовых флагов.
+        style &= 0xFFFFFFFF
+
+        window_rect = _RECT()
+        user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(window_rect))
+        client_rect = _RECT()
+        user32.GetClientRect(ctypes.c_void_p(hwnd), ctypes.byref(client_rect))
+
+        return {
+            "hwnd": hwnd,
+            "parent_hwnd": int(parent) if parent else None,
+            "is_child": bool(style & WS_CHILD),
+            "is_popup": bool(style & WS_POPUP),
+            "window_rect": (window_rect.left, window_rect.top, window_rect.right, window_rect.bottom),
+            "client_rect": (client_rect.left, client_rect.top, client_rect.right, client_rect.bottom),
+        }
+    except Exception as error:
+        return {"error": str(error)}
+
+
+def _force_native_child_parenting(native_hwnd: int, parent_hwnd: int, width: int, height: int) -> dict[str, Any]:
+    """
+    QWindow.fromWinId(handle) + QWidget.createWindowContainer(...) is
+    documented Qt API for embedding a foreign native window, but measured
+    with _win32_window_info() this project's Panda3D window stayed a
+    top-level WS_POPUP with parent_hwnd=None the whole time — Qt's own
+    reparenting silently didn't take effect for this window. That is the
+    actual cause of the viewport rendering at the wrong screen position:
+    Panda3D kept moving a top-level popup to chase the container's SCREEN
+    coordinates each time WindowProperties got reapplied (see
+    MultiplayerGame._sync_panda_window_to_container), instead of simply
+    living at local (0, 0) inside a real child window.
+
+    This does the reparenting ourselves at the Win32 level: clear WS_POPUP,
+    set WS_CHILD, SetParent() to the container's HWND, then position at
+    local (0, 0) with SWP_FRAMECHANGED so Windows re-evaluates the changed
+    style. Called once, right after embedding — not on every frame.
+    """
+    if not native_hwnd or not parent_hwnd:
+        return {"error": "missing hwnd"}
+
+    try:
+        user32 = ctypes.windll.user32
+        get_style = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+        set_style = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+
+        style = get_style(ctypes.c_void_p(native_hwnd), GWL_STYLE) & 0xFFFFFFFF
+        style = (style & ~WS_POPUP) | WS_CHILD
+        set_style(ctypes.c_void_p(native_hwnd), GWL_STYLE, ctypes.c_long(style))
+
+        user32.SetParent(ctypes.c_void_p(native_hwnd), ctypes.c_void_p(parent_hwnd))
+
+        user32.SetWindowPos(
+            ctypes.c_void_p(native_hwnd),
+            None,
+            0, 0, int(width), int(height),
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+        )
+
+        return _win32_window_info(native_hwnd)
+    except Exception as error:
+        return {"error": str(error)}
 
 
 # ============================================================
@@ -843,6 +951,7 @@ class MultiplayerGame(Entity):
         # случая, когда встраивание не удалось и Panda3D осталась
         # владеть отдельным top-level окном.
         self.qt_viewport_container: QWidget | None = None
+        self.qt_viewport_foreign_window: QWindow | None = None
         self._qt_look_last_pos: QPoint | None = None
 
         self.saved_play_position = Vec3(0, 3, 0)
@@ -911,8 +1020,9 @@ class MultiplayerGame(Entity):
     # RELATIVE MOUSE LOOK (см. комментарий у QT_LOOK_SENSITIVITY_*)
     # --------------------------------------------------------
 
-    def set_qt_viewport_container(self, container: QWidget) -> None:
+    def set_qt_viewport_container(self, container: QWidget, foreign_window: QWindow | None = None) -> None:
         self.qt_viewport_container = container
+        self.qt_viewport_foreign_window = foreign_window
 
     def _qt_look_available(self) -> bool:
         return self.qt_viewport_container is not None
@@ -925,31 +1035,36 @@ class MultiplayerGame(Entity):
     # --------------------------------------------------------
     # ГЕОМЕТРИЯ ВСТРОЕННОГО ОКНА (см. подробный разбор бага в отчёте задачи)
     #
-    # Корень проблемы: ursina.window — это САМ объект WindowProperties
-    # (класс Window наследуется от WindowProperties, не оборачивает его), и
-    # это единственный на весь процесс общий экземпляр. mouse.visible /
-    # mouse.locked (ursina/mouse.py) при каждом переключении делают
-    # application.base.win.requestProperties(window) — то есть шлют Panda3D
-    # ВЕСЬ накопленный на этом объекте набор свойств, включая size, который
-    # был выставлен один раз при Ursina(size=(1100, 700), ...) в main() и
-    # с тех пор ни разу не обновлялся. Qt меняет реальный размер встроенного
-    # нативного окна напрямую через WinAPI при ресайзе контейнера — Panda3D
-    # (и тем более WindowProperties-синглтон ursina) об этом не узнаёт. В
-    # результате ЛЮБОЙ вызов requestProperties(window) (mouse.visible при
-    # RMB-обзоре, mouse.visible при входе в Play) откатывает нативное окно
-    # обратно к протухшему 1100x700 — отсюда "усыхание" вьюпорта. Клик ЛКМ
-    # ничего не чинит напрямую: его "чинящий" эффект — случайный побочный
-    # эффект PandaWindowFocusFilter.requestActivate() на foreign QWindow,
-    # которая пересобирает геометрию дочернего окна по данным Qt.
+    # Часть 1 (уже была исправлена) — стухший SIZE: ursina.window это САМ
+    # объект WindowProperties (класс Window наследуется от WindowProperties,
+    # не оборачивает его), единственный на процесс. mouse.visible/mouse.locked
+    # (ursina/mouse.py) на каждое переключение делают
+    # application.base.win.requestProperties(window) — шлют Panda3D ВЕСЬ
+    # накопленный на этом объекте набор свойств.
     #
-    # Исправление — в двух точках:
-    #  1) держим сам window.size синхронным с реальным размером контейнера
-    #     при каждом Resize контейнера (см. PandaWindowFocusFilter) — тогда
-    #     будущие requestProperties(window) из любого места несут уже
-    #     актуальный size, а не протухший;
-    #  2) на случай, если requestProperties сработает раньше первого Resize
-    #     (маловероятно, но дёшево подстраховаться) — принудительно
-    #     досинхронизируем сразу после переключений mouse.visible.
+    # Часть 2 (эта причина размера) — ТАКЖЕ стухший ORIGIN: ursina сама
+    # вызывает window.position = Vec2(x, y) при старте (см. "set window
+    # position" в логе) — это ursina/window.py Window.position.setter,
+    # который делает self.setOrigin(x, y) на том же синглтоне. Значение —
+    # координаты ЭКРАНА, актуальные, пока Panda3D владеет top-level окном
+    # (до встраивания). После createWindowContainer() нативное окно становится
+    # ДОЧЕРНИМ окном Qt-контейнера, и Windows интерпретирует origin
+    # WindowProperties для дочернего окна как координаты ОТНОСИТЕЛЬНО
+    # РОДИТЕЛЯ, а не экрана. window.setOrigin() с тех пор ни разу не
+    # обновлялся на (0, 0) — поэтому каждый requestProperties(window) (тот же
+    # mouse.visible) заново прикладывает старые экранные координаты как
+    # локальные координаты внутри контейнера, сдвигая вьюпорт вправо/вниз.
+    # Это и есть баг со скриншота: размер уже был исправлён (часть 1), но
+    # origin — нет.
+    #
+    # Исправление — держим синхронными И size, И origin:
+    #  1) на каждый Resize контейнера (PandaWindowFocusFilter) синхронизируем
+    #     window.size = размер контейнера, window.origin = (0, 0);
+    #  2) защитный ресинк сразу после переключений mouse.visible (это именно
+    #     то место, где ursina/mouse.py уже вызвал requestProperties() со
+    #     старыми данными — досинхронизация идёт СРАЗУ после, тем же кадром);
+    #  3) собственный WindowProperties-запрос (props) тоже всегда несёт явный
+    #     setOrigin(0, 0) — не полагаемся только на синглтон window.
     # --------------------------------------------------------
 
     def _log_viewport_geometry(self, label: str) -> None:
@@ -957,30 +1072,68 @@ class MultiplayerGame(Entity):
             return
 
         container = self.qt_viewport_container
-        container_geom = None
+        container_geom = container_rect = container_contents_rect = None
+        container_global_top_left = None
         parent_geom = None
+        device_pixel_ratio = None
+        container_hwnd = None
         if container is not None:
-            container_geom = (container.x(), container.y(), container.width(), container.height())
+            geom = container.geometry()
+            container_geom = (geom.x(), geom.y(), geom.width(), geom.height())
+            rect = container.rect()
+            container_rect = (rect.x(), rect.y(), rect.width(), rect.height())
+            contents = container.contentsRect()
+            container_contents_rect = (contents.x(), contents.y(), contents.width(), contents.height())
+            top_left = container.mapToGlobal(QPoint(0, 0))
+            container_global_top_left = (top_left.x(), top_left.y())
+            device_pixel_ratio = container.devicePixelRatioF()
+            try:
+                container_hwnd = int(container.winId())
+            except Exception:
+                container_hwnd = None
             parent = container.parentWidget()
             if parent is not None:
-                parent_geom = (parent.x(), parent.y(), parent.width(), parent.height())
+                pg = parent.geometry()
+                parent_geom = (pg.x(), pg.y(), pg.width(), pg.height())
 
-        native_size = None
+        foreign_geom = None
+        if self.qt_viewport_foreign_window is not None:
+            fg = self.qt_viewport_foreign_window.geometry()
+            foreign_geom = (fg.x(), fg.y(), fg.width(), fg.height())
+
+        native_size = native_origin = None
+        native_hwnd = None
+        native_parent_info: dict[str, Any] = {}
         panda_window = getattr(application.base, "win", None)
         if panda_window is not None:
             try:
                 props = panda_window.getProperties()
                 native_size = (props.getXSize(), props.getYSize())
+                native_origin = (props.getXOrigin(), props.getYOrigin())
+                native_hwnd = int(panda_window.getWindowHandle().getIntHandle())
+                native_parent_info = _win32_window_info(native_hwnd)
             except Exception as error:
                 native_size = f"<error: {error}>"
 
         focus_widget = QApplication.focusWidget()
         focus_name = type(focus_widget).__name__ if focus_widget is not None else None
+        main_window_state = None
+        if container is not None:
+            top_level = container.window()
+            if top_level is not None:
+                main_window_state = str(top_level.windowState())
 
         print(
             f"[VIEWPORT_GEOMETRY] {label}: playing={self.studio_playing} "
-            f"container_geom={container_geom} parent_geom={parent_geom} "
-            f"native_size={native_size} focus={focus_name}"
+            f"container_geometry={container_geom} container_rect={container_rect} "
+            f"container_contentsRect={container_contents_rect} "
+            f"container_global_top_left={container_global_top_left} "
+            f"parent_geometry={parent_geom} foreign_qwindow_geometry={foreign_geom} "
+            f"native_size={native_size} native_origin={native_origin} "
+            f"native_hwnd={native_hwnd} container_hwnd={container_hwnd} "
+            f"native_parent_info={native_parent_info} "
+            f"devicePixelRatio={device_pixel_ratio} main_window_state={main_window_state} "
+            f"focus={focus_name}"
         )
 
     def _sync_panda_window_to_container(self, reason: str) -> None:
@@ -997,14 +1150,37 @@ class MultiplayerGame(Entity):
 
         self._log_viewport_geometry(f"before sync [{reason}]")
 
-        # Обновляем сам синглтон ursina.window — это и есть настоящий фикс
-        # (см. комментарий выше): без этого следующий requestProperties(window)
-        # из mouse.py снова протащит старый размер.
+        # Обновляем сам синглтон ursina.window — без этого следующий
+        # requestProperties(window) из mouse.py снова протащит и старый
+        # размер, и старые (ЭКРАННЫЕ) координаты origin как локальные
+        # координаты внутри контейнера (см. комментарий выше).
         window.setSize(target_width, target_height)
+        window.setOrigin(0, 0)
 
+        # Свой запрос тоже всегда явно несёт origin=(0, 0) — дочернее окно
+        # не должно сдвигаться относительно контейнера ни при каких условиях.
         props = WindowProperties()
         props.setSize(target_width, target_height)
+        props.setOrigin(0, 0)
         panda_window.requestProperties(props)
+
+        # ВАЖНО: измерено диагностикой, что Panda3D's request_properties()
+        # на Windows сам по себе иногда откатывает нативное окно обратно к
+        # top-level WS_POPUP без родителя (видимо, пересобирает его под
+        # свои же внутренние WindowProperties, которые никогда не знали о
+        # внешнем Qt-репарентинге) — то есть именно ЭТОТ вызов способен
+        # разрушить репарентинг, сделанный при embed. Поэтому переприменяем
+        # принудительный Win32 child-parenting здесь же, на каждый sync, а
+        # не только один раз при embed.
+        try:
+            native_hwnd = int(panda_window.getWindowHandle().getIntHandle())
+            parent_hwnd = int(container.winId())
+            result = _force_native_child_parenting(native_hwnd, parent_hwnd, target_width, target_height)
+            if DEBUG_VIEWPORT_GEOMETRY and not result.get("is_child"):
+                print(f"[VIEWPORT_GEOMETRY] re-parenting still failed after sync [{reason}]: {result}")
+        except Exception as error:
+            if DEBUG_VIEWPORT_GEOMETRY:
+                print(f"[VIEWPORT_GEOMETRY] re-parenting raised after sync [{reason}]: {error}")
 
         self._log_viewport_geometry(f"after sync [{reason}]")
 
@@ -2336,12 +2512,37 @@ def embed_panda_window(
     studio._panda_window_container = container
     studio._panda_focus_filter = focus_filter
     studio.install_engine_viewport(container)
-    game.set_qt_viewport_container(container)
+
+    # createWindowContainer() is documented to reparent the foreign native
+    # window under the container, but measured with _win32_window_info() it
+    # doesn't reliably happen for this Panda3D window on this Qt/Windows
+    # combination — it can stay a top-level WS_POPUP with parent_hwnd=None,
+    # which is the actual cause of the viewport rendering at the wrong
+    # screen position (see _force_native_child_parenting docstring). Force
+    # it explicitly and verify.
+    container_hwnd = int(container.winId())
+    parenting_before = _win32_window_info(handle)
+    parenting_after = _force_native_child_parenting(
+        handle, container_hwnd, container.width(), container.height()
+    )
+    if not parenting_after.get("is_child"):
+        bridge.log(
+            "error",
+            f"Failed to make the Panda3D window a real Win32 child "
+            f"(parenting_before={parenting_before}, parenting_after={parenting_after}).",
+        )
+
+    game.set_qt_viewport_container(container, foreign_window)
     # Контейнер мог уже получить свой первый Resize до того, как мы успели
     # навесить event filter (порядок layout-прохода Qt не гарантирован) —
-    # досинхронизируем сразу, чтобы ursina.window.size не остался протухшим
-    # с самого старта.
+    # досинхронизируем сразу, чтобы ursina.window.size/origin не остались
+    # протухшими с самого старта.
     game._sync_panda_window_to_container("initial embed")
+
+    if DEBUG_VIEWPORT_GEOMETRY:
+        print(f"[VIEWPORT_GEOMETRY] native HWND parenting before force: {parenting_before}")
+        print(f"[VIEWPORT_GEOMETRY] native HWND parenting after force: {parenting_after}")
+
     bridge.log("info", f"Ursina viewport embedded. Native handle: {handle}")
     return True
 
