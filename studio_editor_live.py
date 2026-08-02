@@ -2177,7 +2177,7 @@ class InspectorPanel(QWidget):
         size = VectorEditor(obj.size, "size")
         for editor in (position, rotation, scale, size):
             editor.value_changed.connect(self._set_value)
-        self._live_vector_editors = {"position": position, "rotation": rotation}
+        self._live_vector_editors = {"position": position, "rotation": rotation, "size": size}
 
         transform.add_row("Position", position)
         transform.add_row("Rotation", rotation)

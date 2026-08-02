@@ -160,7 +160,7 @@ def sanitize_properties_for_type(type_id: str, raw_properties: Any) -> dict[str,
                 clean[key] = [float(v) for v in value]
         elif spec.kind == "size3":
             if instance_module.is_valid_vector3(value):
-                clean[key] = [max(0.05, float(v)) for v in value]
+                clean[key] = [max(instance_module.MIN_PART_SIZE, float(v)) for v in value]
         elif spec.kind == "color":
             if instance_module.is_valid_color(value):
                 clean[key] = [int(v) for v in value]

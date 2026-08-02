@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import builtins
 import math
-from typing import Optional
+from typing import Optional, Union
 
-from panda3d.core import LineSegs, NodePath, Point2, Point3
+from panda3d.core import LineSegs, NodePath, Point2, Point3, Quat
 from ursina import Cone, Entity, Vec3, camera, color, mouse, window
 from ursina.scene import instance as scene
+
+from shared.instance import MIN_PART_SIZE
 
 
 # ============================================================
@@ -86,6 +88,30 @@ GIZMO_MAX_SCALE = 50.0
 
 ROTATE_SNAP_DEGREES = 5.0
 DEFAULT_MOVE_SNAP = 0.25
+
+# Stage 2.3: Scale-хендлы — маленькие кубики на концах осевых "шафтов"
+# (та же дистанция ARROW_LENGTH, что и у стрелок Move, для визуальной
+# согласованности) плюс один центральный uniform-хендл. Не переиспользуют
+# ARROW_HIT_TOLERANCE/RING_HIT_TOLERANCE — это отдельные точечные хендлы,
+# не целый шафт/кольцо, поэтому у них свой (меньший) радиус хит-теста.
+SCALE_HANDLE_DISTANCE = ARROW_LENGTH
+SCALE_HANDLE_SIZE = 0.16
+SCALE_UNIFORM_HANDLE_SIZE = 0.22
+SCALE_HANDLE_HIT_RADIUS = 0.32
+# Порог, ниже которого стартовая дистанция "луч-до-центра" для uniform-
+# хендла считается вырожденной (камера смотрит почти точно на pivot) —
+# иначе коэффициент масштабирования мог бы улететь в бесконечность.
+SCALE_UNIFORM_MIN_START_DISTANCE = 0.05
+
+SCALE_HANDLE_COLOR = color.rgb32(225, 225, 225)
+SCALE_HANDLE_HIGHLIGHT_COLOR = color.rgb32(255, 230, 90)
+
+# Ключи хендлов Scale: одна из осей + знак направления ("x+","x-",...),
+# или "uniform" для центрального хендла. AXIS_DIRECTION[axis] * sign даёт
+# единичный вектор направления хендла В ЛОКАЛЬНОЙ (до поворота root)
+# системе координат.
+_SCALE_AXIS_HANDLE_KEYS = tuple(f"{axis}{sign}" for axis in AXIS_ORDER for sign in ("+", "-"))
+_SCALE_UNIFORM_KEY = "uniform"
 
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -195,6 +221,7 @@ class TransformGizmo:
 
         self.move_group = Entity(parent=self.root, enabled=False, eternal=True)
         self.rotate_group = Entity(parent=self.root, enabled=False, eternal=True)
+        self.scale_group = Entity(parent=self.root, enabled=False, eternal=True)
 
         self._arrow_parts: dict[str, tuple[Entity, Entity]] = {}
         for axis in AXIS_ORDER:
@@ -228,16 +255,57 @@ class TransformGizmo:
         for axis in AXIS_ORDER:
             self._ring_nodes[axis] = self._build_ring(axis)
 
+        # Scale-хендлы: маленький кубик на конце каждого +/-axis шафта,
+        # плюс один центральный uniform-хендл. Позиции заданы в ЛОКАЛЬНОЙ
+        # (до поворота root) системе координат — refresh_transform()
+        # поворачивает root целиком на rotation цели в Scale-режиме, так
+        # что хендлы визуально следуют реальным локальным осям объекта
+        # (см. отчёт Stage 2.3: "не считать, что локальные оси совпадают
+        # с мировыми X/Y/Z").
+        self._scale_handles: dict[str, Entity] = {}
+        for axis in AXIS_ORDER:
+            axis_dir = AXIS_DIRECTION[axis]
+            for sign_symbol, sign_value in (("+", 1.0), ("-", -1.0)):
+                key = f"{axis}{sign_symbol}"
+                handle = Entity(
+                    parent=self.scale_group,
+                    model="cube",
+                    color=AXIS_COLOR[axis],
+                    unlit=True,
+                    scale=SCALE_HANDLE_SIZE,
+                    position=axis_dir * (SCALE_HANDLE_DISTANCE * sign_value),
+                    eternal=True,
+                )
+                self._scale_handles[key] = handle
+
+        self._uniform_handle = Entity(
+            parent=self.scale_group,
+            model="cube",
+            color=SCALE_HANDLE_COLOR,
+            unlit=True,
+            scale=SCALE_UNIFORM_HANDLE_SIZE,
+            position=Vec3(0, 0, 0),
+            eternal=True,
+        )
+        self._scale_handles[_SCALE_UNIFORM_KEY] = self._uniform_handle
+
         self._mode = "select"
         self._target: Optional[Entity] = None
+        self._allow_axis_scale = True
         self._hovered_axis: Optional[str] = None
+        self._hovered_scale_handle: Optional[str] = None
         self._dragging = False
         self._drag_axis: Optional[str] = None
+        self._drag_scale_handle: Optional[str] = None
         self._drag_anchor = Vec3(0, 0, 0)
         self._drag_start_position = Vec3(0, 0, 0)
         self._drag_start_rotation = Vec3(0, 0, 0)
         self._drag_start_vector = Vec3(1, 0, 0)
-        self._last_result: Optional[tuple[str, Vec3]] = None
+        self._drag_start_size = Vec3(1, 1, 1)
+        self._drag_start_quat = Quat()
+        self._drag_axis_direction = Vec3(1, 0, 0)
+        self._drag_start_uniform_distance = 1.0
+        self._last_result: Optional[Union[tuple[str, Vec3], dict[str, Vec3]]] = None
         self._current_scale = 1.0
 
     def _build_ring(self, axis: str) -> NodePath:
@@ -283,30 +351,53 @@ class TransformGizmo:
         self._mode = mode
         self._dragging = False
         self._drag_axis = None
+        self._drag_scale_handle = None
         self._hovered_axis = None
+        self._hovered_scale_handle = None
 
         has_target = self._target is not None
         self.move_group.enabled = has_target and mode == "move"
         self.rotate_group.enabled = has_target and mode == "rotate"
+        self.scale_group.enabled = has_target and mode == "scale"
+        self._update_scale_handle_visibility()
         self._reset_colors()
+        self._reset_scale_colors()
 
-    def set_target(self, entity: Optional[Entity]) -> None:
-        if entity is self._target:
+    def set_target(self, entity: Optional[Entity], allow_axis_scale: bool = True) -> None:
+        if entity is self._target and allow_axis_scale == self._allow_axis_scale:
             return
 
         self._target = entity
+        self._allow_axis_scale = allow_axis_scale
         self._dragging = False
         self._drag_axis = None
+        self._drag_scale_handle = None
         self._hovered_axis = None
+        self._hovered_scale_handle = None
 
         has_target = entity is not None
         self.root.enabled = has_target
         self.move_group.enabled = has_target and self._mode == "move"
         self.rotate_group.enabled = has_target and self._mode == "rotate"
+        self.scale_group.enabled = has_target and self._mode == "scale"
+        self._update_scale_handle_visibility()
         self._reset_colors()
+        self._reset_scale_colors()
 
         if has_target:
             self.refresh_transform(camera.world_position)
+
+    def _update_scale_handle_visibility(self) -> None:
+        """Model targets only ever get the uniform handle (see Stage 2.3
+        report: non-uniform Model axis scaling would introduce shear for
+        arbitrarily rotated descendants and is deliberately not
+        implemented) — the 6 axis handles are hidden entirely rather than
+        merely inert, so there is nothing to hover/click by accident."""
+        for key, handle in self._scale_handles.items():
+            if key == _SCALE_UNIFORM_KEY:
+                handle.enabled = True
+            else:
+                handle.enabled = self._allow_axis_scale
 
     def refresh_transform(self, camera_position: Vec3) -> None:
         if self._target is None:
@@ -314,6 +405,16 @@ class TransformGizmo:
 
         origin = Vec3(self._target.position)
         self.root.position = origin
+
+        # В Scale-режиме root поворачивается на rotation цели, чтобы
+        # хендлы стояли на РЕАЛЬНЫХ локальных осях объекта (важно для
+        # повёрнутых Part) — Move/Rotate специально остаются в мировых
+        # осях без изменений (см. отчёт Stage 2.3), поэтому поворот root
+        # применяется ТОЛЬКО когда активен Scale.
+        if self._mode == "scale":
+            self.root.set_quat(Quat(self._target.get_quat()))
+        else:
+            self.root.rotation = Vec3(0, 0, 0)
 
         distance = (Vec3(camera_position) - origin).length()
         scale = _clamp(distance * GIZMO_SCREEN_SCALE, GIZMO_MIN_SCALE, GIZMO_MAX_SCALE)
@@ -339,6 +440,22 @@ class TransformGizmo:
         self._hovered_axis = axis
         self._reset_colors()
 
+    def _reset_scale_colors(self) -> None:
+        for key, handle in self._scale_handles.items():
+            if key == _SCALE_UNIFORM_KEY:
+                active = key == self._hovered_scale_handle or key == self._drag_scale_handle
+                handle.color = SCALE_HANDLE_HIGHLIGHT_COLOR if active else SCALE_HANDLE_COLOR
+                continue
+            axis = key[0]
+            active = key == self._hovered_scale_handle or key == self._drag_scale_handle
+            handle.color = AXIS_HIGHLIGHT_COLOR[axis] if active else AXIS_COLOR[axis]
+
+    def _set_hovered_scale_handle(self, key: Optional[str]) -> None:
+        if key == self._hovered_scale_handle:
+            return
+        self._hovered_scale_handle = key
+        self._reset_scale_colors()
+
     def update_hover(self, ray_origin: Vec3, ray_direction: Vec3) -> None:
         if self._target is None or self._dragging:
             return
@@ -346,6 +463,10 @@ class TransformGizmo:
             test = self._hit_test_arrow
         elif self._mode == "rotate":
             test = self._hit_test_ring
+        elif self._mode == "scale":
+            best_key, _ = self._best_scale_handle_hit(ray_origin, ray_direction)
+            self._set_hovered_scale_handle(best_key)
+            return
         else:
             self._set_hovered(None)
             return
@@ -411,13 +532,41 @@ class TransformGizmo:
                 best = candidate
         return AXIS_DIRECTION[best]
 
+    @staticmethod
+    def _point_to_ray_distance(point: Vec3, ray_origin: Vec3, ray_direction: Vec3) -> float:
+        """Perpendicular distance from `point` to the ray, clamped to the
+        ray's forward half (t >= 0) — used for both scale-handle hit
+        testing (discrete point handles, not a whole shaft/ring) and the
+        uniform handle's drag-distance metric."""
+        to_point = point - ray_origin
+        t = max(0.0, to_point.dot(ray_direction))
+        closest = ray_origin + ray_direction * t
+        return (point - closest).length()
+
+    def _best_scale_handle_hit(self, ray_origin: Vec3, ray_direction: Vec3) -> tuple[Optional[str], Optional[float]]:
+        best_key = None
+        best_metric = None
+        tolerance = SCALE_HANDLE_HIT_RADIUS * self._current_scale
+        for key, handle in self._scale_handles.items():
+            if not handle.enabled:
+                continue
+            distance = self._point_to_ray_distance(Vec3(handle.world_position), ray_origin, ray_direction)
+            if distance > tolerance:
+                continue
+            if best_metric is None or distance < best_metric:
+                best_metric, best_key = distance, key
+        return best_key, best_metric
+
     # --------------------------------------------------------
     # DRAG
     # --------------------------------------------------------
 
     def begin_drag(self, ray_origin: Vec3, ray_direction: Vec3) -> bool:
-        if self._target is None or self._mode not in ("move", "rotate"):
+        if self._target is None or self._mode not in ("move", "rotate", "scale"):
             return False
+
+        if self._mode == "scale":
+            return self._begin_scale_drag(ray_origin, ray_direction)
 
         origin = Vec3(self._target.position)
         if self._mode == "move":
@@ -454,14 +603,57 @@ class TransformGizmo:
         self._reset_colors()
         return True
 
+    def _begin_scale_drag(self, ray_origin: Vec3, ray_direction: Vec3) -> bool:
+        key, _ = self._best_scale_handle_hit(ray_origin, ray_direction)
+        if key is None:
+            return False
+
+        self._drag_scale_handle = key
+        self._last_result = None
+        self._drag_start_position = Vec3(self._target.position)
+        self._drag_start_size = Vec3(self._target.scale)
+        self._drag_start_quat = Quat(self._target.get_quat())
+
+        if key == _SCALE_UNIFORM_KEY:
+            start_distance = self._point_to_ray_distance(self._drag_start_position, ray_origin, ray_direction)
+            self._drag_start_uniform_distance = max(start_distance, SCALE_UNIFORM_MIN_START_DISTANCE)
+        else:
+            # Ось хендла — единичный вектор ЛОКАЛЬНОЙ оси объекта в мировом
+            # пространстве на момент старта драга (не мировой X/Y/Z), это
+            # то, что делает resize корректным для повёрнутых Part.
+            axis = key[0]
+            sign = 1.0 if key[1] == "+" else -1.0
+            local_dir = Vec3(self._drag_start_quat.xform(AXIS_DIRECTION[axis]))
+            self._drag_anchor = self._drag_start_position
+            self._drag_axis_direction = local_dir * sign
+
+        if DEBUG_GIZMO:
+            print(f"[GIZMO] begin_drag scale handle={key} start_size={self._drag_start_size}")
+
+        self._dragging = True
+        self._hovered_scale_handle = key
+        self._reset_scale_colors()
+        return True
+
     def update_drag(
         self,
         ray_origin: Vec3,
         ray_direction: Vec3,
         move_snap_size: float,
         snap_enabled: bool,
-    ) -> Optional[tuple[str, Vec3]]:
-        if not self._dragging or self._target is None or self._drag_axis is None:
+    ) -> Optional[Union[tuple[str, Vec3], dict[str, Vec3]]]:
+        if not self._dragging or self._target is None:
+            return None
+
+        if self._mode == "scale":
+            if self._drag_scale_handle is None:
+                return None
+            result = self._update_scale_drag(ray_origin, ray_direction, move_snap_size, snap_enabled)
+            if result is not None:
+                self._last_result = result
+            return result
+
+        if self._drag_axis is None:
             return None
 
         axis = self._drag_axis
@@ -536,21 +728,110 @@ class TransformGizmo:
 
         return "Rotation", Vec3(new_rotation)
 
-    def end_drag(self) -> Optional[tuple[str, Vec3]]:
+    def _update_scale_drag(self, ray_origin, ray_direction, move_snap_size, snap_enabled):
+        if self._drag_scale_handle == _SCALE_UNIFORM_KEY:
+            return self._update_uniform_scale_drag(ray_origin, ray_direction, move_snap_size, snap_enabled)
+        return self._update_axis_scale_drag(ray_origin, ray_direction, move_snap_size, snap_enabled)
+
+    def _update_axis_scale_drag(self, ray_origin, ray_direction, move_snap_size, snap_enabled):
+        """Resizes one axis, anchoring the OPPOSITE face in place (see
+        Stage 2.3 report). handle_dir is the target's real local axis
+        direction at drag-start (rotated into world space), not a world
+        X/Y/Z axis, so this works correctly for a rotated Part."""
+        handle = self._drag_scale_handle
+        axis = handle[0]
+        handle_dir = self._drag_axis_direction
+
+        result = line_line_closest(self._drag_anchor, handle_dir, ray_origin, ray_direction)
+        if result is not None:
+            s, t = result
+            if t < 0:
+                result = None
+        if result is None:
+            plane_normal = self._fallback_plane_normal(axis, ray_direction)
+            hit = ray_plane_intersect(ray_origin, ray_direction, self._drag_anchor, plane_normal)
+            if hit is None:
+                return None
+            s = (hit - self._drag_anchor).dot(handle_dir)
+        else:
+            s, _t = result
+
+        if not math.isfinite(s):
+            return None
+
+        index = _AXIS_INDEX[axis]
+        new_component = self._drag_start_size[index] + s
+        if snap_enabled and move_snap_size > 0:
+            new_component = round(new_component / move_snap_size) * move_snap_size
+        new_component = max(new_component, MIN_PART_SIZE)
+        if not math.isfinite(new_component):
+            return None
+
+        applied_delta = new_component - self._drag_start_size[index]
+        new_size = Vec3(self._drag_start_size)
+        new_size[index] = new_component
+        new_position = self._drag_start_position + handle_dir * (applied_delta / 2.0)
+
+        self._target.scale = new_size
+        self._target.position = new_position
+
+        if DEBUG_GIZMO:
+            print(f"[GIZMO] scale handle={handle} size={new_size} position={new_position}")
+
+        return {"Position": Vec3(new_position), "Size": Vec3(new_size)}
+
+    def _update_uniform_scale_drag(self, ray_origin, ray_direction, move_snap_size, snap_enabled):
+        """Central handle: one scalar factor derived from drag-start Size,
+        never independently-snapped per axis (see Stage 2.3 report — this
+        is what keeps original proportions exact). Position is untouched;
+        uniform scale is anchored at the Part's own center."""
+        current_distance = self._point_to_ray_distance(self._drag_start_position, ray_origin, ray_direction)
+        factor = current_distance / self._drag_start_uniform_distance
+        if not math.isfinite(factor) or factor <= 0:
+            return None
+
+        start = self._drag_start_size
+        reference = max(start.x, start.y, start.z)
+        if reference <= 1e-9:
+            return None
+        scaled_reference = reference * factor
+        if snap_enabled and move_snap_size > 0:
+            scaled_reference = round(scaled_reference / move_snap_size) * move_snap_size
+        scaled_reference = max(scaled_reference, MIN_PART_SIZE)
+        effective_factor = scaled_reference / reference
+
+        smallest = min(start.x, start.y, start.z)
+        if smallest > 1e-9:
+            effective_factor = max(effective_factor, MIN_PART_SIZE / smallest)
+        if not math.isfinite(effective_factor) or effective_factor <= 0:
+            return None
+
+        new_size = Vec3(start.x * effective_factor, start.y * effective_factor, start.z * effective_factor)
+        self._target.scale = new_size
+
+        if DEBUG_GIZMO:
+            print(f"[GIZMO] scale uniform factor={effective_factor:.4f} size={new_size}")
+
+        return {"Size": Vec3(new_size)}
+
+    def end_drag(self) -> Optional[Union[tuple[str, Vec3], dict[str, Vec3]]]:
         if not self._dragging:
             return None
 
         result = self._last_result
         axis = self._drag_axis
+        scale_handle = self._drag_scale_handle
 
         self._dragging = False
         self._drag_axis = None
+        self._drag_scale_handle = None
         self._last_result = None
         self._hovered_axis = None
+        self._hovered_scale_handle = None
         self._reset_colors()
+        self._reset_scale_colors()
 
         if DEBUG_GIZMO and result is not None:
-            kind, vector = result
-            print(f"[GIZMO] end_drag axis={axis} final {kind}={vector}")
+            print(f"[GIZMO] end_drag axis={axis} scale_handle={scale_handle} final={result}")
 
         return result

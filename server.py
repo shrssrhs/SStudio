@@ -10,6 +10,7 @@ from websockets.exceptions import ConnectionClosed
 from shared import object_registry, protocol
 from shared.instance import (
     DEFAULT_PART_PROPERTIES,
+    MIN_PART_SIZE,
     Instance,
     destroy_cascade,
     get_descendant_ids,
@@ -572,6 +573,7 @@ def _snapshot_model_transform_state(model_id: str) -> dict[str, Any] | None:
             descendants_payload[descendant_id] = {
                 "Position": descendant_instance.get_property("Position", [0.0, 0.0, 0.0]),
                 "Rotation": descendant_instance.get_property("Rotation", [0.0, 0.0, 0.0]),
+                "Size": descendant_instance.get_property("Size", [1.0, 1.0, 1.0]),
             }
     return {
         "pivot": {
@@ -606,9 +608,18 @@ async def _reject_transform_model(
 
 
 def _extract_transform_vectors(raw: Any) -> dict[str, list[float]] | None:
-    """Валидирует {"Position": [...], "Rotation": [...]} — обе стороны
-    опциональны (Move-only и Rotate-only кадры не обязаны слать обе), но
-    хотя бы одна должна быть валидным vector3, иначе запись мусорная."""
+    """Валидирует {"Position": [...], "Rotation": [...], "Size": [...]} —
+    все три опциональны (Move-only/Rotate-only/Scale-only кадры не обязаны
+    слать остальные), но хотя бы одна должна быть валидным vector3, иначе
+    запись мусорная. Size (Stage 2.3, Model uniform scale cascade и
+    одиночный Part resize) клэмпится к MIN_PART_SIZE тем же правилом, что
+    и sanitize_part_properties — применяется здесь тоже, а не только там,
+    потому что этот payload's Size может попасть в model_transform-ветку
+    (нет sanitize_part_properties) для не-Model потомков через
+    handle_transform_model, который передаёт clean_transform дальше в
+    sanitize_part_properties и клэмпит повторно — здесь клэмп нужен только
+    чтобы отбросить NaN/Infinity до того, как что-либо более осмысленное
+    (типа сравнения factor) увидит мусор."""
     if not isinstance(raw, dict):
         return None
     clean: dict[str, list[float]] = {}
@@ -622,6 +633,11 @@ def _extract_transform_vectors(raw: Any) -> dict[str, list[float]] | None:
         if not is_valid_vector3(rotation):
             return None
         clean["Rotation"] = [float(v) for v in rotation]
+    size = raw.get("Size")
+    if size is not None:
+        if not is_valid_vector3(size):
+            return None
+        clean["Size"] = [max(MIN_PART_SIZE, float(v)) for v in size]
     if not clean:
         return None
     return clean

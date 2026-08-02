@@ -20,6 +20,13 @@ from typing import Any
 # ДЕФОЛТНЫЕ СВОЙСТВА
 # ============================================================
 
+# Stage 2.3: единственная авторитетная константа минимального размера —
+# используется и здесь (sanitize_part_properties), и в
+# object_registry.sanitize_properties_for_type (generic size3), и в
+# transform_gizmo.py (клэмп во время Scale-драга), чтобы не расползаться
+# по файлам отдельными литералами "0.05".
+MIN_PART_SIZE = 0.05
+
 # Свойства, которые есть у любого Part. Как в Roblox: Position/Size/
 # Color и т.д. Клиент читает эти ключи, чтобы построить Entity;
 # сервер их не интерпретирует, просто хранит и рассылает.
@@ -220,7 +227,7 @@ def sanitize_part_properties(raw_properties: dict[str, Any]) -> dict[str, Any]:
 
     size = raw_properties.get("Size")
     if is_valid_vector3(size):
-        clean["Size"] = [max(0.05, float(v)) for v in size]
+        clean["Size"] = [max(MIN_PART_SIZE, float(v)) for v in size]
 
     rotation = raw_properties.get("Rotation")
     if is_valid_vector3(rotation):

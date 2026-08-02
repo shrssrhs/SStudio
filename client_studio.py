@@ -49,7 +49,7 @@ from studio_editor_live import (
     Vec3 as EditorVec3,
 )
 from shared import object_registry, protocol
-from shared.instance import DEFAULT_PART_PROPERTIES
+from shared.instance import DEFAULT_PART_PROPERTIES, MIN_PART_SIZE
 from shared.object_registry import ROOT_SERVICES
 from transform_gizmo import (
     DEFAULT_MOVE_SNAP,
@@ -522,6 +522,16 @@ DEBUG_REPARENTING = False
 # потомков, время на квaternion-математику/обновление Entity/bridge-sync,
 # частоту сетевой отправки/эха. Временный флаг — по умолчанию False.
 DEBUG_MODEL_TRANSFORMS = False
+
+# Stage 2.3: диагностика Scale-гизмо. Одиночный Part resize уже покрыт
+# существующим DEBUG_GIZMO_TIMING (те же tick()-точки: entity_transform/
+# bridge_sync/network_send/apply_gizmo_result — см. _apply_scale_gizmo_result).
+# Этот флаг — отдельная печать для Model uniform-scale каскада (число
+# трансформируемых потомков + время на factor-математику/Entity-обновление/
+# bridge-sync/сетевую отправку за кадр), по образцу DEBUG_MODEL_TRANSFORMS,
+# но для _apply_model_scale_result. По умолчанию False, не печатает ничего
+# в проде.
+DEBUG_SCALE_GIZMO = False
 
 QT_LOOK_SENSITIVITY_X = 0.08
 QT_LOOK_SENSITIVITY_Y = 0.08
@@ -2042,6 +2052,13 @@ class MultiplayerGame(Entity):
         pivot_quat_inv = pivot_quat.conjugate()
 
         descendant_relative: dict[str, tuple[Vec3, Quat]] = {}
+        # Stage 2.3: Size at drag-start, Part-like descendants only (a
+        # nested Model has no Size of its own, only a pivot) — needed for
+        # Model uniform scale (new_size = old_size * factor), computed
+        # once here rather than every frame for the same reason relative
+        # offsets are: always derive from drag-start state, never from a
+        # previous frame, so repeated small drags can't accumulate drift.
+        descendant_start_size: dict[str, Vec3] = {}
         for descendant_id in self._collect_transformable_descendants(model_id):
             descendant_record = self.instances.get(descendant_id)
             if descendant_record is None:
@@ -2056,12 +2073,21 @@ class MultiplayerGame(Entity):
                 child_rot_raw = descendant_record.properties.get("Rotation", [0.0, 0.0, 0.0])
                 child_pos = Vec3(float(child_pos_raw[0]), float(child_pos_raw[1]), float(child_pos_raw[2]))
                 child_quat = self._euler_xyz_to_quat(child_rot_raw)
+                child_size_raw = descendant_record.properties.get("Size")
+                if isinstance(child_size_raw, (list, tuple)) and len(child_size_raw) == 3:
+                    descendant_start_size[descendant_id] = Vec3(
+                        float(child_size_raw[0]), float(child_size_raw[1]), float(child_size_raw[2]),
+                    )
 
             relative_pos = Vec3(pivot_quat_inv.xform(child_pos - pivot_pos))
             relative_quat = self._compose_quat(pivot_quat_inv, child_quat)
             descendant_relative[descendant_id] = (relative_pos, relative_quat)
 
-        self._model_drag_state = {"model_id": model_id, "descendant_relative": descendant_relative}
+        self._model_drag_state = {
+            "model_id": model_id,
+            "descendant_relative": descendant_relative,
+            "descendant_start_size": descendant_start_size,
+        }
         self._model_drag_suppressed_ids = {model_id, *descendant_relative.keys()}
         self._model_drag_sequence_counter = 0
         self._model_drag_awaiting_final = None
@@ -2183,6 +2209,124 @@ class MultiplayerGame(Entity):
                 f"bridge={bridge_ms:.3f}ms total={total_ms:.3f}ms sent={sent}"
             )
 
+    def _apply_model_scale_result(self, result: dict[str, Vec3], force_network: bool) -> None:
+        """Model uniform-scale counterpart to _apply_model_gizmo_result().
+        Only the uniform handle is ever interactable for a Model target
+        (see allow_axis_scale=False in update_gizmo() — axis scale is not
+        exactly representable for arbitrarily-rotated descendants, see
+        Stage 2.3 report), so `result` here is always a pure factor:
+        result["Size"] == (factor, factor, factor) because
+        model_gizmo_proxy's own scale is always Vec3(1,1,1) (never touched
+        anywhere else — see its definition), so the gizmo's drag-start Size
+        is exactly 1 on every axis and the returned Size vector IS the
+        scale factor.
+
+        Pivot stays FIXED for a uniform scale (Rotation and Position both
+        unchanged) — new_position = pivot + (old_position - pivot) *
+        factor, new_size = old_size * factor for Part-like descendants;
+        nested Models get only their PivotPosition scaled the same way (no
+        Size of their own, PivotRotation unchanged)."""
+        if self._model_drag_state is None:
+            return
+        size_factor_vec = result.get("Size")
+        if size_factor_vec is None:
+            return
+        factor = float(size_factor_vec.x)
+        if not math.isfinite(factor) or factor <= 0:
+            return
+        frame_start = time.perf_counter() if DEBUG_SCALE_GIZMO else 0.0
+
+        model_id = self._model_drag_state["model_id"]
+        descendant_relative: dict[str, tuple[Vec3, Quat]] = self._model_drag_state["descendant_relative"]
+        descendant_start_size: dict[str, Vec3] = self._model_drag_state.get("descendant_start_size", {})
+
+        # Uniform scale commutes with rotation, so the pivot-rotated
+        # relative offset can simply be scaled by `factor` before being
+        # rotated back into world space — see Stage 2.3 report for the
+        # derivation showing this is exactly equivalent to
+        # pivot + (old_position - pivot) * factor.
+        pivot_pos = Vec3(self.model_gizmo_proxy.position)
+        pivot_quat = Quat(self.model_gizmo_proxy.get_quat())
+
+        math_start = time.perf_counter() if DEBUG_SCALE_GIZMO else 0.0
+        computed: dict[str, tuple[Vec3, list[float] | None]] = {}
+        for descendant_id, (relative_pos, _relative_quat) in descendant_relative.items():
+            child_pos_new = pivot_pos + Vec3(pivot_quat.xform(relative_pos * factor))
+            start_size = descendant_start_size.get(descendant_id)
+            new_size: list[float] | None = None
+            if start_size is not None:
+                new_size = [
+                    max(MIN_PART_SIZE, start_size.x * factor),
+                    max(MIN_PART_SIZE, start_size.y * factor),
+                    max(MIN_PART_SIZE, start_size.z * factor),
+                ]
+            computed[descendant_id] = (child_pos_new, new_size)
+        math_ms = (time.perf_counter() - math_start) * 1000.0 if DEBUG_SCALE_GIZMO else 0.0
+
+        entity_start = time.perf_counter() if DEBUG_SCALE_GIZMO else 0.0
+        for descendant_id, (child_pos_new, new_size) in computed.items():
+            descendant_record = self.instances.get(descendant_id)
+            if descendant_record is None:
+                continue
+            position_list = [float(child_pos_new.x), float(child_pos_new.y), float(child_pos_new.z)]
+            entity = self.parts.get(descendant_id)
+            if descendant_record.class_name == "Model":
+                descendant_record.properties["PivotPosition"] = position_list
+                descendant_record.properties["PivotIsExplicit"] = True
+            else:
+                descendant_record.properties["Position"] = position_list
+                if entity is not None:
+                    entity.position = child_pos_new
+                    entity.instance_properties["Position"] = position_list
+                if new_size is not None:
+                    descendant_record.properties["Size"] = new_size
+                    if entity is not None:
+                        entity.scale = Vec3(*new_size)
+                        entity.instance_properties["Size"] = new_size
+            if self.studio_adapter is not None:
+                self.studio_adapter.on_instance_transform_live(descendant_record, "Position", position_list)
+                if new_size is not None:
+                    self.studio_adapter.on_instance_transform_live(descendant_record, "Size", new_size)
+        entity_ms = (time.perf_counter() - entity_start) * 1000.0 if DEBUG_SCALE_GIZMO else 0.0
+
+        self._update_model_selection_highlight(model_id)
+
+        now = time.monotonic()
+        interval = 1.0 / GIZMO_NETWORK_SEND_RATE
+        sent = False
+        if force_network or (now - self._model_drag_last_network_send) >= interval:
+            self._model_drag_last_network_send = now
+            self._model_drag_sequence_counter += 1
+            sequence = self._model_drag_sequence_counter
+            pivot_position_list = [float(pivot_pos.x), float(pivot_pos.y), float(pivot_pos.z)]
+            pivot_rotation_list = self._quat_to_euler_xyz(pivot_quat)
+            descendants_payload: dict[str, dict[str, list[float]]] = {}
+            for descendant_id, (child_pos_new, new_size) in computed.items():
+                entry: dict[str, list[float]] = {
+                    "Position": [float(child_pos_new.x), float(child_pos_new.y), float(child_pos_new.z)],
+                }
+                if new_size is not None:
+                    entry["Size"] = new_size
+                descendants_payload[descendant_id] = entry
+            self.request_transform_model(
+                model_id, pivot_position_list, pivot_rotation_list, descendants_payload, sequence,
+            )
+            sent = True
+            if force_network:
+                self._model_drag_awaiting_final = {
+                    "model_id": model_id,
+                    "sequence": sequence,
+                    "since": now,
+                }
+
+        if DEBUG_SCALE_GIZMO:
+            total_ms = (time.perf_counter() - frame_start) * 1000.0
+            print(
+                f"[SCALE_GIZMO] model={model_id} factor={factor:.4f} "
+                f"descendants={len(computed)} math={math_ms:.3f}ms entity={entity_ms:.3f}ms "
+                f"total={total_ms:.3f}ms sent={sent}"
+            )
+
     def request_transform_model(
         self,
         model_id: str,
@@ -2246,7 +2390,11 @@ class MultiplayerGame(Entity):
             target = self.parts.get(self.selected_part_id) if self.selected_part_id else None
 
         if target is not self.gizmo.current_target:
-            self.gizmo.set_target(target)
+            # Model axis-scaling is not exactly representable for
+            # arbitrarily-rotated descendants (shear) — see Stage 2.3
+            # report. Axis handles stay hidden entirely for a Model
+            # target; only the uniform handle is ever interactable there.
+            self.gizmo.set_target(target, allow_axis_scale=not is_model_target)
 
         if target is None:
             return
@@ -2277,7 +2425,12 @@ class MultiplayerGame(Entity):
                 if DEBUG_GIZMO_TIMING:
                     self._gizmo_timing.tick("entity_transform")
                 if is_model_target:
-                    self._apply_model_gizmo_result(force_network=False)
+                    if self.gizmo_mode == "scale":
+                        self._apply_model_scale_result(result, force_network=False)
+                    else:
+                        self._apply_model_gizmo_result(force_network=False)
+                elif self.gizmo_mode == "scale":
+                    self._apply_scale_gizmo_result(target, result, force_network=False)
                 else:
                     self._apply_gizmo_result(target, result, force_network=False)
         else:
@@ -2286,7 +2439,7 @@ class MultiplayerGame(Entity):
                 self.gizmo.update_hover(ray_origin, ray_direction)
 
     def try_begin_gizmo_drag(self) -> bool:
-        if self.gizmo.current_target is None or self.gizmo_mode not in ("move", "rotate"):
+        if self.gizmo.current_target is None or self.gizmo_mode not in ("move", "rotate", "scale"):
             return False
         ray_origin, ray_direction = mouse_world_ray()
         if ray_origin is None:
@@ -2312,7 +2465,10 @@ class MultiplayerGame(Entity):
         result = self.gizmo.end_drag()
         if self._model_drag_state is not None:
             if result is not None:
-                self._apply_model_gizmo_result(force_network=True)
+                if self.gizmo_mode == "scale":
+                    self._apply_model_scale_result(result, force_network=True)
+                else:
+                    self._apply_model_gizmo_result(force_network=True)
             if DEBUG_MODEL_TRANSFORMS:
                 elapsed = time.perf_counter() - getattr(self, "_model_drag_timing_start", time.perf_counter())
                 frames = getattr(self, "_model_drag_frame_count", 0)
@@ -2341,7 +2497,10 @@ class MultiplayerGame(Entity):
             return
         target = self.parts.get(self.selected_part_id) if self.selected_part_id else None
         if target is not None:
-            self._apply_gizmo_result(target, result, force_network=True)
+            if self.gizmo_mode == "scale":
+                self._apply_scale_gizmo_result(target, result, force_network=True)
+            else:
+                self._apply_gizmo_result(target, result, force_network=True)
         self._gizmo_dragging_instance_id = None
         if DEBUG_GIZMO_TIMING:
             self._gizmo_timing.end_and_report()
@@ -2391,6 +2550,64 @@ class MultiplayerGame(Entity):
         if force_network or (now - self._gizmo_last_network_send) >= interval:
             self._gizmo_last_network_send = now
             self.apply_property_edit(part_id, {kind: entity.instance_properties[kind]})
+            if DEBUG_GIZMO_TIMING:
+                self._gizmo_timing.tick("network_send")
+
+        if DEBUG_GIZMO_TIMING:
+            self._gizmo_timing.tick("apply_gizmo_result")
+            self._gizmo_timing.record_duration_ms((time.perf_counter() - duration_start) * 1000.0)
+
+    def _apply_scale_gizmo_result(
+        self,
+        entity: Entity,
+        result: dict[str, Vec3],
+        force_network: bool,
+    ) -> None:
+        """Scale-mode counterpart to _apply_gizmo_result(). The gizmo's
+        result is a dict with "Size" always present and "Position" present
+        only for an axis-handle drag (the uniform handle scales around the
+        Part's own center and never touches Position — see Stage 2.3
+        report). Both keys are synced and sent together in ONE
+        apply_property_edit() call so no intermediate network frame ever
+        shows Size updated without the matching Position (or vice versa)."""
+        duration_start = time.perf_counter() if DEBUG_GIZMO_TIMING else 0.0
+
+        part_id = self.selected_part_id
+        if part_id is None:
+            return
+        record = self.instances.get(part_id)
+
+        # Entity.scale/.position were already updated inside
+        # gizmo.update_drag()/end_drag() (see _update_axis_scale_drag/
+        # _update_uniform_scale_drag in transform_gizmo.py) — same
+        # "render frame == drag frame" architecture as Move/Rotate, so
+        # only instance_properties/record/bridge/network need syncing here.
+        updated: dict[str, list[float]] = {}
+        for key in ("Position", "Size"):
+            vector = result.get(key)
+            if vector is None:
+                continue
+            new_value = [float(vector.x), float(vector.y), float(vector.z)]
+            entity.instance_properties[key] = new_value
+            if record is not None:
+                record.properties[key] = new_value
+            updated[key] = new_value
+
+        if not updated:
+            return
+
+        self.update_selection_highlight(entity)
+        if self.studio_adapter is not None and record is not None:
+            for key, new_value in updated.items():
+                self.studio_adapter.on_instance_transform_live(record, key, new_value)
+            if DEBUG_GIZMO_TIMING:
+                self._gizmo_timing.tick("bridge_sync")
+
+        now = time.monotonic()
+        interval = 1.0 / GIZMO_NETWORK_SEND_RATE
+        if force_network or (now - self._gizmo_last_network_send) >= interval:
+            self._gizmo_last_network_send = now
+            self.apply_property_edit(part_id, dict(updated))
             if DEBUG_GIZMO_TIMING:
                 self._gizmo_timing.tick("network_send")
 
@@ -2981,7 +3198,7 @@ class MultiplayerGame(Entity):
             # нормально. Гвард снимается сразу на отпускании кнопки — тогда
             # финальный echo (в т.ч. этого же перетаскивания) снова
             # применяется как обычно.
-            properties = {k: v for k, v in properties.items() if k not in ("Position", "Rotation")}
+            properties = {k: v for k, v in properties.items() if k not in ("Position", "Rotation", "Size")}
 
         if properties:
             self._apply_instance_properties(record, properties, replace=False)
@@ -3350,7 +3567,7 @@ class MultiplayerStudioAdapter:
         if self.bridge is not None:
             self.bridge.sync_upsert(self.instance_to_scene_object(record))
 
-    _LIVE_TRANSFORM_FIELDS = {"Position": "position", "Rotation": "rotation"}
+    _LIVE_TRANSFORM_FIELDS = {"Position": "position", "Rotation": "rotation", "Size": "size"}
     # Stage 2.2: a Model's live-dragged transform is its PIVOT, not a
     # Position/Rotation property (Model has none) — same SceneObject
     # live-sync mechanism, different target fields (see SceneObject.
