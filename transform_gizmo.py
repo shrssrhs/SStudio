@@ -19,6 +19,13 @@ from shared.instance import MIN_PART_SIZE
 # drag. Временный инструмент диагностики — включать только вручную.
 DEBUG_GIZMO = False
 
+# Stage 2.3 fix: логирует uniform-scale drag-baseline (drag-start Size,
+# initial/current reference distance, raw delta, raw/snapped factor,
+# resulting Size) — добавлено при расследовании "instant jump on
+# mouse-down" бага в центральном handle. Временный флаг, по умолчанию
+# False.
+DEBUG_SCALE_GIZMO = False
+
 
 # ============================================================
 # ГЕОМЕТРИЯ И ВНЕШНИЙ ВИД
@@ -615,8 +622,22 @@ class TransformGizmo:
         self._drag_start_quat = Quat(self._target.get_quat())
 
         if key == _SCALE_UNIFORM_KEY:
-            start_distance = self._point_to_ray_distance(self._drag_start_position, ray_origin, ray_direction)
-            self._drag_start_uniform_distance = max(start_distance, SCALE_UNIFORM_MIN_START_DISTANCE)
+            # Stage 2.3 fix: keep the TRUE (unclamped) click-to-center
+            # distance separate from the floored value used only to
+            # normalize the delta's sensitivity. The old code clamped
+            # this single number and then divided a freshly-recomputed
+            # (unclamped) current_distance by the clamped one — on a
+            # precise click (true distance below
+            # SCALE_UNIFORM_MIN_START_DISTANCE) that mismatch alone
+            # produced factor != 1.0 on the very first zero-movement
+            # frame (see _update_uniform_scale_drag). Recording the true
+            # distance here and computing a delta against it instead
+            # makes current==start structurally guarantee delta==0 (and
+            # therefore factor==1.0), regardless of how small the true
+            # distance was.
+            self._drag_start_uniform_distance = self._point_to_ray_distance(
+                self._drag_start_position, ray_origin, ray_direction,
+            )
         else:
             # Ось хендла — единичный вектор ЛОКАЛЬНОЙ оси объекта в мировом
             # пространстве на момент старта драга (не мировой X/Y/Z), это
@@ -784,13 +805,56 @@ class TransformGizmo:
         """Central handle: one scalar factor derived from drag-start Size,
         never independently-snapped per axis (see Stage 2.3 report — this
         is what keeps original proportions exact). Position is untouched;
-        uniform scale is anchored at the Part's own center."""
+        uniform scale is anchored at the Part's own center.
+
+        Stage 2.3 fix (mouse-down jump): the factor is a normalized DELTA
+        from the drag-start reference distance, not a raw ratio of two
+        independently-measured distances. current_distance ==
+        _drag_start_uniform_distance (pointer hasn't moved since
+        mouse-down) makes delta exactly 0 and therefore factor exactly
+        1.0, structurally — it does not depend on how small the true
+        click-to-center distance was. The previous `current_distance /
+        drag_start_uniform_distance` ratio broke this invariant whenever
+        the true click distance was below SCALE_UNIFORM_MIN_START_DISTANCE:
+        _begin_scale_drag floored the DENOMINATOR to that minimum, but
+        current_distance here is recomputed fresh every frame from the
+        real (unclamped) geometry, so on the very first zero-movement
+        frame the numerator no longer matched the artificially-raised
+        denominator, producing a nonzero factor with no mouse movement at
+        all. The floor is still applied, but only to the delta's
+        sensitivity reference, which cannot by itself make delta nonzero."""
         current_distance = self._point_to_ray_distance(self._drag_start_position, ray_origin, ray_direction)
-        factor = current_distance / self._drag_start_uniform_distance
+        delta = current_distance - self._drag_start_uniform_distance
+        sensitivity_reference = max(self._drag_start_uniform_distance, SCALE_UNIFORM_MIN_START_DISTANCE)
+        factor = 1.0 + delta / sensitivity_reference
+        if DEBUG_SCALE_GIZMO:
+            print(
+                f"[SCALE_GIZMO] uniform drag_start_size={self._drag_start_size} "
+                f"drag_start_distance={self._drag_start_uniform_distance:.6f} "
+                f"current_distance={current_distance:.6f} delta={delta:.6f} "
+                f"raw_factor={factor:.6f}"
+            )
         if not math.isfinite(factor) or factor <= 0:
             return None
 
         start = self._drag_start_size
+
+        # No perceptible pointer movement since mouse-down: Size must stay
+        # EXACTLY the drag-start Size. With snap enabled, re-snapping the
+        # absolute reference dimension to the grid below could otherwise
+        # manufacture a tiny but nonzero jump purely because drag-start
+        # Size wasn't already grid-aligned, even though delta (and the
+        # true factor) is 0 — short-circuiting here keeps the zero-
+        # movement invariant exact regardless of snap settings.
+        if abs(delta) < 1e-9:
+            new_size = Vec3(start)
+            self._target.scale = new_size
+            if DEBUG_GIZMO:
+                print(f"[GIZMO] scale uniform factor=1.0000 size={new_size}")
+            if DEBUG_SCALE_GIZMO:
+                print(f"[SCALE_GIZMO] uniform snapped_factor=1.000000 resulting_size={new_size}")
+            return {"Size": Vec3(new_size)}
+
         reference = max(start.x, start.y, start.z)
         if reference <= 1e-9:
             return None
@@ -811,6 +875,8 @@ class TransformGizmo:
 
         if DEBUG_GIZMO:
             print(f"[GIZMO] scale uniform factor={effective_factor:.4f} size={new_size}")
+        if DEBUG_SCALE_GIZMO:
+            print(f"[SCALE_GIZMO] uniform snapped_factor={effective_factor:.6f} resulting_size={new_size}")
 
         return {"Size": Vec3(new_size)}
 

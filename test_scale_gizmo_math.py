@@ -135,5 +135,162 @@ assert result4["Size"].x > 0
 gizmo.end_drag()
 print("Test 4 (minimum size clamp, no negative/zero) PASSED\n")
 
+# --- Test 5: mouse-down on uniform handle with ZERO movement -> Size
+# EXACTLY unchanged (regression test for the "instant jump on mouse-down"
+# bug fixed in transform_gizmo.py's _update_uniform_scale_drag). Uses a
+# deliberately imprecise click ray (near, not exactly at, the object's
+# center) so the true click-to-center distance is small — the exact
+# condition that used to trip the SCALE_UNIFORM_MIN_START_DISTANCE floor
+# mismatch. ---
+part5 = Entity(position=Vec3(-3, 2, 6), scale=Vec3(2, 3, 4), rotation=Vec3(0, 0, 0))
+gizmo.set_target(part5)
+old_size5 = Vec3(part5.scale)
+old_position5 = Vec3(part5.position)
+ray_dir5 = Vec3(0.15, 0.1, 1).normalized()
+# Deliberately imprecise: offset from the exact center by a few mm, well
+# under the handle's hit tolerance, but NOT a mathematically exact hit.
+ray_origin5 = old_position5 - ray_dir5 * 10 + Vec3(0.003, -0.002, 0)
+key5, _ = gizmo._best_scale_handle_hit(ray_origin5, ray_dir5)
+print("hit handle (expect uniform):", key5)
+assert key5 == "uniform"
+started5 = gizmo._begin_scale_drag(ray_origin5, ray_dir5)
+assert started5
+print("drag_start_uniform_distance (true, unclamped):", gizmo._drag_start_uniform_distance)
+# SAME ray -- zero mouse movement since mouse-down.
+result5 = gizmo._update_scale_drag(ray_origin5, ray_dir5, 0.0, False)
+print("zero-movement result:", result5)
+assert result5["Size"] == old_size5, "Size must be EXACTLY unchanged on zero movement"
+assert part5.position.x == old_position5.x and part5.position.y == old_position5.y and part5.position.z == old_position5.z
+gizmo.end_drag()
+print("Test 5 (uniform handle, zero movement -> Size unchanged) PASSED\n")
+
+# --- Test 6: one small movement -> small proportional resize (not a big
+# jump), and Test 4 requirement (repeated frames with no further movement
+# after that -> no cumulative growth). ---
+part6 = Entity(position=Vec3(1, 0, 0), scale=Vec3(2, 2, 2), rotation=Vec3(0, 0, 0))
+gizmo.set_target(part6)
+old_size6 = Vec3(part6.scale)
+ray_dir6 = Vec3(0.15, 0.1, 1).normalized()
+ray_origin6 = part6.position - ray_dir6 * 10
+key6, _ = gizmo._best_scale_handle_hit(ray_origin6, ray_dir6)
+assert key6 == "uniform"
+gizmo._begin_scale_drag(ray_origin6, ray_dir6)
+# Tiny outward nudge, roughly "one pixel"-scale at this ray distance.
+tiny_offset = Vec3(0.002, 0.0, 0.0)
+result6a = gizmo._update_scale_drag(ray_origin6 + tiny_offset, ray_dir6, 0.0, False)
+print("small-movement result:", result6a)
+factor6a = result6a["Size"].x / old_size6.x
+assert 0.0 < abs(factor6a - 1.0) < 0.5, f"a tiny movement should produce a small, not huge, change (factor={factor6a})"
+# Repeated frames with the SAME (already-moved) ray -> no further
+# cumulative growth: re-evaluating with an unchanged pointer position
+# must reproduce the exact same Size again, not keep growing.
+result6b = gizmo._update_scale_drag(ray_origin6 + tiny_offset, ray_dir6, 0.0, False)
+result6c = gizmo._update_scale_drag(ray_origin6 + tiny_offset, ray_dir6, 0.0, False)
+print("repeated-frame results:", result6b["Size"], result6c["Size"])
+assert result6b["Size"] == result6a["Size"] == result6c["Size"], "repeated frames with no pointer movement must not accumulate"
+gizmo.end_drag()
+print("Test 6 (small movement + no cumulative growth across repeated frames) PASSED\n")
+
+# --- Test 7: move outward then return to the EXACT original pointer
+# position -> Size returns exactly to drag-start Size. ---
+part7 = Entity(position=Vec3(0, 0, 4), scale=Vec3(2, 2, 2), rotation=Vec3(0, 0, 0))
+gizmo.set_target(part7)
+old_size7 = Vec3(part7.scale)
+ray_dir7 = Vec3(0.15, 0.1, 1).normalized()
+ray_origin7 = part7.position - ray_dir7 * 10
+gizmo._begin_scale_drag(ray_origin7, ray_dir7)
+moved_result = gizmo._update_scale_drag(ray_origin7 + Vec3(1.0, 0, 0), ray_dir7, 0.0, False)
+print("moved-out result:", moved_result)
+assert moved_result["Size"] != old_size7
+returned_result = gizmo._update_scale_drag(ray_origin7, ray_dir7, 0.0, False)
+print("returned-to-start result:", returned_result)
+assert returned_result["Size"] == old_size7, "returning to the exact start pointer must restore the exact start Size"
+gizmo.end_drag()
+print("Test 7 (move out and return to origin -> exact original Size) PASSED\n")
+
+# --- Test 8: snap enabled must still produce no jump on mouse-down
+# (the old bug: re-snapping an ungrid-aligned absolute reference value
+# could itself manufacture a jump even with the delta==0 fix). ---
+part8 = Entity(position=Vec3(2, -1, 3), scale=Vec3(2.1, 3.3, 4.7), rotation=Vec3(0, 0, 0))
+gizmo.set_target(part8)
+old_size8 = Vec3(part8.scale)
+ray_dir8 = Vec3(0.15, 0.1, 1).normalized()
+ray_origin8 = part8.position - ray_dir8 * 10 + Vec3(0.001, 0.001, 0)
+gizmo._begin_scale_drag(ray_origin8, ray_dir8)
+result8_snap = gizmo._update_scale_drag(ray_origin8, ray_dir8, 0.25, True)
+print("snap-enabled zero-movement result:", result8_snap)
+assert result8_snap["Size"] == old_size8, "snap-enabled zero movement must still leave Size unchanged"
+gizmo.end_drag()
+print("Test 8 (snap enabled, no jump on mouse-down) PASSED\n")
+
+# --- Test 9: snap disabled (small/no snap) also produces no jump. ---
+part9 = Entity(position=Vec3(-2, 1, -3), scale=Vec3(1.7, 2.9, 3.3), rotation=Vec3(0, 0, 0))
+gizmo.set_target(part9)
+old_size9 = Vec3(part9.scale)
+ray_dir9 = Vec3(0.15, 0.1, 1).normalized()
+ray_origin9 = part9.position - ray_dir9 * 10 + Vec3(0.001, -0.001, 0)
+gizmo._begin_scale_drag(ray_origin9, ray_dir9)
+result9 = gizmo._update_scale_drag(ray_origin9, ray_dir9, 0.0, False)
+print("snap-disabled zero-movement result:", result9)
+assert result9["Size"] == old_size9
+gizmo.end_drag()
+print("Test 9 (snap disabled, no jump on mouse-down) PASSED\n")
+
+# --- Test 10: non-cubic Part, real movement -> proportions unchanged
+# (re-verified against the fixed delta-based factor, not just the old
+# ratio-based one). ---
+part10 = Entity(position=Vec3(4, 4, 4), scale=Vec3(1.0, 2.0, 5.0), rotation=Vec3(0, 0, 0))
+gizmo.set_target(part10)
+old_size10 = Vec3(part10.scale)
+ray_dir10 = Vec3(0.15, 0.1, 1).normalized()
+ray_origin10 = part10.position - ray_dir10 * 10
+gizmo._begin_scale_drag(ray_origin10, ray_dir10)
+result10 = gizmo._update_scale_drag(ray_origin10 + Vec3(2.0, 0, 0), ray_dir10, 0.0, False)
+print("non-cubic scale result:", result10)
+new_size10 = result10["Size"]
+ratio10_before = (old_size10.x / old_size10.y, old_size10.y / old_size10.z)
+ratio10_after = (new_size10.x / new_size10.y, new_size10.y / new_size10.z)
+assert close(ratio10_before[0], ratio10_after[0], 1e-3)
+assert close(ratio10_before[1], ratio10_after[1], 1e-3)
+gizmo.end_drag()
+print("Test 10 (non-cubic Part, proportions preserved) PASSED\n")
+
+# --- Test 11: drag toward minimum via the uniform handle clamps
+# correctly (no negative/zero/NaN). Starts from a moderate (not
+# near-zero) click-to-center distance so there's real room to shrink
+# toward, then drags the ray back through the exact center (current
+# distance -> 0, factor -> 0) to drive Size well past the clamp. ---
+part11 = Entity(position=Vec3(0, 5, 0), scale=Vec3(1, 1, 1), rotation=Vec3(0, 0, 0))
+gizmo.set_target(part11)
+ray_dir11 = Vec3(0.15, 0.1, 1).normalized()
+ray_origin11 = part11.position - ray_dir11 * 10 + Vec3(0.2, 0, 0)
+key11, _ = gizmo._best_scale_handle_hit(ray_origin11, ray_dir11)
+assert key11 == "uniform"
+gizmo._begin_scale_drag(ray_origin11, ray_dir11)
+print("Test 11 drag_start_uniform_distance:", gizmo._drag_start_uniform_distance)
+ray_origin11_center = part11.position - ray_dir11 * 10
+result11 = gizmo._update_scale_drag(ray_origin11_center, ray_dir11, 0.0, False)
+print("uniform min-size clamp result:", result11)
+assert result11["Size"].x >= MIN_PART_SIZE - 1e-6
+assert result11["Size"].y >= MIN_PART_SIZE - 1e-6
+assert result11["Size"].z >= MIN_PART_SIZE - 1e-6
+assert close(result11["Size"].x, MIN_PART_SIZE, 1e-3), "should have clamped to the minimum, not just shrunk a bit"
+gizmo.end_drag()
+print("Test 11 (uniform handle drag toward minimum clamps correctly) PASSED\n")
+
+# --- Test 12: axis handles remain byte-for-byte unchanged by this fix
+# (re-run of Tests 1-2's exact scenarios, same expected values). ---
+part12 = Entity(position=Vec3(0, 0, 0), scale=Vec3(2, 2, 2), rotation=Vec3(0, 0, 0))
+gizmo.set_target(part12)
+handle_pos_x12 = Vec3(gizmo._scale_handles["x+"].world_position)
+ray_dir12 = Vec3(0, 0, 1)
+ray_origin12 = handle_pos_x12 - ray_dir12 * 10
+gizmo._begin_scale_drag(ray_origin12, ray_dir12)
+result12 = gizmo._update_scale_drag(ray_origin12 + Vec3(2.0, 0, 0), ray_dir12, 0.0, False)
+print("axis handle regression result:", result12)
+assert close(result12["Size"].x, 7.2) and close(result12["Position"].x, 2.6)
+gizmo.end_drag()
+print("Test 12 (axis handles unaffected by the uniform-handle fix) PASSED\n")
+
 print("ALL SCALE GIZMO MATH TESTS PASSED")
 app.destroy()
