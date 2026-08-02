@@ -203,6 +203,63 @@ class PhysicsWorld:
     def body_count(self) -> int:
         return len(self._bodies)
 
+    def has_body(self, instance_id: str) -> bool:
+        return instance_id in self._bodies
+
+    def remove_part(self, instance_id: str) -> Optional[str]:
+        """Bug-report follow-up: an authoritatively-deleted Instance during
+        Play used to leave its Bullet body (or ghost/static bookkeeping)
+        behind forever — the visible Entity was destroyed, but nothing
+        here ever heard about it, so a static floor's body kept
+        supporting whatever rested on it even after the floor itself was
+        gone. Called from MultiplayerGame.remove_instance() for every
+        authoritatively-deleted instance, not just ones the local player
+        deleted (see module docstring — same call site the server's
+        PART_DELETED broadcast already drives for the Entity/instances
+        cleanup, so this piggybacks on the one confirmed-delete path
+        rather than adding a second one).
+
+        Returns the removed body's kind ("static"/"dynamic"/"ghost"/
+        "none"), or None if this instance had no runtime body at all
+        (e.g. it wasn't part of this Play session, or physics already
+        tore down) -- the caller uses "static" to decide whether to wake
+        remaining dynamic bodies."""
+        body = self._bodies.pop(instance_id, None)
+        if body is None:
+            if DEBUG_PHYSICS:
+                print(f"[PHYSICS] remove_part id={instance_id}: no runtime body (nothing to remove)")
+            return None
+
+        before = len(self._bodies) + 1
+        if body.node is not None:
+            self.bullet_world.removeRigidBody(body.node)
+        after = len(self._bodies)
+        if DEBUG_PHYSICS:
+            print(
+                f"[PHYSICS] remove_part id={instance_id} kind={body.kind} "
+                f"body_count_before={before} body_count_after={after}"
+            )
+        return body.kind
+
+    def wake_all_dynamic(self) -> None:
+        """Force every remaining dynamic body active. Called after a
+        static (or ghost/none -- harmless either way) body is removed:
+        a dynamic body resting on a now-gone support is very likely
+        asleep (Bullet deactivates bodies that haven't moved for a
+        while, see setDeactivationEnabled in add_part), and a sleeping
+        body does NOT re-evaluate gravity/contacts on its own even
+        though its support just vanished from the world. Simpler and
+        more robust than targeted contact-based waking for the small
+        object counts this stage targets (see Stage 2.4 report scope
+        note) -- correctness over precision."""
+        woken = 0
+        for body in self._bodies.values():
+            if body.kind == "dynamic" and body.node is not None:
+                body.node.setActive(True, True)
+                woken += 1
+        if DEBUG_PHYSICS:
+            print(f"[PHYSICS] wake_all_dynamic: {woken} dynamic bodies forced active")
+
     def step(self, dt: float) -> None:
         self._frame_count += 1
         frame_no = self._frame_count

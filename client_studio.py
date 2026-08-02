@@ -3364,6 +3364,33 @@ class MultiplayerGame(Entity):
             self.studio_adapter.on_instance_updated(record)
 
     def remove_instance(self, instance_id: str) -> None:
+        # Bug-report follow-up: this is the ONE authoritative local-removal
+        # path (driven by the server's confirmed PART_DELETED broadcast,
+        # see process_network_messages -- fires for every recursively
+        # deleted descendant too, one message each) that Explorer delete,
+        # cascade-delete, and any other client's delete all funnel
+        # through. Runtime physics used to have no idea an instance
+        # existed here at all: its Bullet body (or ghost/ "none"
+        # bookkeeping) would keep existing forever after the visible
+        # Entity was destroyed -- a deleted static floor kept invisibly
+        # supporting whatever rested on it. Removing the body BEFORE
+        # destroying the Entity (order doesn't actually matter for
+        # correctness here, since PhysicsWorld never touches Ursina's
+        # destroy() and step() only ever iterates self._bodies, but doing
+        # it first keeps this block reading top-to-bottom as "physics,
+        # then the rest").
+        if self._physics_world is not None:
+            removed_kind = self._physics_world.remove_part(instance_id)
+            if removed_kind == "static":
+                # A static support may have just vanished out from under
+                # sleeping dynamic bodies -- Bullet does not re-evaluate
+                # a deactivated body's contacts on its own, so nothing
+                # would ever notice the support is gone otherwise. See
+                # Stage 2.4 follow-up report for why "wake everything"
+                # was chosen over targeted contact-based waking.
+                self._physics_world.wake_all_dynamic()
+        self._physics_snapshot.pop(instance_id, None)
+
         self.instances.pop(instance_id, None)
         entity = self.parts.pop(instance_id, None)
         if entity is not None:
