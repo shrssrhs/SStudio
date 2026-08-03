@@ -3,3 +3,4 @@ ursina
 websockets>=14
 panda3d-simplepbr
 panda3d-gltf
+lupa==2.8

@@ -51,6 +51,7 @@ from studio_editor_live import (
     Vec3 as EditorVec3,
 )
 import editor_history
+import lua_runtime
 import physics
 from shared import object_registry, protocol
 from shared.instance import DEFAULT_PART_PROPERTIES, MIN_PART_SIZE
@@ -1275,6 +1276,16 @@ class MultiplayerGame(Entity):
         self._physics_world: physics.PhysicsWorld | None = None
         self._physics_snapshot: dict[str, dict[str, list[float]]] = {}
 
+        # Stage 3.0: sandboxed Lua runtime (see lua_runtime.py). Exists
+        # only between set_studio_playing(True) and set_studio_playing
+        # (False), created AFTER physics (it binds to self._physics_world)
+        # and stopped BEFORE physics on the way out -- Lua must finish
+        # cancelling every task and restoring its own overlay before
+        # anything else starts tearing the Play session down, so no
+        # coroutine can mutate the scene mid-cleanup (see Stage 3.0
+        # report).
+        self._lua_runtime: lua_runtime.LuaRuntimeManager | None = None
+
         # Stage 2.5: authoritative Undo/Redo command history (see
         # editor_history.py for the full design). Sequence counter here is
         # deliberately SEPARATE from _model_drag_sequence_counter below —
@@ -1346,6 +1357,7 @@ class MultiplayerGame(Entity):
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = False
             self._start_physics()
+            self._start_lua()
             self.history.refresh_ui()
         else:
             if preserve_position and self.studio_playing:
@@ -1360,6 +1372,13 @@ class MultiplayerGame(Entity):
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = True
             if was_playing:
+                # Lua first: every task/coroutine must be cancelled and
+                # its scene overlay restored before physics tears down
+                # and the ordinary Position/Rotation/Size restore runs --
+                # otherwise a script could still be mid-mutation while
+                # the rest of Stop is unwinding the world under it (see
+                # Stage 3.0 report, "execution authority model").
+                self._stop_lua()
                 self._stop_physics()
             self.history.refresh_ui()
 
@@ -1469,6 +1488,40 @@ class MultiplayerGame(Entity):
         if self._physics_world is None:
             return
         self._physics_world.step(ursina_time.dt)
+
+    def _start_lua(self) -> None:
+        """Wrapped in try/except that ALWAYS prints a full traceback, for
+        the same reason _start_physics() is: this runs through
+        EngineBridge._adapter_call(), which would otherwise swallow the
+        exception into a one-line Output log while Play looks like it
+        succeeded (see Stage 2.4 report's identical concern for physics)."""
+        try:
+            self._lua_runtime = lua_runtime.LuaRuntimeManager(self)
+            self._lua_runtime.start()
+        except Exception:
+            print("[LUA_RUNTIME] EXCEPTION in _start_lua() -- Play mode continues but scripts did NOT start:")
+            traceback.print_exc()
+            self._lua_runtime = None
+
+    def _stop_lua(self) -> None:
+        if self._lua_runtime is None:
+            return
+        try:
+            self._lua_runtime.stop()
+        except Exception:
+            print("[LUA_RUNTIME] EXCEPTION in _stop_lua():")
+            traceback.print_exc()
+        self._lua_runtime = None
+
+    def update_lua(self) -> None:
+        if self._lua_runtime is None:
+            return
+        try:
+            self._lua_runtime.update(ursina_time.dt)
+        except Exception:
+            print("[LUA_RUNTIME] EXCEPTION in update_lua() -- stopping the Lua runtime for the rest of this Play session:")
+            traceback.print_exc()
+            self._stop_lua()
 
     def begin_editor_look(self) -> None:
         if self.studio_playing:
@@ -3728,6 +3781,7 @@ class MultiplayerGame(Entity):
         if self.studio_playing:
             self.send_transform()
             self.update_physics()
+            self.update_lua()
         self.update_remote_smoothing()
         self.update_sky()
 

@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
@@ -2297,13 +2298,32 @@ class InspectorPanel(QWidget):
         script.add_row("Source", summary_label)
 
         open_button = QPushButton("Open Script")
-        open_button.clicked.connect(
-            lambda: QMessageBox.information(
-                self, obj.name, "Code editor will be implemented in the next stage."
-            )
-        )
+        open_button.clicked.connect(lambda: self._open_script_source_editor(obj.id, obj.name))
         script.add_row("", open_button)
         return script
+
+    def _open_script_source_editor(self, object_id: str, display_name: str) -> None:
+        """Stage 3.0's minimal Source editor -- see ScriptSourceDialog.
+        Reads fresh Source at open time (not whatever was captured when
+        the Inspector section was last built) and routes Save through the
+        exact same _set_value("properties.Source", ...) -> bridge.
+        set_property() path every other Inspector field already uses, so
+        Source edits get Undo/Redo (one Apply = one PropertyEditCommand,
+        see Stage 2.5) for free with no special-casing here."""
+        obj = self.bridge.get_object(object_id)
+        if obj is None:
+            return
+        current_source = str(obj.properties.get("Source", ""))
+        dialog = ScriptSourceDialog(display_name, current_source, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_source = dialog.source_text()
+        if new_source == current_source:
+            return
+        if self.current_object is not None and self.current_object.id == object_id:
+            self._set_value("properties.Source", new_source)
+        else:
+            self.bridge.set_property(object_id, "properties.Source", new_source)
 
     def _build_placeholder_section(self, obj: SceneObject, definition: Optional[ObjectTypeDefinition]) -> CollapsibleSection:
         section = CollapsibleSection("Properties")
@@ -2463,6 +2483,42 @@ def resolve_parent_for_type(
         f"Using the default location '{default_parent}' instead."
     )
     return default_parent, True, warning
+
+
+class ScriptSourceDialog(QDialog):
+    """Minimal Source editor for Script/LocalScript/ModuleScript -- Stage
+    3.0 needs a way to actually get Lua text into a scene, but the real
+    code editor (syntax highlighting, autocomplete, tabs, breakpoints) is
+    a later stage. Deliberately plain: QPlainTextEdit, Save/Cancel,
+    nothing else. Reusable/replaceable when that stage lands."""
+
+    def __init__(self, title: str, source: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Source — {title}")
+        self.resize(760, 560)
+        self.setSizeGripEnabled(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setPlainText(source)
+        self.text_edit.setTabStopDistance(28)
+        self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        mono_font = QFont("Consolas")
+        mono_font.setStyleHint(QFont.StyleHint.Monospace)
+        mono_font.setPointSize(10)
+        self.text_edit.setFont(mono_font)
+        layout.addWidget(self.text_edit, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def source_text(self) -> str:
+        return self.text_edit.toPlainText()
 
 
 class InsertObjectDialog(QDialog):
