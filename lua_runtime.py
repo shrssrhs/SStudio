@@ -56,6 +56,8 @@ Architecture summary (see Stage 3.0 final report for full rationale):
 
 from __future__ import annotations
 
+import itertools as _itertools
+import re as _re
 import time as _time
 import traceback as _traceback
 from dataclasses import dataclass, field
@@ -127,6 +129,7 @@ class ScriptDiagnostic:
     stack_trace: Optional[str] = None
     chunk_name: str = ""
     timestamp: float = field(default_factory=_time.monotonic)
+    session_id: int = 0
 
     def format(self) -> str:
         if self.severity == "error":
@@ -135,6 +138,32 @@ class ScriptDiagnostic:
         if self.severity == "warning":
             return f"[LUA WARNING][{self.script_name}] {self.message}"
         return f"[LUA][{self.script_name}] {self.message}"
+
+
+_LUA_ERROR_LINE_RE = _re.compile(r':(\d+):')
+
+# Process-wide, never reset per LuaRuntimeManager instance (a fresh instance
+# is created on every Play -- see class docstring): Stage 3.1's editor gutter
+# needs to tell "this diagnostic belongs to the Play session currently
+# running" from "this is a straggler from a Play session that already
+# Stopped" apart, which per-instance numbering (always restarting at 1)
+# cannot distinguish since two different instances would both report 1.
+_SESSION_ID_COUNTER = _itertools.count(1)
+
+
+def _extract_lua_error_line(message: str) -> Optional[int]:
+    """Lua's own error format is always `<chunksource>:<line>: <text>`
+    (with chunksource wrapped as `[string "name"]` unless the chunk name
+    was given an `@`/`=` prefix) -- this pulls the line back out for
+    Stage 3.1's editor gutter markers / Output-click-to-navigate, without
+    changing the message text Stage 3.0 already logs to Output."""
+    match = _LUA_ERROR_LINE_RE.search(message)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
 
 
 # ============================================================
@@ -1190,6 +1219,8 @@ class LuaRuntimeManager:
         self.scheduler = LuaTaskScheduler(self)
         self.lua: Any = None
         self.diagnostics: list[ScriptDiagnostic] = []
+        self.session_id = 0
+        self._diagnostic_listeners: list[Callable[[ScriptDiagnostic], None]] = []
         self._module_cache: dict[str, Any] = {}
         self._module_in_progress: set[str] = set()
         self._script_names: dict[str, str] = {}
@@ -1200,7 +1231,23 @@ class LuaRuntimeManager:
 
     # ---------------- lifecycle ----------------
 
+    def add_diagnostic_listener(self, callback: Callable[[ScriptDiagnostic], None]) -> None:
+        """Stage 3.1 hook: the code editor's gutter markers/Output
+        navigation need the SAME diagnostics Stage 3.0 already logs as
+        formatted strings, just structured (script_id + line) instead of
+        parsed back out of text. Additive -- the existing
+        studio_adapter.log() formatted-string path is untouched."""
+        self._diagnostic_listeners.append(callback)
+
+    def _notify_diagnostic(self, diag: ScriptDiagnostic) -> None:
+        for callback in self._diagnostic_listeners:
+            try:
+                callback(diag)
+            except Exception:
+                _debug(f"diagnostic listener raised: {_traceback.format_exc()}")
+
     def start(self) -> list[ScriptDiagnostic]:
+        self.session_id = next(_SESSION_ID_COUNTER)
         self.diagnostics = []
         self._module_cache.clear()
         self._module_in_progress.clear()
@@ -1365,15 +1412,22 @@ class LuaRuntimeManager:
             print(f"[{level.upper()}] {message}")
 
     def _report_info(self, script_id: str, message: str) -> None:
-        diag = ScriptDiagnostic(script_id, self._script_name(script_id), "info", message)
+        diag = ScriptDiagnostic(script_id, self._script_name(script_id), "info", message, session_id=self.session_id)
         self.diagnostics.append(diag)
         self._log("info", diag.format())
         _debug(diag.format())
+        self._notify_diagnostic(diag)
 
     def _report_error(self, script_id: str, message: str, *, severity: str = "error", line: Optional[int] = None, chunk_name: str = "") -> None:
-        diag = ScriptDiagnostic(script_id, self._script_name(script_id), severity, message, line=line, chunk_name=chunk_name or self._script_name(script_id))
+        if line is None:
+            line = _extract_lua_error_line(message)
+        diag = ScriptDiagnostic(
+            script_id, self._script_name(script_id), severity, message, line=line,
+            chunk_name=chunk_name or self._script_name(script_id), session_id=self.session_id,
+        )
         self.diagnostics.append(diag)
         self._log(severity if severity != "info" else "info", diag.format())
+        self._notify_diagnostic(diag)
 
     # ---------------- module require ----------------
 

@@ -1497,11 +1497,31 @@ class MultiplayerGame(Entity):
         succeeded (see Stage 2.4 report's identical concern for physics)."""
         try:
             self._lua_runtime = lua_runtime.LuaRuntimeManager(self)
+            self._lua_runtime.add_diagnostic_listener(self._forward_lua_diagnostic)
             self._lua_runtime.start()
+            self._forward_lua_session_started(self._lua_runtime.session_id)
         except Exception:
             print("[LUA_RUNTIME] EXCEPTION in _start_lua() -- Play mode continues but scripts did NOT start:")
             traceback.print_exc()
             self._lua_runtime = None
+
+    def _forward_lua_diagnostic(self, diag: Any) -> None:
+        """Stage 3.1: the code editor's gutter markers/Output-click
+        navigation need the SAME diagnostic Stage 3.0 already logs as a
+        formatted string, just structured. Forwarded through the adapter
+        (which owns the Qt-side EngineBridge) rather than emitting a Qt
+        signal directly from here -- this class has no Qt dependency."""
+        if self.studio_adapter is not None:
+            self.studio_adapter.on_lua_diagnostic(diag.script_id, diag.severity, diag.message, diag.line, diag.session_id)
+
+    def _forward_lua_session_started(self, session_id: int) -> None:
+        """Tells the editor's diagnostic gutter a fresh Play session just
+        began, independent of whether that session ever reports a single
+        diagnostic -- without this, a clean Play after an errored one would
+        leave the previous session's stale gutter markers on screen
+        forever (nothing would ever arrive to clear them)."""
+        if self.studio_adapter is not None:
+            self.studio_adapter.on_lua_session_started(session_id)
 
     def _stop_lua(self) -> None:
         if self._lua_runtime is None:
@@ -3836,6 +3856,14 @@ class MultiplayerStudioAdapter:
             self.bridge.log(level, message)
         else:
             print(f"[{level.upper()}] {message}")
+
+    def on_lua_diagnostic(self, script_id: str, severity: str, message: str, line: Any, session_id: int) -> None:
+        if self.bridge is not None:
+            self.bridge.lua_diagnostic.emit(script_id, severity, message, line, session_id)
+
+    def on_lua_session_started(self, session_id: int) -> None:
+        if self.bridge is not None:
+            self.bridge.lua_session_started.emit(session_id)
 
     @staticmethod
     def _as_editor_vec3(value: Any, default: tuple[float, float, float]) -> EditorVec3:

@@ -33,7 +33,7 @@ import sys
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from PySide6.QtCore import (
     QEvent,
@@ -106,6 +106,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import script_editor
 from shared import object_registry, transform_math
 from shared.object_registry import ObjectTypeDefinition, ROOT_SERVICES
 
@@ -316,6 +317,8 @@ class EngineBridge(QObject):
     play_state_changed = Signal(bool)
     dirty_changed = Signal(bool)
     history_state_changed = Signal()
+    lua_diagnostic = Signal(str, str, str, object, int)  # script_id, severity, message, line (Optional[int]), session_id
+    lua_session_started = Signal(int)  # session_id -- fires once per Play, whether or not any diagnostic ever follows
 
     def __init__(
         self,
@@ -333,6 +336,12 @@ class EngineBridge(QObject):
         self.is_playing = False
         self.is_dirty = False
         self.adapter: Any = None
+        # Stage 3.1: lets StudioMainWindow interpose the "unsaved Script
+        # Source" prompt in front of EVERY existing way to trigger Play
+        # (Ribbon buttons x2, Tests menu/F5, the `:play` console command)
+        # without rewiring each call site individually -- they all still
+        # just call bridge.play().
+        self._play_guard: Optional[Callable[[], bool]] = None
 
     def set_adapter(self, adapter: Any) -> None:
         self.adapter = adapter
@@ -860,8 +869,13 @@ class EngineBridge(QObject):
         self.property_changed.emit(object_id, property_path, value)
         self.set_dirty(True)
 
+    def set_play_guard(self, callback: Optional[Callable[[], bool]]) -> None:
+        self._play_guard = callback
+
     def play(self) -> None:
         if self.is_playing:
+            return
+        if self._play_guard is not None and not self._play_guard():
             return
         accepted = self._adapter_call("play", default=True)
         if accepted is False:
@@ -1501,6 +1515,12 @@ class ExplorerTree(QTreeWidget):
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
 
+    def keyPressEvent(self, event: Any) -> None:  # noqa: N802 -- Qt override
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._panel.activate_current():
+                return
+        super().keyPressEvent(event)
+
     def dragEnterEvent(self, event) -> None:
         if event.source() is self:
             event.acceptProposedAction()
@@ -1552,9 +1572,10 @@ class ExplorerTree(QTreeWidget):
 class ExplorerPanel(QWidget):
     SYSTEM_PROTECTED_TYPES = {"Baseplate", "Camera", "Lighting", "Terrain"}
 
-    def __init__(self, bridge: EngineBridge, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, bridge: EngineBridge, script_workspace: Any, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.bridge = bridge
+        self.script_workspace = script_workspace
         self._syncing = False
 
         layout = QVBoxLayout(self)
@@ -1788,21 +1809,47 @@ class ExplorerPanel(QWidget):
         self.bridge.set_property(object_id, "name", new_name)
 
     # --------------------------------------------------------
-    # ДВОЙНОЙ КЛИК (заглушка редактора кода для Script-типов)
+    # ДВОЙНОЙ КЛИК / ENTER -- открытие вкладки редактора для Script-типов
     # --------------------------------------------------------
+
+    def _is_script_object(self, object_id: Optional[str]) -> Optional[SceneObject]:
+        """Returns the SceneObject if object_id names a Script/LocalScript/
+        ModuleScript instance (object_registry category "Scripting"), else
+        None. Never used to decide identity -- callers still open by
+        object_id, this is purely a type check."""
+        if not object_id:
+            return None
+        obj = self.bridge.get_object(object_id)
+        if obj is None:
+            return None
+        definition = object_registry.get_object_type(obj.object_type)
+        if definition is not None and definition.category == "Scripting":
+            return obj
+        return None
+
+    def open_script_tab(self, object_id: str) -> bool:
+        """Opens (or focuses, if already open) the integrated editor tab
+        for a Script/LocalScript/ModuleScript. Never executes the script --
+        ScriptEditorWorkspace.open_script() only reads properties.Source
+        and displays it; ModuleScripts are never run just by opening
+        them."""
+        return bool(self.script_workspace.open_script(object_id))
+
+    def activate_current(self) -> bool:
+        """Enter-key equivalent of double-click: opens the selected
+        Script/LocalScript/ModuleScript's tab. Returns False (and does
+        nothing) for any other selected type, so Enter falls through to
+        Qt's normal tree navigation for non-Script items."""
+        object_id = self._selected_object_id()
+        if self._is_script_object(object_id) is None:
+            return False
+        return self.open_script_tab(object_id)
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         object_id = item.data(0, Qt.ItemDataRole.UserRole)
-        if not object_id:
+        if self._is_script_object(object_id) is None:
             return
-        obj = self.bridge.get_object(object_id)
-        if obj is None:
-            return
-        definition = object_registry.get_object_type(obj.object_type)
-        if definition is not None and definition.category == "Scripting":
-            QMessageBox.information(
-                self, obj.name, "Code editor will be implemented in the next stage."
-            )
+        self.open_script_tab(object_id)
 
     # --------------------------------------------------------
     # КОНТЕКСТНОЕ МЕНЮ
@@ -1826,6 +1873,11 @@ class ExplorerPanel(QWidget):
             is_system = object_id.startswith("system:")
             is_protected = obj is not None and obj.object_type in self.SYSTEM_PROTECTED_TYPES
             menu.addSeparator()
+
+            if self._is_script_object(object_id) is not None:
+                open_script_action = menu.addAction("Open Script")
+                open_script_action.triggered.connect(lambda: self.open_script_tab(object_id))
+                menu.addSeparator()
 
             rename_action = menu.addAction("Rename")
             rename_action.setEnabled(not is_system)
@@ -2015,9 +2067,10 @@ class ColorField(QPushButton):
 
 
 class InspectorPanel(QWidget):
-    def __init__(self, bridge: EngineBridge, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, bridge: EngineBridge, script_workspace: Any, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.bridge = bridge
+        self.script_workspace = script_workspace
         self.current_object: Optional[SceneObject] = None
         self._building = False
         # Заполняется _build_transform_section() при показе объекта с
@@ -2303,27 +2356,15 @@ class InspectorPanel(QWidget):
         return script
 
     def _open_script_source_editor(self, object_id: str, display_name: str) -> None:
-        """Stage 3.0's minimal Source editor -- see ScriptSourceDialog.
-        Reads fresh Source at open time (not whatever was captured when
-        the Inspector section was last built) and routes Save through the
-        exact same _set_value("properties.Source", ...) -> bridge.
-        set_property() path every other Inspector field already uses, so
-        Source edits get Undo/Redo (one Apply = one PropertyEditCommand,
-        see Stage 2.5) for free with no special-casing here."""
-        obj = self.bridge.get_object(object_id)
-        if obj is None:
-            return
-        current_source = str(obj.properties.get("Source", ""))
-        dialog = ScriptSourceDialog(display_name, current_source, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        new_source = dialog.source_text()
-        if new_source == current_source:
-            return
-        if self.current_object is not None and self.current_object.id == object_id:
-            self._set_value("properties.Source", new_source)
-        else:
-            self.bridge.set_property(object_id, "properties.Source", new_source)
+        """Stage 3.1: opens/focuses the integrated ScriptEditorWorkspace
+        tab for this Script/LocalScript/ModuleScript -- the same tab
+        Explorer double-click/Enter/"Open Script" open, keyed by the same
+        stable instance_id, so there is exactly one Source-editing surface
+        (see ScriptSourceDialog's removal note). Saving from that tab
+        already routes through bridge.set_property("properties.Source",
+        ...), the same authoritative path every other Inspector field
+        uses."""
+        self.script_workspace.open_script(object_id)
 
     def _build_placeholder_section(self, obj: SceneObject, definition: Optional[ObjectTypeDefinition]) -> CollapsibleSection:
         section = CollapsibleSection("Properties")
@@ -2483,42 +2524,6 @@ def resolve_parent_for_type(
         f"Using the default location '{default_parent}' instead."
     )
     return default_parent, True, warning
-
-
-class ScriptSourceDialog(QDialog):
-    """Minimal Source editor for Script/LocalScript/ModuleScript -- Stage
-    3.0 needs a way to actually get Lua text into a scene, but the real
-    code editor (syntax highlighting, autocomplete, tabs, breakpoints) is
-    a later stage. Deliberately plain: QPlainTextEdit, Save/Cancel,
-    nothing else. Reusable/replaceable when that stage lands."""
-
-    def __init__(self, title: str, source: str, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(f"Source — {title}")
-        self.resize(760, 560)
-        self.setSizeGripEnabled(True)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        self.text_edit = QPlainTextEdit()
-        self.text_edit.setPlainText(source)
-        self.text_edit.setTabStopDistance(28)
-        self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        mono_font = QFont("Consolas")
-        mono_font.setStyleHint(QFont.StyleHint.Monospace)
-        mono_font.setPointSize(10)
-        self.text_edit.setFont(mono_font)
-        layout.addWidget(self.text_edit, 1)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def source_text(self) -> str:
-        return self.text_edit.toPlainText()
 
 
 class InsertObjectDialog(QDialog):
@@ -3133,10 +3138,35 @@ class ViewportFrame(QWidget):
 # Output / Console / Assets / Profiler
 # ---------------------------------------------------------------------------
 
+class _OutputTextEdit(QTextEdit):
+    """Adds one signal Stage 3.1 needs -- which text block was
+    double-clicked -- on top of an otherwise completely ordinary read-only
+    QTextEdit. OutputPanel uses this to map a double-clicked line back to
+    the Script instance ID/line it was logged for (see
+    OutputPanel._diagnostic_blocks)."""
+
+    block_double_clicked = Signal(int)
+
+    def mouseDoubleClickEvent(self, event: Any) -> None:  # noqa: N802 -- Qt override
+        super().mouseDoubleClickEvent(event)
+        cursor = self.cursorForPosition(event.pos())
+        self.block_double_clicked.emit(cursor.blockNumber())
+
+
 class OutputPanel(QWidget):
     def __init__(self, bridge: EngineBridge, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.bridge = bridge
+        # Stage 3.1 Output-to-source navigation: maps the block number of
+        # an appended Output line to the (script_id, line) it was logged
+        # for, WITHOUT parsing the formatted log text back apart -- see
+        # _on_lua_diagnostic, which correlates using the fact that
+        # lua_runtime.py always calls the plain-text log path immediately
+        # before the structured diagnostic path for the same event (same
+        # thread, direct Qt connections -- see that method's docstring).
+        self._diagnostic_blocks: dict[int, tuple[str, Optional[int]]] = {}
+        self._last_log_block: Optional[int] = None
+        self._navigate_callback: Optional[Callable[[str, Optional[int]], None]] = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -3157,18 +3187,19 @@ class OutputPanel(QWidget):
         self.context_filter = QComboBox()
         self.context_filter.addItems(["All Contexts", "Editor", "Engine", "Adapter"])
         clear_button = QPushButton("Clear")
-        clear_button.clicked.connect(lambda: self.output.clear())
+        clear_button.clicked.connect(self._clear_output)
         filters.addWidget(self.message_filter)
         filters.addWidget(self.context_filter)
         filters.addStretch(1)
         filters.addWidget(clear_button)
         output_layout.addLayout(filters)
 
-        self.output = QTextEdit()
+        self.output = _OutputTextEdit()
         self.output.setReadOnly(True)
         self.output.document().setMaximumBlockCount(5000)
         self.output.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self.output.setFont(QFont("JetBrains Mono, Consolas, monospace", 9))
+        self.output.block_double_clicked.connect(self._on_output_block_double_clicked)
         output_layout.addWidget(self.output, 1)
 
         console_page = QWidget()
@@ -3214,10 +3245,18 @@ class OutputPanel(QWidget):
         layout.addWidget(self.tabs)
 
         self.bridge.log_message.connect(self.append_log)
+        self.bridge.lua_diagnostic.connect(self._on_lua_diagnostic)
         self.bridge.scene_changed.connect(self._update_profiler)
         self._update_profiler()
         self.append_log("info", "Scene loaded successfully. (0.38s)")
         self.append_log("info", "Workspace ready.")
+
+    def set_navigate_callback(self, callback: Callable[[str, Optional[int]], None]) -> None:
+        """Optional hook so studio_editor_live.py's StudioMainWindow can
+        wire double-clicked diagnostic lines to
+        ScriptEditorWorkspace.navigate_to_diagnostic without this class
+        importing anything from script_editor.py."""
+        self._navigate_callback = callback
 
     def append_log(self, level: str, message: str) -> None:
         from datetime import datetime
@@ -3247,7 +3286,34 @@ class OutputPanel(QWidget):
         cursor.insertHtml(html)
         self.output.setTextCursor(cursor)
         self.output.ensureCursorVisible()
+        self._last_log_block = cursor.blockNumber()
         self.console_log.appendPlainText(f"{stamp} [{level_name}] {message}")
+
+    def _on_lua_diagnostic(self, script_id: str, severity: str, message: str, line: Any, session_id: int) -> None:
+        """Correlates the Output line just appended by append_log() (see
+        that method's `_last_log_block`) with this diagnostic's identity,
+        instead of parsing the formatted log text back apart. Relies on
+        lua_runtime.py always calling its plain-text log path immediately
+        before notifying diagnostic listeners for the same event (both
+        synchronous, same thread -- see LuaRuntimeManager._report_error/
+        _report_info)."""
+        if severity not in ("error", "warning") or line is None:
+            return
+        if self._last_log_block is not None:
+            self._diagnostic_blocks[self._last_log_block] = (script_id, line)
+
+    def _on_output_block_double_clicked(self, block_number: int) -> None:
+        meta = self._diagnostic_blocks.get(block_number)
+        if meta is None:
+            return
+        script_id, line = meta
+        if self._navigate_callback is not None:
+            self._navigate_callback(script_id, line)
+
+    def _clear_output(self) -> None:
+        self.output.clear()
+        self._diagnostic_blocks.clear()
+        self._last_log_block = None
 
     def _execute_command(self) -> None:
         command = self.command_line.text().strip()
@@ -3270,7 +3336,7 @@ class OutputPanel(QWidget):
         elif head == "duplicate":
             self.bridge.duplicate_selected()
         elif head == "clear":
-            self.output.clear()
+            self._clear_output()
             self.console_log.clear()
         elif head == "help":
             self.console_log.appendPlainText(
@@ -3316,6 +3382,13 @@ class StudioMainWindow(QMainWindow):
         self.bridge.dirty_changed.connect(self._update_title)
         self.bridge.selection_changed.connect(self._selection_status)
         self.bridge.play_state_changed.connect(self._play_status)
+        self.bridge.set_play_guard(self._handle_play_guard)
+        # Edit-menu Undo/Redo must read "Undo Typing"/"Redo Typing" (and
+        # act on the text buffer) the instant a LuaCodeEditor gains focus,
+        # and read the normal scene action the instant it loses focus --
+        # history_state_changed alone can't see focus changes (typing
+        # inside a QPlainTextEdit never touches scene history at all).
+        QApplication.instance().focusChanged.connect(lambda _old, _new: self._update_undo_redo_actions())
 
         self._restore_layout()
         if not self.bridge.live_mode:
@@ -3334,26 +3407,35 @@ class StudioMainWindow(QMainWindow):
         open_action.triggered.connect(self.open_scene)
         save_action = QAction("Save", self)
         save_action.setShortcut(QKeySequence.StandardKey.Save)
-        save_action.triggered.connect(self.save_scene)
+        save_action.triggered.connect(self._on_save_triggered)
         save_as_action = QAction("Save As…", self)
         save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
         save_as_action.triggered.connect(self.save_scene_as)
+        save_all_action = QAction("Save All", self)
+        save_all_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        save_all_action.triggered.connect(self._save_all_scripts)
         exit_action = QAction("Exit", self)
         exit_action.setShortcut(QKeySequence.StandardKey.Quit)
         exit_action.triggered.connect(self.close)
 
-        file_menu.addActions([new_action, open_action, save_action, save_as_action])
+        file_menu.addActions([new_action, open_action, save_action, save_as_action, save_all_action])
         file_menu.addSeparator()
         file_menu.addAction(exit_action)
 
         edit_menu = menu.addMenu("&Edit")
         self.undo_action = QAction("Undo", self)
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
-        self.undo_action.triggered.connect(self.bridge.undo)
+        self.undo_action.triggered.connect(self._on_undo_triggered)
         self.redo_action = QAction("Redo", self)
         self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
-        self.redo_action.triggered.connect(self.bridge.redo)
+        self.redo_action.triggered.connect(self._on_redo_triggered)
         edit_menu.addActions([self.undo_action, self.redo_action])
+        # Ctrl+Shift+Z as an additional redo chord (Ctrl+Y already covers
+        # the platform-standard one via QKeySequence.StandardKey.Redo) --
+        # same handler, so it stays subject to the identical focus check
+        # rather than being a second, divergent code path.
+        self.redo_alt_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        self.redo_alt_shortcut.activated.connect(self._on_redo_triggered)
         edit_menu.addSeparator()
         duplicate_action = QAction("Duplicate", self)
         duplicate_action.setShortcut(QKeySequence("Ctrl+D"))
@@ -3432,8 +3514,32 @@ class StudioMainWindow(QMainWindow):
         layout.addWidget(self.ribbon)
 
         self.viewport_frame = ViewportFrame(self.bridge)
-        layout.addWidget(self.viewport_frame, 1)
+
+        # Stage 3.1: the ViewportFrame instance above is added as tab 0 of
+        # a document workspace, not directly to `layout` -- but it is
+        # never recreated or reparented away and back, so
+        # embed_panda_window()'s native Win32 child-window reparenting
+        # (which only ever calls studio.install_engine_viewport(...) ->
+        # self.viewport_frame.install_external_viewport(...), entirely
+        # internal to ViewportFrame's own QStackedWidget) is completely
+        # unaffected by which container ViewportFrame's parent widget is.
+        self.script_workspace = script_editor.ScriptEditorWorkspace(self.bridge, self.viewport_frame)
+        self.script_workspace.set_icon_provider(self._script_tab_icon)
+        self.script_workspace.set_on_document_opened(self._wire_script_document)
+        layout.addWidget(self.script_workspace, 1)
         self.setCentralWidget(central)
+
+    def _script_tab_icon(self, class_name: str) -> Any:
+        icon_name = {"Script": "file-text", "LocalScript": "file-text", "ModuleScript": "package"}.get(class_name, "file-text")
+        return IconFactory.make(icon_name, 14)
+
+    def _wire_script_document(self, doc: Any) -> None:
+        """Keeps the Edit menu's Undo/Redo enabled-state live as THIS
+        editor's own text-undo-stack changes (typing never touches scene
+        history, so history_state_changed alone would never fire for
+        this)."""
+        doc.editor.document().undoAvailable.connect(lambda _available: self._update_undo_redo_actions())
+        doc.editor.document().redoAvailable.connect(lambda _available: self._update_undo_redo_actions())
 
     def _make_dock(
         self,
@@ -3458,9 +3564,10 @@ class StudioMainWindow(QMainWindow):
         return dock
 
     def _build_docks(self) -> None:
-        self.explorer_panel = ExplorerPanel(self.bridge)
-        self.inspector_panel = InspectorPanel(self.bridge)
+        self.explorer_panel = ExplorerPanel(self.bridge, self.script_workspace)
+        self.inspector_panel = InspectorPanel(self.bridge, self.script_workspace)
         self.output_panel = OutputPanel(self.bridge)
+        self.output_panel.set_navigate_callback(self.script_workspace.navigate_to_diagnostic)
 
         self.explorer_dock = self._make_dock(
             "Explorer",
@@ -3546,6 +3653,23 @@ class StudioMainWindow(QMainWindow):
             self._selection_status(obj)
 
     def _update_undo_redo_actions(self) -> None:
+        # Stage 3.1: while a LuaCodeEditor has focus, Edit menu Undo/Redo
+        # reads and acts on ITS text undo stack, not the scene
+        # CommandManager -- see _on_undo_triggered/_on_redo_triggered,
+        # which this must stay in sync with (both check focused_editor()).
+        # `script_workspace` doesn't exist yet the first time this runs --
+        # _build_menu() (which wires history_state_changed to this and
+        # calls it once immediately) runs before _build_central() creates
+        # it -- hence the getattr guard.
+        workspace = getattr(self, "script_workspace", None)
+        editor = workspace.focused_editor() if workspace is not None else None
+        if editor is not None:
+            self.undo_action.setEnabled(editor.document().isUndoAvailable())
+            self.undo_action.setText("Undo Typing")
+            self.redo_action.setEnabled(editor.document().isRedoAvailable())
+            self.redo_action.setText("Redo Typing")
+            return
+
         state = self.bridge.history_state()
         can_undo = bool(state.get("can_undo"))
         can_redo = bool(state.get("can_redo"))
@@ -3555,6 +3679,56 @@ class StudioMainWindow(QMainWindow):
         self.undo_action.setText(f"Undo {undo_text}" if undo_text else "Undo")
         self.redo_action.setEnabled(can_redo)
         self.redo_action.setText(f"Redo {redo_text}" if redo_text else "Redo")
+
+    def _on_undo_triggered(self) -> None:
+        editor = self.script_workspace.focused_editor()
+        if editor is not None:
+            editor.undo()
+            return
+        self.bridge.undo()
+
+    def _on_redo_triggered(self) -> None:
+        editor = self.script_workspace.focused_editor()
+        if editor is not None:
+            editor.redo()
+            return
+        self.bridge.redo()
+
+    def _on_save_triggered(self) -> None:
+        doc = self.script_workspace.focused_document()
+        if doc is not None:
+            doc.save()
+            return
+        self.save_scene()
+
+    def _save_all_scripts(self) -> None:
+        count = self.script_workspace.save_all()
+        if count:
+            self.bridge.log("info", f"Saved {count} Script(s).")
+
+    def _handle_play_guard(self) -> bool:
+        """Runs before EVERY Play (see EngineBridge.play()/set_play_guard)
+        -- the single choke point every Play trigger already shares, so
+        this needs no changes at any individual Ribbon button/menu
+        action/console-command call site."""
+        if not self.script_workspace.has_dirty_documents():
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("Unsaved Script Changes")
+        box.setText("Some open Scripts have unsaved changes.")
+        save_play_button = box.addButton("Save All and Play", QMessageBox.ButtonRole.AcceptRole)
+        play_saved_button = box.addButton("Play Saved Version", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(save_play_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is save_play_button:
+            self.script_workspace.save_all()
+            return True
+        if clicked is play_saved_button:
+            self.bridge.log("info", "Playing the last saved Source; open Script tabs remain unsaved.")
+            return True
+        return False
 
     def _update_title(self, *_args) -> None:
         name = self.current_file.name if self.current_file else "Untitled Scene"
@@ -3658,6 +3832,9 @@ class StudioMainWindow(QMainWindow):
         self.shutdown_callback = callback
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if not self.script_workspace.prompt_save_all_before_closing():
+            event.ignore()
+            return
         if not self.maybe_save():
             event.ignore()
             return
