@@ -1,0 +1,194 @@
+{
+  "format": "nebula-scene",
+  "version": 2,
+  "objects": [
+    {
+      "id": "a1",
+      "class_name": "Part",
+      "name": "Baseplate",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          -0.5,
+          0
+        ],
+        "Size": [
+          128,
+          1,
+          128
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          163,
+          163,
+          166
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "a2",
+      "class_name": "SpawnPoint",
+      "name": "SpawnLocation",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          3,
+          0
+        ],
+        "Size": [
+          6.0,
+          0.4,
+          6.0
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          0,
+          200,
+          90
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.25,
+        "Anchored": true,
+        "CanCollide": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "a3",
+      "class_name": "Part",
+      "name": "Block",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          10,
+          3,
+          5
+        ],
+        "Size": [
+          4,
+          4,
+          4
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          150,
+          150,
+          200
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "a4",
+      "class_name": "Part",
+      "name": "Block",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          -10,
+          3,
+          -5
+        ],
+        "Size": [
+          4,
+          4,
+          4
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          150,
+          200,
+          150
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "a5",
+      "class_name": "Part",
+      "name": "Ramp",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          2,
+          15
+        ],
+        "Size": [
+          8,
+          1,
+          10
+        ],
+        "Rotation": [
+          15,
+          0,
+          0
+        ],
+        "Color": [
+          200,
+          180,
+          150
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "a6",
+      "class_name": "Script",
+      "name": "ExampleScript",
+      "parent_id": "Workspace",
+      "properties": {
+        "Source": "-- Starter Script (disabled by default)\n-- Enable this Script to run it. Placed under Workspace rather than\n-- ServerScriptService: only Scripts reachable from Workspace are\n-- currently executed by the Lua runtime.\nprint(\"Hello from the Starter Scene!\")\n",
+        "RunContext": "Server"
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": false
+    }
+  ]
+}

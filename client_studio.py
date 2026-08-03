@@ -12,8 +12,9 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 from panda3d.core import Filename, Quat, TransparencyAttrib
 from ursina import (
@@ -41,7 +42,7 @@ from websockets.exceptions import ConnectionClosed
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt
 from PySide6.QtGui import QCursor, QWindow
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
 from studio_editor_live import (
     DARK_STYLE,
@@ -53,6 +54,8 @@ from studio_editor_live import (
 import editor_history
 import lua_runtime
 import physics
+import place_manager
+import sstudio_templates
 from shared import object_registry, protocol
 from shared.instance import DEFAULT_PART_PROPERTIES, MIN_PART_SIZE
 from shared.object_registry import ROOT_SERVICES
@@ -1213,6 +1216,14 @@ class MultiplayerGame(Entity):
         self.selected_part_id: str | None = None
         self.selection_highlight: Entity | None = None
         self.studio_adapter: MultiplayerStudioAdapter | None = None
+
+        # Stage 3.2: REPLACE_WORLD is fire-and-forget over the websocket;
+        # the eventual REPLACE_WORLD_RESULT is correlated back to its
+        # caller purely by request_id, since nothing else about this
+        # exchange is otherwise distinguishable from any other confirmed/
+        # rejected message pair already flowing through process_network_
+        # messages().
+        self._pending_replace_world: dict[str, Callable[[bool, str], None]] = {}
 
         self.studio_playing = False
         self.editor_look_active = False
@@ -2989,6 +3000,26 @@ class MultiplayerGame(Entity):
         self.network.send({"type": protocol.DELETE_PART, "id": instance_id})
         return True
 
+    def request_replace_world(
+        self, objects: list[dict[str, Any]], on_result: Callable[[bool, str], None],
+    ) -> str:
+        """Stage 3.2: Create Place from template / Open Place. One atomic
+        REPLACE_WORLD request; on_result(success, message) fires once the
+        matching REPLACE_WORLD_RESULT arrives (see process_network_
+        messages) -- never called synchronously, since the request has not
+        even been sent yet when this method returns."""
+        request_id = uuid.uuid4().hex
+        if not self.network.connected_event.is_set():
+            on_result(False, "Not connected to a server.")
+            return request_id
+        self._pending_replace_world[request_id] = on_result
+        self.network.send({
+            "type": protocol.REPLACE_WORLD,
+            "request_id": request_id,
+            "objects": objects,
+        })
+        return request_id
+
     def request_set_parent(self, instance_id: str, parent_id: str) -> bool:
         if not self.network.connected_event.is_set():
             if self.studio_adapter is not None:
@@ -3296,6 +3327,13 @@ class MultiplayerGame(Entity):
                 self.apply_model_transformed(message)
             elif message_type == protocol.TRANSFORM_MODEL_REJECTED:
                 self.apply_model_transform_rejected(message)
+            elif message_type == protocol.REPLACE_WORLD_RESULT:
+                request_id = str(message.get("request_id", ""))
+                callback = self._pending_replace_world.pop(request_id, None)
+                if callback is not None:
+                    success = bool(message.get("success", False))
+                    result_message = str(message.get("message", ""))
+                    callback(success, result_message)
 
     # Как долго держать группу под защитой в ожидании финального echo,
     # прежде чем считать соединение зависшим и снять защиту принудительно
@@ -3334,11 +3372,16 @@ class MultiplayerGame(Entity):
         model_id: str,
         pivot: Any,
         descendants: Any,
+        *,
+        confirmed: bool = True,
     ) -> None:
         """Shared by the MODEL_TRANSFORMED happy path and the corrective
         'current' snapshot attached to TRANSFORM_MODEL_REJECTED — same
         application logic either way, so a rejection can self-heal the
-        local preview through the exact same code as a normal echo."""
+        local preview through the exact same code as a normal echo.
+        confirmed=False (the rejection path) must NOT dirty the Place --
+        it is re-syncing to the ALREADY-authoritative state, not applying
+        a new one."""
         if isinstance(pivot, dict):
             model_record = self.instances.get(model_id)
             if model_record is not None:
@@ -3369,6 +3412,8 @@ class MultiplayerGame(Entity):
             self._update_model_selection_highlight(model_id)
         if self.studio_adapter is not None:
             self.studio_adapter.sync_full_scene()
+            if confirmed:
+                self.studio_adapter.mark_place_dirty()
 
     def apply_model_transformed(self, message: dict[str, Any]) -> None:
         """Receives an atomic MODEL_TRANSFORMED batch (our own confirmed
@@ -3419,7 +3464,9 @@ class MultiplayerGame(Entity):
 
         current = message.get("current")
         if isinstance(current, dict):
-            self._apply_model_transform_payload(model_id, current.get("pivot"), current.get("descendants"))
+            self._apply_model_transform_payload(
+                model_id, current.get("pivot"), current.get("descendants"), confirmed=False,
+            )
 
         still_dragging = (
             self.gizmo.dragging
@@ -3440,13 +3487,23 @@ class MultiplayerGame(Entity):
                 self._model_drag_suppressed_ids = set()
 
     def load_world_snapshot(self, parts: list[dict[str, Any]]) -> None:
-        incoming_ids = {str(item.get("id", "")) for item in parts if isinstance(item, dict)}
-        for stale_id in list(self.instances):
-            if stale_id not in incoming_ids:
-                self.remove_instance(stale_id)
-        for part_data in parts:
-            if isinstance(part_data, dict):
-                self.spawn_instance(part_data)
+        # Stage 3.2: spawn_instance()/remove_instance() below call
+        # on_instance_created/updated/deleted per object, which would
+        # otherwise mark a just-created/just-opened Place dirty from its
+        # own load -- see MultiplayerStudioAdapter.begin_snapshot_reload.
+        if self.studio_adapter is not None:
+            self.studio_adapter.begin_snapshot_reload()
+        try:
+            incoming_ids = {str(item.get("id", "")) for item in parts if isinstance(item, dict)}
+            for stale_id in list(self.instances):
+                if stale_id not in incoming_ids:
+                    self.remove_instance(stale_id)
+            for part_data in parts:
+                if isinstance(part_data, dict):
+                    self.spawn_instance(part_data)
+        finally:
+            if self.studio_adapter is not None:
+                self.studio_adapter.end_snapshot_reload()
         # A WORLD_SNAPSHOT is a brand-new authoritative world (initial
         # connect, or a reconnect) -- every stored instance id/parent/
         # property reference an Undo/Redo command might hold could now be
@@ -3814,6 +3871,61 @@ class MultiplayerStudioAdapter:
         self.game = game
         self.bridge: EngineBridge | None = None
         self.pending_create_count = 0
+        # Stage 3.2: set once by main()/StudioMainWindow's Place workflow.
+        # Optional by design -- an adapter with no PlaceManager attached
+        # (e.g. any headless test that builds one directly) simply never
+        # marks anything dirty, exactly like before this stage existed.
+        self.place_manager: Any = None
+        # spawn_instance()/remove_instance() call on_instance_created/
+        # updated/deleted for EVERY object during a mass WORLD_SNAPSHOT
+        # reload (initial connect, or a Stage 3.2 REPLACE_WORLD success) --
+        # without this guard a just-created/just-opened Place would look
+        # dirty from its own load. See MultiplayerGame.load_world_snapshot.
+        self._suppressing_dirty = False
+
+    def set_place_manager(self, place_manager: Any) -> None:
+        self.place_manager = place_manager
+
+    def begin_snapshot_reload(self) -> None:
+        self._suppressing_dirty = True
+
+    def end_snapshot_reload(self) -> None:
+        self._suppressing_dirty = False
+
+    def mark_place_dirty(self) -> None:
+        if self._suppressing_dirty:
+            return
+        if self.place_manager is not None:
+            self.place_manager.mark_authoritative_edit()
+
+    def replace_world(
+        self, objects: list[dict[str, Any]], on_result: Callable[[bool, str], None],
+    ) -> bool:
+        self.game.request_replace_world(objects, on_result)
+        return True
+
+    def export_world(self) -> list[dict[str, Any]]:
+        """Stage 3.2 Save Place: the client's `game.instances` mirror is
+        already kept in lockstep with the server through every existing
+        confirmed round-trip, so Save needs no network request of its own
+        -- just read out what is already authoritative. InstanceRecord
+        does not mirror tags/attributes (nothing in the live UI ever reads
+        them), so Places saved from here always carry empty tags/
+        attributes; this matches how the client already treats them
+        everywhere else, not a new limitation."""
+        return [
+            {
+                "id": record.id,
+                "class_name": record.class_name,
+                "name": record.name,
+                "parent_id": record.parent_id,
+                "properties": dict(record.properties),
+                "tags": [],
+                "attributes": {},
+                "enabled": record.enabled,
+            }
+            for record in self.game.instances.values()
+        ]
 
     def attach_bridge(self, bridge: EngineBridge) -> None:
         self.bridge = bridge
@@ -4034,6 +4146,12 @@ class MultiplayerStudioAdapter:
     def on_instance_created(self, record: "InstanceRecord") -> None:
         if self.bridge is None:
             return
+        # mark_place_dirty() must run BEFORE sync_upsert(): sync_upsert()
+        # synchronously emits scene_changed, which StudioMainWindow._update_
+        # title() reads place_manager.is_dirty from -- calling it after
+        # would leave the title one edit stale until some unrelated later
+        # event happened to refresh it.
+        self.mark_place_dirty()
         self.bridge.sync_upsert(self.instance_to_scene_object(record))
         self.log("info", f'Created {record.class_name} "{record.name}"')
         if self.pending_create_count > 0:
@@ -4043,6 +4161,7 @@ class MultiplayerStudioAdapter:
 
     def on_instance_updated(self, record: "InstanceRecord") -> None:
         if self.bridge is not None:
+            self.mark_place_dirty()
             self.bridge.sync_upsert(self.instance_to_scene_object(record))
 
     _LIVE_TRANSFORM_FIELDS = {"Position": "position", "Rotation": "rotation", "Size": "size"}
@@ -4071,6 +4190,7 @@ class MultiplayerStudioAdapter:
 
     def on_instance_deleted(self, instance_id: str) -> None:
         if self.bridge is not None:
+            self.mark_place_dirty()
             self.bridge.sync_delete(instance_id)
 
     def on_game_selection_changed(self, part_id: str | None) -> None:
@@ -4420,6 +4540,11 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Не встраивать окно Ursina внутрь Studio (режим диагностики)",
     )
+    parser.add_argument(
+        "--place",
+        default=None,
+        help="Открыть указанный файл Place сразу при запуске, минуя стартовую страницу шаблонов",
+    )
     return parser.parse_args()
 
 
@@ -4472,6 +4597,52 @@ def _print_startup_diagnostics() -> None:
     import transform_gizmo as _tg
     print(f"[STARTUP] transform_gizmo module: {Path(_tg.__file__).resolve()}")
     print(f"[STARTUP] transform_gizmo.DEBUG_SCALE_GIZMO = {_tg.DEBUG_SCALE_GIZMO}")
+
+
+def _on_template_activated(studio: StudioMainWindow, spec: sstudio_templates.TemplateSpec) -> None:
+    """install_template_browser()'s on_template callback (Stage 3.2). Called
+    with the TemplateSpec itself -- see _invoke_template_callback's
+    flexible-arity dispatch in sstudio_templates.py, which passes the spec
+    object here because this callback's sole parameter is named 'spec'."""
+    if not studio.bridge.live_mode:
+        studio.bridge.log("warning", "Templates require a live server connection.")
+        return
+    dialog = place_manager.PlaceCreateDialog(spec.name, studio.place_manager.projects_root, parent=studio)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return
+    result = studio.place_manager.create_from_template(
+        spec.template_id, dialog.result_name(), dialog.result_directory()
+    )
+    if not result.success:
+        QMessageBox.critical(studio, "Create Place Failed", result.message)
+        return
+    if studio.templates_binding is not None:
+        studio.templates_binding.show_editor()
+    studio._replace_world_and_report(result)
+
+
+def _show_recent_places_dialog(studio: StudioMainWindow) -> None:
+    dialog = place_manager.RecentPlacesDialog(studio.place_manager.recents, parent=studio)
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        path = dialog.chosen_path()
+        if path:
+            studio.open_recent_place(path)
+
+
+def _on_navigation_requested(studio: StudioMainWindow, section: str) -> None:
+    """install_template_browser()'s on_navigation callback (Stage 3.2). The
+    attached Sidebar has no built-in destination for Recent/Projects/
+    Archive -- wire each to the closest real behavior rather than leaving
+    a click that silently does nothing (spec section 19)."""
+    binding = studio.templates_binding
+    if section == "recent":
+        _show_recent_places_dialog(studio)
+    elif section == "projects":
+        studio._place_open()
+    elif section == "archive":
+        studio.bridge.log("info", "Archive is not implemented in this stage.")
+    elif section == "home" and binding is not None:
+        binding.show()
 
 
 def main() -> int:
@@ -4537,6 +4708,7 @@ def main() -> int:
     studio = StudioMainWindow(bridge=bridge)
     studio.setWindowTitle("Live Server — Pick A Door Studio")
     studio.viewport_frame.scene_title.setText("Live Server")
+    adapter.set_place_manager(studio.place_manager)
 
     embedded = False
     if not arguments.no_embed:
@@ -4552,6 +4724,60 @@ def main() -> int:
             application.base.win.requestProperties(window)
         except Exception:
             pass
+
+    # Stage 3.2: install the template browser AFTER embed_panda_window() so
+    # the native viewport reparenting above (which only ever touches
+    # ViewportFrame's own internal QStackedWidget, see _build_central's
+    # comment) is fully settled before install_template_browser() wraps
+    # StudioMainWindow's plain central widget in an outer QStackedWidget.
+    # With no --place given it shows on top immediately (show_immediately
+    # defaults True); with --place it stays behind the already-visible
+    # editor (QStackedWidget defaults to showing the first-added widget,
+    # i.e. the original editor, when show() is never called).
+    # Connected directly to the page's own signals below rather than via
+    # install_template_browser()'s on_template=/on_navigation= (which route
+    # through a short-lived _EditorAdapter instance that install_template_
+    # browser() does not return or keep any reference to -- once this call
+    # returns, nothing keeps that adapter alive, and its bound-method slots
+    # stop firing). Connecting straight to `page`'s signals ties the
+    # lifetime of these callbacks to `page` itself, which the returned
+    # TemplateBrowserBinding (and the QStackedWidget it lives in) keeps
+    # alive for as long as the window exists.
+    templates_binding = sstudio_templates.install_template_browser(
+        studio,
+        show_immediately=not arguments.place,
+    )
+    templates_binding.page.template_activated_spec.connect(
+        lambda spec: _on_template_activated(studio, spec)
+    )
+    templates_binding.page.navigation_requested.connect(
+        lambda section: _on_navigation_requested(studio, section)
+    )
+    studio.set_templates_binding(templates_binding)
+
+    if arguments.place:
+        # request_replace_world() requires an established websocket
+        # connection, which is still in progress at this point in main()
+        # (MultiplayerGame connects on its background asyncio thread) --
+        # poll until connected_event is set, then run the normal Open
+        # Place path exactly once (adds to Recents on success, same as
+        # File > Open Place).
+        deferred_place_path = Path(arguments.place)
+        deferred_state = {"done": False}
+        deferred_timer = QTimer()
+        deferred_timer.setInterval(100)
+
+        def _try_open_deferred_place() -> None:
+            if deferred_state["done"]:
+                return
+            if not game.network.connected_event.is_set():
+                return
+            deferred_state["done"] = True
+            deferred_timer.stop()
+            studio._open_place_path(deferred_place_path)
+
+        deferred_timer.timeout.connect(_try_open_deferred_place)
+        deferred_timer.start()
 
     panda_timer = QTimer()
     panda_timer.setTimerType(Qt.TimerType.PreciseTimer)

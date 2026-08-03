@@ -106,6 +106,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import place_manager
 import script_editor
 from shared import object_registry, transform_math
 from shared.object_registry import ObjectTypeDefinition, ROOT_SERVICES
@@ -1000,6 +1001,28 @@ class EngineBridge(QObject):
 
         self.replace_scene(objects, mark_dirty=False)
         self.log("info", f"Scene loaded: {source.name}")
+
+    def replace_world(self, objects: list[dict[str, Any]], on_result: Callable[[bool, str], None]) -> bool:
+        """Stage 3.2: Create Place from template / Open Place. Instance-
+        shaped (id/class_name/name/parent_id/properties/tags/attributes/
+        enabled) objects, NOT SceneObject-shaped -- distinct from load_
+        from_file()/save_to_file() above, which remain untouched for the
+        offline (non-live) demo path. on_result fires asynchronously once
+        the server's REPLACE_WORLD_RESULT arrives; this method itself
+        never blocks and never mutates local state -- see PlaceManager
+        for the file-side half of this operation."""
+        if not self.live_mode:
+            on_result(False, "Place file operations require a live server connection.")
+            return False
+        return bool(self._adapter_call("replace_world", objects, on_result, default=False))
+
+    def export_world(self) -> list[dict[str, Any]]:
+        """Stage 3.2 Save Place: Instance-shaped snapshot of whatever is
+        currently authoritative. Empty in non-live mode -- Save Place is
+        not offered there; the offline demo keeps using save_to_file()."""
+        if not self.live_mode:
+            return []
+        return list(self._adapter_call("export_world", default=[]))
 
 # ---------------------------------------------------------------------------
 # Icon factory
@@ -3363,8 +3386,17 @@ class StudioMainWindow(QMainWindow):
         super().__init__()
         self.bridge = bridge or EngineBridge()
         self.shutdown_callback: Any = None
-        self.current_file: Optional[Path] = None
+        self.current_file: Optional[Path] = None  # offline (non-live) demo path only -- see save_scene/open_scene
         self.settings = QSettings(ORG_NAME, APP_NAME)
+        # Stage 3.2: PlaceManager is plain data (no Qt/engine refs on it,
+        # see its own docstring) -- always constructed, but its create/
+        # open/save methods are only exercised for a live bridge. Set
+        # externally via set_templates_binding() once client_studio.py's
+        # main() has wired install_template_browser() -- optional, so a
+        # StudioMainWindow built standalone/headless (tests, the offline
+        # demo) never crashes, it just has no Start Page to return to.
+        self.place_manager = place_manager.PlaceManager()
+        self.templates_binding: Optional[Any] = None
 
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(1180, 720)
@@ -3380,6 +3412,14 @@ class StudioMainWindow(QMainWindow):
         self._build_shortcuts()
 
         self.bridge.dirty_changed.connect(self._update_title)
+        # Stage 3.2: place_manager.is_dirty has no Qt signal of its own
+        # (PlaceManager is plain data, see its docstring) -- scene_changed
+        # already fires synchronously right alongside every
+        # mark_authoritative_edit() call (both happen in the same
+        # on_instance_created/updated/deleted/model-transform methods, see
+        # client_studio.py), so reusing it here keeps the title in sync
+        # without a second signal plumbed all the way from there.
+        self.bridge.scene_changed.connect(self._update_title)
         self.bridge.selection_changed.connect(self._selection_status)
         self.bridge.play_state_changed.connect(self._play_status)
         self.bridge.set_play_guard(self._handle_play_guard)
@@ -3399,26 +3439,30 @@ class StudioMainWindow(QMainWindow):
         menu = self.menuBar()
 
         file_menu = menu.addMenu("&File")
-        new_action = QAction("New Scene", self)
+        new_action = QAction("New Place", self)
         new_action.setShortcut(QKeySequence.StandardKey.New)
-        new_action.triggered.connect(self.new_scene)
-        open_action = QAction("Open Scene…", self)
+        new_action.triggered.connect(self._place_new)
+        open_action = QAction("Open Place…", self)
         open_action.setShortcut(QKeySequence.StandardKey.Open)
-        open_action.triggered.connect(self.open_scene)
-        save_action = QAction("Save", self)
+        open_action.triggered.connect(self._place_open)
+        save_action = QAction("Save Place", self)
         save_action.setShortcut(QKeySequence.StandardKey.Save)
         save_action.triggered.connect(self._on_save_triggered)
-        save_as_action = QAction("Save As…", self)
+        save_as_action = QAction("Save Place As…", self)
         save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
-        save_as_action.triggered.connect(self.save_scene_as)
+        save_as_action.triggered.connect(self._place_save_as)
         save_all_action = QAction("Save All", self)
-        save_all_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        save_all_action.setShortcut(QKeySequence("Ctrl+Alt+S"))
         save_all_action.triggered.connect(self._save_all_scripts)
+        return_to_start_action = QAction("Return to Start Page", self)
+        return_to_start_action.triggered.connect(self._return_to_start_page)
         exit_action = QAction("Exit", self)
         exit_action.setShortcut(QKeySequence.StandardKey.Quit)
         exit_action.triggered.connect(self.close)
 
         file_menu.addActions([new_action, open_action, save_action, save_as_action, save_all_action])
+        file_menu.addSeparator()
+        file_menu.addAction(return_to_start_action)
         file_menu.addSeparator()
         file_menu.addAction(exit_action)
 
@@ -3695,16 +3739,23 @@ class StudioMainWindow(QMainWindow):
         self.bridge.redo()
 
     def _on_save_triggered(self) -> None:
+        # Stage 3.1 behavior preserved exactly: code focused and dirty ->
+        # save Source. Stage 3.2 only changes the "otherwise" branch, from
+        # the old SceneObject scene file to Save Place.
         doc = self.script_workspace.focused_document()
         if doc is not None:
             doc.save()
             return
-        self.save_scene()
+        self._place_save()
 
     def _save_all_scripts(self) -> None:
+        # Stage 3.2 spec section 12: Save All = every dirty Source
+        # document, THEN the current Place -- in that order, so the Place
+        # save captures Source exactly as it was just written.
         count = self.script_workspace.save_all()
         if count:
             self.bridge.log("info", f"Saved {count} Script(s).")
+        self._place_save()
 
     def _handle_play_guard(self) -> bool:
         """Runs before EVERY Play (see EngineBridge.play()/set_play_guard)
@@ -3731,12 +3782,18 @@ class StudioMainWindow(QMainWindow):
         return False
 
     def _update_title(self, *_args) -> None:
-        name = self.current_file.name if self.current_file else "Untitled Scene"
-        dirty = " *" if self.bridge.is_dirty else ""
+        if self.bridge.live_mode:
+            name = self.place_manager.display_name
+            dirty = " *" if self.place_manager.is_dirty else ""
+        else:
+            name = self.current_file.name if self.current_file else "Untitled Scene"
+            dirty = " *" if self.bridge.is_dirty else ""
         self.setWindowTitle(f"{name}{dirty} — {APP_NAME}")
         self.viewport_frame.scene_title.setText(name + dirty)
 
     def maybe_save(self) -> bool:
+        """Offline (non-live) demo path only -- see _resolve_dirty_before_
+        place_change() for the live Place-based equivalent."""
         if not self.bridge.is_dirty:
             return True
         result = QMessageBox.question(
@@ -3754,26 +3811,151 @@ class StudioMainWindow(QMainWindow):
             return False
         return True
 
-    def new_scene(self) -> None:
-        if not self.maybe_save():
-            return
-        self.bridge.new_scene()
-        self.current_file = None
-        self._update_title()
+    # ---------------- Stage 3.2: Place workflow (live mode) ----------------
 
-    def open_scene(self) -> None:
-        if not self.maybe_save():
+    def _resolve_dirty_before_place_change(self) -> bool:
+        """Spec section 11: Script buffers first, then the current Place,
+        before New/Open/world-replace/Return-to-Start-Page. Returns False
+        only on an explicit Cancel -- caller must abort and leave
+        everything exactly as it was."""
+        if not self.script_workspace.prompt_save_all_before_closing():
+            return False
+        if not self.bridge.live_mode:
+            return self.maybe_save()
+        if not self.place_manager.is_dirty:
+            return True
+        result = QMessageBox.question(
+            self,
+            "Unsaved Place",
+            f"'{self.place_manager.display_name}' has unsaved changes. Save before continuing?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if result == QMessageBox.StandardButton.Cancel:
+            return False
+        if result == QMessageBox.StandardButton.Save:
+            return self._place_save()
+        return True
+
+    def _reject_while_playing(self, action_description: str) -> bool:
+        """Spec section 22: New/Open/Save As/world replacement/Return to
+        Start Page are all rejected outright while Play is active, rather
+        than silently stopping it out from under the running Lua session.
+        Returns True if the action was rejected (caller should abort)."""
+        if not self.bridge.is_playing:
+            return False
+        QMessageBox.information(
+            self, "Play in Progress", f"Stop the current Play session before {action_description}.",
+        )
+        return True
+
+    def _place_new(self) -> None:
+        if self._reject_while_playing("starting a new Place"):
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open Scene", "", SCENE_FILE_FILTER)
+        if self.templates_binding is None:
+            self.bridge.log("warning", "Template browser is not available.")
+            return
+        if not self._resolve_dirty_before_place_change():
+            return
+        self.templates_binding.show()
+
+    def _return_to_start_page(self) -> None:
+        if self._reject_while_playing("returning to the Start Page"):
+            return
+        if self.templates_binding is None:
+            self.bridge.log("warning", "Template browser is not available.")
+            return
+        if not self._resolve_dirty_before_place_change():
+            return
+        self.templates_binding.show()
+
+    def _place_open(self) -> None:
+        if self._reject_while_playing("opening another Place"):
+            return
+        if not self.bridge.live_mode:
+            self.open_scene()
+            return
+        if not self._resolve_dirty_before_place_change():
+            return
+        start_dir = str(self.place_manager.current_project_dir or self.place_manager.projects_root)
+        path, _ = QFileDialog.getOpenFileName(self, "Open Place", start_dir, SCENE_FILE_FILTER)
         if not path:
             return
-        try:
-            self.bridge.load_from_file(path)
-            self.current_file = Path(path)
-            self._update_title()
-        except Exception as exc:
-            QMessageBox.critical(self, "Open failed", str(exc))
-            self.bridge.log("error", f"Open failed: {exc}")
+        self._open_place_path(Path(path))
+
+    def open_recent_place(self, path: str | Path) -> None:
+        """Entry point for a Recents list item -- same validation/replace
+        flow as File > Open Place, just skipping the file dialog."""
+        if self._reject_while_playing("opening another Place"):
+            return
+        if not self._resolve_dirty_before_place_change():
+            return
+        self._open_place_path(Path(path))
+
+    def _open_place_path(self, path: Path) -> None:
+        result = self.place_manager.open(path)
+        if not result.success:
+            QMessageBox.critical(self, "Open Place Failed", result.message)
+            self.bridge.log("error", result.message)
+            return
+        self._replace_world_and_report(result)
+
+    def _replace_world_and_report(self, result: place_manager.PlaceOperationResult) -> None:
+        """Sends the prepared (already-validated, already-fresh-id-
+        remapped-if-a-template) object list as one REPLACE_WORLD request.
+        place_manager.commit() -- which is what actually updates current_
+        path/display_name/resets dirty/records Recents -- runs ONLY inside
+        the success branch, never speculatively (spec section 8/17: a
+        rejected create/open leaves the current Place untouched)."""
+        def _on_result(success: bool, message: str) -> None:
+            if success:
+                self.place_manager.commit(result)
+                self._update_title()
+                self.bridge.log("info", result.message)
+            else:
+                QMessageBox.critical(
+                    self, "Place Operation Failed", message or "The server rejected the request.",
+                )
+                self.bridge.log("error", f"Place operation rejected: {message}")
+        accepted = self.bridge.replace_world(result.objects or [], _on_result)
+        if not accepted:
+            QMessageBox.critical(self, "Not Connected", "Not connected to a live server.")
+
+    def _place_save(self) -> bool:
+        if not self.bridge.live_mode:
+            return self.save_scene()
+        if self.place_manager.current_path is None:
+            return self._place_save_as()
+        objects = self.bridge.export_world()
+        result = self.place_manager.save(objects)
+        if not result.success:
+            QMessageBox.critical(self, "Save Failed", result.message)
+            self.bridge.log("error", result.message)
+            return False
+        self._update_title()
+        self.bridge.log("info", result.message)
+        return True
+
+    def _place_save_as(self) -> bool:
+        if not self.bridge.live_mode:
+            return self.save_scene_as()
+        default_path = self.place_manager.current_path or (self.place_manager.projects_root / "Untitled.nebula.json")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Place As", str(default_path), SCENE_FILE_FILTER)
+        if not path:
+            return False
+        if not path.lower().endswith(".json"):
+            path += ".nebula.json"
+        objects = self.bridge.export_world()
+        result = self.place_manager.save_as(path, objects)
+        if not result.success:
+            QMessageBox.critical(self, "Save Failed", result.message)
+            self.bridge.log("error", result.message)
+            return False
+        self._update_title()
+        self.bridge.log("info", result.message)
+        return True
 
     def save_scene(self) -> bool:
         if self.current_file is None:
@@ -3831,11 +4013,15 @@ class StudioMainWindow(QMainWindow):
     def set_shutdown_callback(self, callback: Any) -> None:
         self.shutdown_callback = callback
 
+    def set_templates_binding(self, binding: Any) -> None:
+        self.templates_binding = binding
+
     def closeEvent(self, event: QCloseEvent) -> None:
-        if not self.script_workspace.prompt_save_all_before_closing():
-            event.ignore()
-            return
-        if not self.maybe_save():
+        # _resolve_dirty_before_place_change() already resolves dirty
+        # Script tabs first, then the current Place (live) or scene file
+        # (offline) -- exactly the sequence spec section 11 requires
+        # before closing SStudio too.
+        if not self._resolve_dirty_before_place_change():
             event.ignore()
             return
         self.settings.setValue("geometry", self.saveGeometry())

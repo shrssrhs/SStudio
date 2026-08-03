@@ -265,6 +265,9 @@ async def handle_message(
     elif message_type == protocol.TRANSFORM_MODEL:
         await handle_transform_model(player_id, message)
 
+    elif message_type == protocol.REPLACE_WORLD:
+        await handle_replace_world(player_id, message)
+
 
 async def handle_create_part(
     player_id: str,
@@ -773,6 +776,184 @@ async def handle_transform_model(player_id: str, message: dict[str, Any]) -> Non
             "sequence": sequence,
         }
     )
+
+
+# ============================================================
+# Stage 3.2: REPLACE_WORLD (Create Place from template / Open Place)
+# ============================================================
+
+# Security policy (see Stage 3.2 spec §9): the server has no filesystem
+# access of its own to guard -- all Place file I/O happens client-side in
+# place_manager.py, on the local user's own machine. The one thing that
+# DOES need a guard is REPLACE_WORLD itself, since it is a generic
+# client->server message like any other and this protocol has no per-
+# connection auth/role concept at all today (any socket can already send
+# CREATE_PART unauthenticated). For this stage, REPLACE_WORLD is honored
+# only from a loopback connection -- "the current client is explicitly the
+# local host", one of the three explicitly acceptable policies in the spec.
+# A non-local connection gets a clean rejection, never a partial/silent one.
+_LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+MAX_REPLACE_WORLD_OBJECTS = 20000
+
+
+def _is_local_connection(player_id: str) -> bool:
+    websocket = clients.get(player_id)
+    if websocket is None:
+        return False
+    try:
+        host = websocket.remote_address[0]
+    except (TypeError, IndexError, AttributeError):
+        return False
+    return host in _LOCAL_HOSTS
+
+
+async def _send_replace_world_result(
+    player_id: str, request_id: str, success: bool, message: str,
+) -> None:
+    async with state_lock:
+        websocket = clients.get(player_id)
+    if websocket is not None:
+        await send_json(
+            websocket,
+            {
+                "type": protocol.REPLACE_WORLD_RESULT,
+                "request_id": request_id,
+                "success": success,
+                "message": message,
+            },
+        )
+
+
+def _sanitize_replace_world_object(raw: Any) -> Instance | None:
+    """Mirrors handle_create_part's own sanitization exactly -- a Place
+    file is untrusted input the same way a network message is, whether it
+    came from a template or a hand-edited/corrupted file on disk."""
+    if not isinstance(raw, dict):
+        return None
+
+    class_name = str(raw.get("class_name") or "")
+    definition = object_registry.get_object_type(class_name)
+    if definition is None:
+        return None
+
+    raw_properties = raw.get("properties", {})
+    if not isinstance(raw_properties, dict):
+        raw_properties = {}
+
+    if class_name in PART_LIKE_TYPES:
+        clean_properties = sanitize_part_properties(raw_properties)
+        base_defaults = DEFAULT_PART_PROPERTIES if class_name == "Part" else definition.default_properties
+    else:
+        clean_properties = object_registry.sanitize_properties_for_type(class_name, raw_properties)
+        base_defaults = definition.default_properties
+
+    properties = dict(base_defaults)
+    properties.update(clean_properties)
+
+    instance_id = str(raw.get("id") or "").strip()
+    if not instance_id:
+        return None
+
+    name = str(raw.get("name", "")).strip()[:32] or definition.display_name
+
+    raw_parent_id = raw.get("parent_id")
+    parent_id = str(raw_parent_id) if isinstance(raw_parent_id, str) and raw_parent_id else None
+
+    raw_tags = raw.get("tags", [])
+    tags = [str(t) for t in raw_tags if isinstance(t, str)][:32] if isinstance(raw_tags, list) else []
+    raw_attributes = raw.get("attributes", {})
+    attributes = dict(raw_attributes) if isinstance(raw_attributes, dict) else {}
+
+    return Instance(
+        id=instance_id,
+        class_name=class_name,
+        name=name,
+        parent_id=parent_id,
+        properties=properties,
+        tags=tags,
+        attributes=attributes,
+        enabled=bool(raw.get("enabled", True)),
+    )
+
+
+def _hierarchy_is_valid(instances: dict[str, Instance]) -> bool:
+    for instance in instances.values():
+        parent_key = instance.parent_id or "Workspace"
+        if parent_key not in object_registry.ROOT_SERVICES and parent_key not in instances:
+            return False
+        visited = {instance.id}
+        walker = parent_key
+        while walker in instances:
+            if walker in visited:
+                return False
+            visited.add(walker)
+            walker = instances[walker].parent_id or "Workspace"
+    return True
+
+
+async def handle_replace_world(player_id: str, message: dict[str, Any]) -> None:
+    """Create Place from template / Open Place: one atomic all-or-nothing
+    swap of the entire authoritative world. Never partially applied -- any
+    rejection leaves `world` completely untouched (see Stage 3.2 spec §8,
+    §17)."""
+    request_id = str(message.get("request_id") or "")
+
+    if not _is_local_connection(player_id):
+        logging.warning(
+            "Игрок %s (не localhost) запросил replace_world — отклонено", player_id,
+        )
+        await _send_replace_world_result(
+            player_id, request_id, False,
+            "Place file operations are only available from a local connection.",
+        )
+        return
+
+    raw_objects = message.get("objects")
+    if not request_id or not isinstance(raw_objects, list):
+        await _send_replace_world_result(player_id, request_id, False, "Malformed replace_world request.")
+        return
+
+    if len(raw_objects) > MAX_REPLACE_WORLD_OBJECTS:
+        await _send_replace_world_result(player_id, request_id, False, "Place is too large.")
+        return
+
+    new_world: dict[str, Instance] = {}
+    for raw in raw_objects:
+        instance = _sanitize_replace_world_object(raw)
+        if instance is None:
+            await _send_replace_world_result(
+                player_id, request_id, False, "Rejected: invalid or unrecognized object in Place data.",
+            )
+            return
+        if instance.id in new_world:
+            await _send_replace_world_result(
+                player_id, request_id, False, "Rejected: duplicate instance id in Place data.",
+            )
+            return
+        new_world[instance.id] = instance
+
+    if not _hierarchy_is_valid(new_world):
+        await _send_replace_world_result(
+            player_id, request_id, False, "Rejected: Place data has a missing or cyclic parent chain.",
+        )
+        return
+
+    async with state_lock:
+        world.clear()
+        world.update(new_world)
+        snapshot = serialize_world(world)
+
+    logging.info(
+        "Игрок %s заменил мир целиком (%d объектов)", player_id, len(new_world),
+    )
+
+    # Broadcast first (including to the requester) so the ordinary
+    # WORLD_SNAPSHOT handling -- which already clears history and rebuilds
+    # the scene, see Stage 3.2 baseline report question 6 -- has run by the
+    # time the requester's UI acts on the result below.
+    await broadcast_to_all({"type": protocol.WORLD_SNAPSHOT, "parts": snapshot})
+    await _send_replace_world_result(player_id, request_id, True, "World replaced.")
 
 
 async def client_handler(

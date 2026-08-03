@@ -1,0 +1,411 @@
+{
+  "format": "nebula-scene",
+  "version": 2,
+  "objects": [
+    {
+      "id": "ground",
+      "class_name": "Part",
+      "name": "Ground",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          -0.5,
+          0
+        ],
+        "Size": [
+          200,
+          1,
+          200
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          70,
+          74
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "roads_folder",
+      "class_name": "Folder",
+      "name": "Roads",
+      "parent_id": "Workspace",
+      "properties": {},
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "road_ns",
+      "class_name": "Part",
+      "name": "Road_NS",
+      "parent_id": "roads_folder",
+      "properties": {
+        "Position": [
+          0,
+          0.05,
+          0
+        ],
+        "Size": [
+          14,
+          0.1,
+          200
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          90,
+          90,
+          86
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "road_ew",
+      "class_name": "Part",
+      "name": "Road_EW",
+      "parent_id": "roads_folder",
+      "properties": {
+        "Position": [
+          0,
+          0.05,
+          0
+        ],
+        "Size": [
+          200,
+          0.1,
+          14
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          90,
+          90,
+          86
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "sidewalk_ns_a",
+      "class_name": "Part",
+      "name": "Sidewalk_NS_A",
+      "parent_id": "roads_folder",
+      "properties": {
+        "Position": [
+          -9,
+          0.08,
+          0
+        ],
+        "Size": [
+          2,
+          0.05,
+          200
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          180,
+          180,
+          175
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "sidewalk_ns_b",
+      "class_name": "Part",
+      "name": "Sidewalk_NS_B",
+      "parent_id": "roads_folder",
+      "properties": {
+        "Position": [
+          9,
+          0.08,
+          0
+        ],
+        "Size": [
+          2,
+          0.05,
+          200
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          180,
+          180,
+          175
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "buildings_folder",
+      "class_name": "Folder",
+      "name": "Buildings",
+      "parent_id": "Workspace",
+      "properties": {},
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "building_1",
+      "class_name": "Part",
+      "name": "Building1",
+      "parent_id": "buildings_folder",
+      "properties": {
+        "Position": [
+          -40,
+          7.0,
+          -40
+        ],
+        "Size": [
+          16,
+          14,
+          16
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          140,
+          130,
+          120
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "building_2",
+      "class_name": "Part",
+      "name": "Building2",
+      "parent_id": "buildings_folder",
+      "properties": {
+        "Position": [
+          -40,
+          10.0,
+          40
+        ],
+        "Size": [
+          16,
+          20,
+          16
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          120,
+          140,
+          150
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "building_3",
+      "class_name": "Part",
+      "name": "Building3",
+      "parent_id": "buildings_folder",
+      "properties": {
+        "Position": [
+          40,
+          13.0,
+          -40
+        ],
+        "Size": [
+          16,
+          26,
+          16
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          160,
+          140,
+          130
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "building_4",
+      "class_name": "Part",
+      "name": "Building4",
+      "parent_id": "buildings_folder",
+      "properties": {
+        "Position": [
+          40,
+          8.0,
+          40
+        ],
+        "Size": [
+          16,
+          16,
+          16
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          150,
+          150,
+          160
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "building_5",
+      "class_name": "Part",
+      "name": "Building5",
+      "parent_id": "buildings_folder",
+      "properties": {
+        "Position": [
+          -70,
+          15.0,
+          0
+        ],
+        "Size": [
+          16,
+          30,
+          16
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          140,
+          130,
+          120
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "building_6",
+      "class_name": "Part",
+      "name": "Building6",
+      "parent_id": "buildings_folder",
+      "properties": {
+        "Position": [
+          70,
+          11.0,
+          0
+        ],
+        "Size": [
+          16,
+          22,
+          16
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          120,
+          140,
+          150
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    }
+  ]
+}

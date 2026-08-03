@@ -41,3 +41,18 @@ SET_PARENT_REJECTED = "set_parent_rejected"   # сервер -> только з�
 TRANSFORM_MODEL = "transform_model"           # клиент -> сервер: пивот + дельты потомков
 MODEL_TRANSFORMED = "model_transformed"       # сервер -> все клиенты: атомарный батч
 TRANSFORM_MODEL_REJECTED = "transform_model_rejected"  # сервер -> только запросившему клиенту
+
+# Stage 3.2: замена всего мира целиком (Create-from-template / Open Place).
+# Один explicit atomic-replace вместо сотен create_part/update_property —
+# см. Stage 3.2 spec §8. Клиент уже полностью санитизирует и ремаппит id
+# локально (place_manager.py) до отправки; сервер повторно санитизирует
+# каждый Instance той же схемой, что использует CREATE_PART/UPDATE_PROPERTY
+# (доверяй, но проверяй), и либо целиком принимает батч, либо целиком
+# отклоняет — никогда частичной заменой. Успех рассылается как обычный
+# WORLD_SNAPSHOT всем клиентам (существующий обработчик уже корректно
+# чистит историю и перестраивает сцену — см. Stage 3.2 отчёт, вопрос 6);
+# REPLACE_WORLD_RESULT идёт только запросившему клиенту, чтобы он знал,
+# применять ли путь/заголовок Place или показать ошибку, не трогая
+# текущее состояние.
+REPLACE_WORLD = "replace_world"                       # клиент -> сервер
+REPLACE_WORLD_RESULT = "replace_world_result"         # сервер -> только запросившему клиенту

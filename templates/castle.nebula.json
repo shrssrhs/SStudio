@@ -1,0 +1,516 @@
+{
+  "format": "nebula-scene",
+  "version": 2,
+  "objects": [
+    {
+      "id": "ground",
+      "class_name": "Part",
+      "name": "Ground",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          -0.5,
+          0
+        ],
+        "Size": [
+          140,
+          1,
+          140
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          92,
+          145,
+          88
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_folder",
+      "class_name": "Folder",
+      "name": "Walls",
+      "parent_id": "Workspace",
+      "properties": {},
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_north_west",
+      "class_name": "Part",
+      "name": "Wall_North_West",
+      "parent_id": "wall_folder",
+      "properties": {
+        "Position": [
+          -17.5,
+          6.0,
+          -30.0
+        ],
+        "Size": [
+          25.0,
+          12,
+          3
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          128,
+          128,
+          122
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_north_east",
+      "class_name": "Part",
+      "name": "Wall_North_East",
+      "parent_id": "wall_folder",
+      "properties": {
+        "Position": [
+          17.5,
+          6.0,
+          -30.0
+        ],
+        "Size": [
+          25.0,
+          12,
+          3
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          128,
+          128,
+          122
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_south_west",
+      "class_name": "Part",
+      "name": "Wall_South_West",
+      "parent_id": "wall_folder",
+      "properties": {
+        "Position": [
+          -17.5,
+          6.0,
+          30.0
+        ],
+        "Size": [
+          25.0,
+          12,
+          3
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          128,
+          128,
+          122
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_south_east",
+      "class_name": "Part",
+      "name": "Wall_South_East",
+      "parent_id": "wall_folder",
+      "properties": {
+        "Position": [
+          17.5,
+          6.0,
+          30.0
+        ],
+        "Size": [
+          25.0,
+          12,
+          3
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          128,
+          128,
+          122
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_west",
+      "class_name": "Part",
+      "name": "Wall_West",
+      "parent_id": "wall_folder",
+      "properties": {
+        "Position": [
+          -30.0,
+          6.0,
+          0
+        ],
+        "Size": [
+          3,
+          12,
+          60
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          128,
+          128,
+          122
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_east",
+      "class_name": "Part",
+      "name": "Wall_East",
+      "parent_id": "wall_folder",
+      "properties": {
+        "Position": [
+          30.0,
+          6.0,
+          0
+        ],
+        "Size": [
+          3,
+          12,
+          60
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          128,
+          128,
+          122
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "gate_post_west",
+      "class_name": "Part",
+      "name": "GatePostWest",
+      "parent_id": "wall_folder",
+      "properties": {
+        "Position": [
+          -5.0,
+          6.0,
+          -30.0
+        ],
+        "Size": [
+          2,
+          12,
+          3
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          90,
+          90,
+          86
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "gate_post_east",
+      "class_name": "Part",
+      "name": "GatePostEast",
+      "parent_id": "wall_folder",
+      "properties": {
+        "Position": [
+          5.0,
+          6.0,
+          -30.0
+        ],
+        "Size": [
+          2,
+          12,
+          3
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          90,
+          90,
+          86
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "tower_folder",
+      "class_name": "Folder",
+      "name": "Towers",
+      "parent_id": "Workspace",
+      "properties": {},
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "TowerNW",
+      "class_name": "Part",
+      "name": "TowerNW",
+      "parent_id": "tower_folder",
+      "properties": {
+        "Position": [
+          -30.0,
+          10.0,
+          -30.0
+        ],
+        "Size": [
+          6,
+          20,
+          6
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          90,
+          90,
+          86
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "TowerNE",
+      "class_name": "Part",
+      "name": "TowerNE",
+      "parent_id": "tower_folder",
+      "properties": {
+        "Position": [
+          30.0,
+          10.0,
+          -30.0
+        ],
+        "Size": [
+          6,
+          20,
+          6
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          90,
+          90,
+          86
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "TowerSW",
+      "class_name": "Part",
+      "name": "TowerSW",
+      "parent_id": "tower_folder",
+      "properties": {
+        "Position": [
+          -30.0,
+          10.0,
+          30.0
+        ],
+        "Size": [
+          6,
+          20,
+          6
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          90,
+          90,
+          86
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "TowerSE",
+      "class_name": "Part",
+      "name": "TowerSE",
+      "parent_id": "tower_folder",
+      "properties": {
+        "Position": [
+          30.0,
+          10.0,
+          30.0
+        ],
+        "Size": [
+          6,
+          20,
+          6
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          90,
+          90,
+          86
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "spawn",
+      "class_name": "SpawnPoint",
+      "name": "SpawnLocation",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          3,
+          -38.0
+        ],
+        "Size": [
+          6.0,
+          0.4,
+          6.0
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          0,
+          200,
+          90
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.25,
+        "Anchored": true,
+        "CanCollide": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    }
+  ]
+}

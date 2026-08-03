@@ -1081,6 +1081,9 @@ class ScriptEditorWorkspace(QTabWidget):
     # ---------------- instance lifecycle ----------------
 
     def _on_instance_deleted(self, instance_id: str) -> None:
+        self._handle_missing_instance(instance_id)
+
+    def _handle_missing_instance(self, instance_id: str) -> None:
         doc = self._documents.get(instance_id)
         if doc is None:
             return
@@ -1097,7 +1100,18 @@ class ScriptEditorWorkspace(QTabWidget):
                 continue
             obj = self.bridge.get_object(instance_id)
             if obj is None:
-                continue  # a real deletion is handled by _on_instance_deleted instead
+                # Stage 3.2: a mass world replace (new Place, Open Place)
+                # never fires object_deleted for the OLD world's instances
+                # -- EngineBridge.replace_scene()/sync_scene() only emit
+                # scene_changed. Without this, a Script tab from a
+                # replaced-away world would stay open forever pointing at
+                # nothing. Single-instance deletion already reaches here
+                # too (scene_changed always follows object_deleted), but by
+                # then _on_instance_deleted already closed/marked it, so
+                # this is a no-op for that case -- see that handler's own
+                # bridge.object_deleted connection above.
+                self._handle_missing_instance(instance_id)
+                continue
             if obj.name != doc.display_name.rstrip("*") and not doc.conflicted:
                 doc.display_name = obj.name
                 self._update_tab_title(instance_id)
