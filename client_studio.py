@@ -1198,11 +1198,20 @@ class InstanceRecord:
 # ============================================================
 
 class MultiplayerGame(Entity):
-    def __init__(self, server_url: str, player_name: str) -> None:
+    def __init__(self, server_url: str, player_name: str, legacy_demo: bool = False) -> None:
         super().__init__()
 
         self.server_url = server_url
         self.player_name = player_name
+        # Gates the original PickADoor demo content (hardcoded ground plane,
+        # 5 hardcoded test blocks, eagerly-loaded player.glb avatar) that
+        # used to be created unconditionally on every launch, independently
+        # of WORLD_SNAPSHOT/the selected template -- see create_world() and
+        # create_local_visual(). Off by default: normal SStudio mode shows
+        # only the actual authoritative world (server Instances) plus the
+        # reusable Camera/Lighting service nodes. --legacy-demo restores it
+        # for developers who still want the original standalone demo scene.
+        self.legacy_demo = legacy_demo
         self.network = NetworkClient(server_url=server_url, player_name=player_name)
 
         self.local_player_id: str | None = None
@@ -1837,19 +1846,12 @@ class MultiplayerGame(Entity):
             shader=unlit_shader,
         )
 
-        self.ground = Entity(
-            model="plane",
-            texture="white_cube",
-            texture_scale=(64, 64),
-            color=GROUND_COLOR,
-            scale=150,
-            y=-8,
-            collider="box",
-        )
-
         # Сетка на полу для Blender-style режима. Настоящий wireframe-меш
         # (Grid), а не текстура — линии остаются чёткими на любом зуме.
         # Чуть приподнята над ground (y=-7.99), чтобы не мерцать (z-fighting).
+        # Purely a reference overlay (no collider, disabled by default) --
+        # kept unconditional regardless of legacy_demo, unlike the actual
+        # ground plane below.
         self.floor_grid = Entity(
             model=Grid(GRID_LINE_COUNT, GRID_LINE_COUNT),
             color=GRID_LINE_COLOR,
@@ -1860,25 +1862,47 @@ class MultiplayerGame(Entity):
             enabled=False,
         )
 
-        blocks = (
-            (-12, -5, 8, 4, 6, 4),
-            (15, -4, 12, 6, 8, 6),
-            (-20, -2, -15, 5, 12, 5),
-            (20, 1, -20, 4, 18, 4),
-            (0, -5, 25, 10, 6, 10),
-        )
-
+        # The original PickADoor demo's hardcoded outdoor test level: a
+        # walkable/collidable ground plane and 5 scattered test blocks,
+        # created unconditionally regardless of which Place/template (if
+        # any) is actually loaded -- i.e. visible independently of
+        # WORLD_SNAPSHOT, which is exactly what normal SStudio mode must
+        # not do (a Blank Place must render as empty, a Baseplate Place
+        # must show only its own real Part). Gated behind --legacy-demo;
+        # self.ground/self.static_blocks are None/[] otherwise, and
+        # _system_objects() (client_studio.py) skips the matching
+        # Terrain/Baseplate/Static Geometry Explorer entries in that case.
+        self.ground: Entity | None = None
         self.static_blocks: list[Entity] = []
 
-        for x, y, z, scale_x, scale_y, scale_z in blocks:
-            block = Entity(
-                model="cube",
-                color=BLOCK_COLOR,
-                position=(x, y, z),
-                scale=(scale_x, scale_y, scale_z),
+        if self.legacy_demo:
+            self.ground = Entity(
+                model="plane",
+                texture="white_cube",
+                texture_scale=(64, 64),
+                color=GROUND_COLOR,
+                scale=150,
+                y=-8,
                 collider="box",
             )
-            self.static_blocks.append(block)
+
+            blocks = (
+                (-12, -5, 8, 4, 6, 4),
+                (15, -4, 12, 6, 8, 6),
+                (-20, -2, -15, 5, 12, 5),
+                (20, 1, -20, 4, 18, 4),
+                (0, -5, 25, 10, 6, 10),
+            )
+
+            for x, y, z, scale_x, scale_y, scale_z in blocks:
+                block = Entity(
+                    model="cube",
+                    color=BLOCK_COLOR,
+                    position=(x, y, z),
+                    scale=(scale_x, scale_y, scale_z),
+                    collider="box",
+                )
+                self.static_blocks.append(block)
 
         self.ambient_light = AmbientLight()
         self.ambient_light.color = AMBIENT_LIGHT_COLOR
@@ -1892,13 +1916,15 @@ class MultiplayerGame(Entity):
             self.background_mode = "grid"
             self.sky.enabled = False
             self.floor_grid.enabled = True
-            self.ground.color = GRID_GROUND_COLOR
+            if self.ground is not None:
+                self.ground.color = GRID_GROUND_COLOR
             window.color = GRID_BACKGROUND_COLOR
         else:
             self.background_mode = "sky"
             self.sky.enabled = True
             self.floor_grid.enabled = False
-            self.ground.color = GROUND_COLOR
+            if self.ground is not None:
+                self.ground.color = GROUND_COLOR
             window.color = SKY_COLOR
 
         self.background_status_text.text = (
@@ -1930,17 +1956,23 @@ class MultiplayerGame(Entity):
         camera.clip_plane_far = 1500
 
     def create_local_visual(self) -> None:
-        # Модель самого себя. По умолчанию скрыта, т.к. игрок в первом
-        # лице обычно не должен видеть своё тело перед камерой.
-        # Включается клавишей V (третье лицо) — удобно, чтобы проверить,
-        # что player.glb вообще грузится и рендерится, не поднимая
-        # второй клиент.
-        self.local_visual = PlayerVisual(
-            player_name=self.player_name,
-            show_name_label=False,
-        )
-        self.local_visual.parent = self.local_player
-        self.local_visual.enabled = False
+        # Модель самого себя (third-person avatar, toggled with V). PlayerVisual
+        # eagerly loads player.glb in its constructor regardless of visibility --
+        # that eager load is exactly what used to make normal SStudio startup
+        # print "[MODEL] Файл найден: player.glb" on every launch, independently
+        # of any Place/template. Gated behind --legacy-demo; self.local_visual is
+        # None otherwise (toggle_third_person() below no-ops in that case). Not
+        # needed for the Studio editing workflow -- RemotePlayer (other users'
+        # avatars) is unaffected and still only loads on-demand when someone
+        # actually joins.
+        self.local_visual: PlayerVisual | None = None
+        if self.legacy_demo:
+            self.local_visual = PlayerVisual(
+                player_name=self.player_name,
+                show_name_label=False,
+            )
+            self.local_visual.parent = self.local_player
+            self.local_visual.enabled = False
 
     # --------------------------------------------------------
     # ИНТЕРФЕЙС
@@ -3176,6 +3208,10 @@ class MultiplayerGame(Entity):
             self.request_create_instance("Part")
 
     def toggle_third_person(self) -> None:
+        if self.local_visual is None:
+            # No avatar to show in third person without --legacy-demo --
+            # no-op rather than raising, so the V shortcut stays harmless.
+            return
         self.third_person_enabled = not self.third_person_enabled
         self.local_visual.enabled = self.third_person_enabled
 
@@ -4007,6 +4043,16 @@ class MultiplayerStudioAdapter:
             return [255, 255, 255]
 
     def _system_objects(self) -> list[SceneObject]:
+        # Camera/Lighting are reusable editor/service nodes (Roblox-Studio-
+        # style Workspace services) -- always present, regardless of which
+        # Place/template is loaded. Terrain/Baseplate/Static Geometry below
+        # are NOT: they mirror the original PickADoor demo's hardcoded
+        # ground plane and 5 test blocks (self.game.ground/static_blocks),
+        # which only exist at all when launched with --legacy-demo -- see
+        # MultiplayerGame.create_world(). Without that flag they must not
+        # appear in Explorer, since they'd otherwise show up independently
+        # of WORLD_SNAPSHOT for every Place including a genuinely empty
+        # Blank one.
         objects = [
             SceneObject(
                 id="system:camera",
@@ -4022,6 +4068,20 @@ class MultiplayerStudioAdapter:
                 cast_shadow=False,
             ),
             SceneObject(
+                id="system:lighting",
+                name="Lighting",
+                object_type="Lighting",
+                parent="Workspace",
+                can_collide=False,
+                cast_shadow=False,
+            ),
+        ]
+
+        if not self.game.legacy_demo:
+            return objects
+
+        objects.append(
+            SceneObject(
                 id="system:terrain",
                 name="Terrain",
                 object_type="Terrain",
@@ -4030,15 +4090,9 @@ class MultiplayerStudioAdapter:
                 size=EditorVec3(150, 1, 150),
                 color="#5c7058",
                 anchored=True,
-            ),
-            SceneObject(
-                id="system:lighting",
-                name="Lighting",
-                object_type="Lighting",
-                parent="Workspace",
-                can_collide=False,
-                cast_shadow=False,
-            ),
+            )
+        )
+        objects.append(
             SceneObject(
                 id="system:baseplate",
                 name="Baseplate",
@@ -4048,16 +4102,18 @@ class MultiplayerStudioAdapter:
                 size=EditorVec3(150, 1, 150),
                 color="#5c7058",
                 anchored=True,
-            ),
-            # Синтетическая (не сетевая) папка — просто чтобы StaticBlock_N
-            # ниже собрались в Explorer в одну группу, как раньше.
+            )
+        )
+        # Синтетическая (не сетевая) папка — просто чтобы StaticBlock_N
+        # ниже собрались в Explorer в одну группу, как раньше.
+        objects.append(
             SceneObject(
                 id="system:static_geometry",
                 name="Static Geometry",
                 object_type="Folder",
                 parent="Workspace",
-            ),
-        ]
+            )
+        )
         for index, block in enumerate(self.game.static_blocks, start=1):
             objects.append(
                 SceneObject(
@@ -4545,6 +4601,16 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="Открыть указанный файл Place сразу при запуске, минуя стартовую страницу шаблонов",
     )
+    parser.add_argument(
+        "--legacy-demo",
+        action="store_true",
+        help=(
+            "Developer-only: restore the original PickADoor demo content "
+            "(player.glb avatar, hardcoded ground plane, 5 hardcoded test "
+            "blocks) that normal SStudio mode no longer creates automatically. "
+            "Not needed for template/Place workflows -- default is off."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -4699,6 +4765,7 @@ def main() -> int:
     game = MultiplayerGame(
         server_url=arguments.server,
         player_name=arguments.name,
+        legacy_demo=arguments.legacy_demo,
     )
 
     bridge = EngineBridge(objects=[], live_mode=True)
