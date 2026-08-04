@@ -3558,20 +3558,53 @@ class StudioMainWindow(QMainWindow):
         layout.addWidget(self.ribbon)
 
         self.viewport_frame = ViewportFrame(self.bridge)
-
-        # Stage 3.1: the ViewportFrame instance above is added as tab 0 of
-        # a document workspace, not directly to `layout` -- but it is
-        # never recreated or reparented away and back, so
-        # embed_panda_window()'s native Win32 child-window reparenting
-        # (which only ever calls studio.install_engine_viewport(...) ->
-        # self.viewport_frame.install_external_viewport(...), entirely
-        # internal to ViewportFrame's own QStackedWidget) is completely
-        # unaffected by which container ViewportFrame's parent widget is.
         self.script_workspace = script_editor.ScriptEditorWorkspace(self.bridge, self.viewport_frame)
         self.script_workspace.set_icon_provider(self._script_tab_icon)
         self.script_workspace.set_on_document_opened(self._wire_script_document)
         layout.addWidget(self.script_workspace, 1)
-        self.setCentralWidget(central)
+
+        # Stage 3.2 crash fix: this permanent outer stack is created and
+        # installed as the central widget HERE, during normal construction --
+        # before embed_panda_window() ever runs (main() builds StudioMainWindow
+        # first, embeds the native Panda3D viewport into `central`'s subtree
+        # second). `central` is added as page 0 and never touched again.
+        #
+        # The previous approach called install_template_browser() AFTER
+        # embed_panda_window(), which made it fall through to the QMainWindow
+        # branch: takeCentralWidget() -> addWidget(central) -> setCentralWidget
+        # (stack). By the time that ran, embed_panda_window() had already
+        # called container.winId(), which forces Qt to realize a real native
+        # HWND for `container` and every ancestor up to `central`, and had
+        # raw-Win32 SetParent()'d the foreign Panda3D window under that
+        # container HWND -- entirely outside Qt's own bookkeeping. Reparenting
+        # `central` afterwards (moving it from being studio's direct child to
+        # being a child of a brand-new QStackedWidget) made Qt destroy/recreate
+        # `central`'s native window during setParent(), orphaning the
+        # raw-SetParent'd Panda3D child HWND and causing a native access
+        # violation (Fatal Python error: Aborted / Windows fatal exception:
+        # access violation) the moment studio.show() actually mapped the
+        # corrupted hierarchy.
+        #
+        # Now: `central` is placed in `self.central_stack` once, up front,
+        # and stays there for the window's entire lifetime. embed_panda_window
+        # -> install_engine_viewport() -> viewport_frame.install_external_
+        # viewport() only ever touches ViewportFrame's OWN internal
+        # QStackedWidget (nested inside `central`), never `central` itself or
+        # any of its ancestors -- so nothing above the embedding point ever
+        # gets reparented again. install_template_browser() is called with
+        # host=self.central_stack (an existing QStackedWidget), which takes
+        # its isinstance(target, QStackedWidget) branch: it only calls
+        # stack.addWidget(page) for the brand-new (not-yet-native) template
+        # page -- `central` itself is never touched.
+        self.central_stack = QStackedWidget()
+        self.central_stack.addWidget(central)
+        self.setCentralWidget(self.central_stack)
+
+    def set_start_page(self, page: QWidget) -> None:
+        """Adds `page` as an additional page of the permanent central stack
+        built in _build_central(). Never reparents the existing editor page;
+        safe to call at any time, including after native viewport embedding."""
+        self.central_stack.addWidget(page)
 
     def _script_tab_icon(self, class_name: str) -> Any:
         icon_name = {"Script": "file-text", "LocalScript": "file-text", "ModuleScript": "package"}.get(class_name, "file-text")

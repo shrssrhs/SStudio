@@ -4725,11 +4725,22 @@ def main() -> int:
         except Exception:
             pass
 
-    # Stage 3.2: install the template browser AFTER embed_panda_window() so
-    # the native viewport reparenting above (which only ever touches
-    # ViewportFrame's own internal QStackedWidget, see _build_central's
-    # comment) is fully settled before install_template_browser() wraps
-    # StudioMainWindow's plain central widget in an outer QStackedWidget.
+    # Stage 3.2 crash fix: pass host=studio.central_stack explicitly -- this
+    # is the permanent outer QStackedWidget StudioMainWindow._build_central()
+    # installs as the central widget during normal construction, BEFORE
+    # embed_panda_window() ever runs. Passing it directly makes
+    # install_template_browser() take its isinstance(target, QStackedWidget)
+    # branch, which only calls stack.addWidget(page) for the brand-new
+    # template page -- it never calls takeCentralWidget()/setCentralWidget()
+    # or reparents the existing editor widget. Without host=, a QMainWindow
+    # with an already-set plain central widget falls through to a DIFFERENT
+    # branch that DOES take/reparent/reset the central widget -- safe before
+    # embedding, but fatal after it (see _build_central's docstring: doing
+    # this after embed_panda_window() had already realized a native HWND for
+    # the embedded container's ancestor chain and raw-Win32 SetParent()'d the
+    # foreign Panda3D window under it caused an access violation on
+    # studio.show()).
+    #
     # With no --place given it shows on top immediately (show_immediately
     # defaults True); with --place it stays behind the already-visible
     # editor (QStackedWidget defaults to showing the first-added widget,
@@ -4745,6 +4756,7 @@ def main() -> int:
     # alive for as long as the window exists.
     templates_binding = sstudio_templates.install_template_browser(
         studio,
+        host=studio.central_stack,
         show_immediately=not arguments.place,
     )
     templates_binding.page.template_activated_spec.connect(
