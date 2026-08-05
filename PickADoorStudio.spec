@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('assets', 'assets'), ('shared', 'shared')]
+datas = [('assets', 'assets'), ('shared', 'shared'), ('templates', 'templates')]
 binaries = []
-hiddenimports = ['shared.protocol', 'shared.instance', 'shared.object_registry', 'studio_editor_live', 'transform_gizmo']
+hiddenimports = ['shared.protocol', 'shared.instance', 'shared.object_registry', 'studio_editor_live', 'transform_gizmo', 'place_manager', 'sstudio_templates', 'script_editor', 'editor_history', 'lua_runtime', 'physics', 'character_controller']
 tmp_ret = collect_all('ursina')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('direct')
