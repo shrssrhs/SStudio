@@ -52,6 +52,7 @@ from studio_editor_live import (
     Vec3 as EditorVec3,
 )
 import character_controller
+import character_rig
 import editor_history
 import lua_runtime
 import physics
@@ -1305,6 +1306,17 @@ class MultiplayerGame(Entity):
         # the full local-only networking boundary).
         self._character_runtime: character_controller.CharacterRuntime | None = None
 
+        # Stage 3.4: default SStudio character visual rig. Exists only
+        # between _start_character() and _stop_character(), same lifespan
+        # as self._character_runtime above -- deliberately a SEPARATE
+        # field (not stored inside CharacterRuntime itself) so
+        # character_controller.py stays untouched by the visual layer, per
+        # Stage 3.4 spec ("Do not rewrite the capsule controller"). Never
+        # parented to local_player (see character_rig.CharacterVisualRig's
+        # class docstring for why), never serialized, never added to
+        # self.instances.
+        self._character_visual: character_rig.CharacterVisualRig | None = None
+
         # Stage 3.0: sandboxed Lua runtime (see lua_runtime.py). Exists
         # only between set_studio_playing(True) and set_studio_playing
         # (False), created AFTER physics (it binds to self._physics_world)
@@ -1543,23 +1555,25 @@ class MultiplayerGame(Entity):
         return candidates
 
     def _start_character(self) -> None:
-        """Creates the Play-session CharacterRuntime -- called AFTER
-        _start_physics() (needs self._physics_world.bullet_world to
-        already exist; see character_controller.py's "do not introduce a
-        second Bullet world" constraint) and BEFORE _start_lua(). Wrapped
-        in try/except that ALWAYS prints a full traceback and guarantees no
-        half-created Bullet node survives a failed spawn, for the same
-        reason _start_physics()/_start_lua() are (see their docstrings) --
-        a failed spawn must not leave Play looking broken with zero
-        console explanation, must still allow Stop, and must not corrupt
-        the editor scene (nothing here ever touches record.properties or
-        self.instances)."""
+        """Creates the Play-session CharacterRuntime AND its visual rig --
+        called AFTER _start_physics() (needs self._physics_world.
+        bullet_world to already exist; see character_controller.py's "do
+        not introduce a second Bullet world" constraint) and BEFORE
+        _start_lua(). Wrapped in try/except that ALWAYS prints a full
+        traceback and guarantees no half-created Bullet node OR visual rig
+        survives a failed spawn, for the same reason _start_physics()/
+        _start_lua() are (see their docstrings) -- a failed spawn must not
+        leave Play looking broken with zero console explanation, must
+        still allow Stop, and must not corrupt the editor scene (nothing
+        here ever touches record.properties or self.instances)."""
         self._character_runtime = None
+        self._character_visual = None
         if self._physics_world is None:
             print("[CHARACTER] _start_character(): no physics world available -- character NOT spawned.")
             return
 
         runtime: character_controller.CharacterRuntime | None = None
+        visual: character_rig.CharacterVisualRig | None = None
         try:
             capsule_half_height = character_controller.DEFAULT_HEIGHT / 2.0
             chosen = character_controller.select_spawn_point(self._collect_spawn_candidates())
@@ -1577,21 +1591,46 @@ class MultiplayerGame(Entity):
             )
             self._character_runtime = runtime
             print(f"[CHARACTER] spawned at {spawn_position}")
+
+            visual = character_rig.CharacterVisualRig(initial_yaw_degrees=self.player_yaw)
+            visual.set_first_person(not self.third_person_enabled)
+            self._character_visual = visual
+            self._apply_third_person_camera()
+            print(f"[CHARACTER] visual rig created ({visual.entity_count()} entities)")
         except Exception:
             print("[CHARACTER] EXCEPTION in _start_character() -- Play mode continues but no character was spawned:")
             traceback.print_exc()
+            if visual is not None:
+                try:
+                    visual.destroy()
+                except Exception:
+                    pass
             if runtime is not None:
                 try:
                     runtime.destroy()
                 except Exception:
                     pass
             self._character_runtime = None
+            self._character_visual = None
 
     def _stop_character(self) -> None:
+        if self._character_visual is not None:
+            self._character_visual.destroy()
+            self._character_visual = None
         if self._character_runtime is None:
             return
         self._character_runtime.destroy()
         self._character_runtime = None
+        # Always leave the editor camera in its normal first-person
+        # transform on Stop, regardless of whichever view mode Play was
+        # last in -- toggle_third_person() is the only other place camera.
+        # position/parent change, and if the user stopped while still in
+        # third-person, nothing else would otherwise reset it before the
+        # editor's own camera state (restored separately by
+        # set_studio_playing()) takes over.
+        self.third_person_enabled = False
+        camera.parent = self.camera_pitch_pivot
+        camera.position = Vec3(0, 0, 0)
         print("[CHARACTER] removed")
 
     def update_character(self) -> None:
@@ -1657,6 +1696,24 @@ class MultiplayerGame(Entity):
         self.local_player.rotation = Vec3(0, self.player_yaw, 0)
         self.camera_pitch_pivot.rotation = Vec3(-self.player_pitch, 0, 0)
         camera.rotation_z = 0
+
+        # Stage 3.4: the visual rig follows using this SAME post-step
+        # position -- feet_position, not the capsule's own center (the
+        # rig's own root is its feet, not its pelvis; see
+        # character_rig.CharacterVisualRig.update()'s docstring).
+        # Deliberately NOT parented to local_player (see that same
+        # docstring for why), so this call is the rig's only per-frame
+        # link to the controller.
+        visual = self._character_visual
+        if visual is not None:
+            feet_position = (position[0], position[1] - runtime.controller.half_height, position[2])
+            visual.update(
+                ursina_time.dt,
+                feet_position,
+                runtime.controller.horizontal_velocity(),
+                runtime.controller.is_grounded(),
+                runtime.controller.vertical_velocity(),
+            )
 
     def release_play_input_capture(self) -> None:
         """Explicit, idempotent release of Play's mouse-look capture --
@@ -3428,21 +3485,44 @@ class MultiplayerGame(Entity):
         elif key == "e":
             self.request_create_instance("Part")
 
+    def _apply_third_person_camera(self) -> None:
+        """Applies self.third_person_enabled's camera transform --
+        factored out so both toggle_third_person() (the V-key path) and
+        _start_character() (which must apply whatever third_person_enabled
+        was already set to, e.g. from a previous Play session, to a
+        freshly created rig) stay in sync without duplicating the camera
+        math. Switching view never touches native viewport embedding or
+        pointer capture (Stage 3.4 spec) -- this only ever reparents/moves
+        the existing `camera` Entity, the same one Stage 3.3's first-person
+        view already uses."""
+        camera.parent = self.camera_pitch_pivot
+        if self.third_person_enabled:
+            camera.position = Vec3(0, 0, -THIRD_PERSON_DISTANCE)
+            camera.y = THIRD_PERSON_HEIGHT
+        else:
+            camera.position = Vec3(0, 0, 0)
+
     def toggle_third_person(self) -> None:
+        """Stage 3.4: prefers the new SStudio character rig (normal Play
+        mode) over the legacy --legacy-demo PlayerVisual avatar, which this
+        no longer requires to function -- V now works in ordinary Play
+        sessions, not just --legacy-demo ones. Falls back to the old
+        local_visual toggle when no rig exists (e.g. --legacy-demo without
+        the character controller having spawned one, or before Play has
+        started), preserving that path's previous behavior unchanged."""
+        if self._character_visual is not None:
+            self.third_person_enabled = not self.third_person_enabled
+            self._character_visual.set_first_person(not self.third_person_enabled)
+            self._apply_third_person_camera()
+            return
+
         if self.local_visual is None:
             # No avatar to show in third person without --legacy-demo --
             # no-op rather than raising, so the V shortcut stays harmless.
             return
         self.third_person_enabled = not self.third_person_enabled
         self.local_visual.enabled = self.third_person_enabled
-
-        if self.third_person_enabled:
-            camera.parent = self.camera_pitch_pivot
-            camera.position = Vec3(0, 0, -THIRD_PERSON_DISTANCE)
-            camera.y = THIRD_PERSON_HEIGHT
-        else:
-            camera.parent = self.camera_pitch_pivot
-            camera.position = Vec3(0, 0, 0)
+        self._apply_third_person_camera()
 
     def update_mouse_look(self) -> None:
         if self._qt_look_available():

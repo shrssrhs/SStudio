@@ -382,6 +382,24 @@ class CharacterController:
         isOnGround()."""
         return self._grounded
 
+    def horizontal_velocity(self) -> tuple[float, float]:
+        """Current (vx, vz) horizontal velocity -- public read accessor
+        (Stage 3.4) for a visual rig's animation-state/facing-direction
+        selection. Read-only view of the same state apply_movement()
+        already maintains; does not affect movement integration."""
+        return self._current_velocity_xz
+
+    def horizontal_speed(self) -> float:
+        """Magnitude of horizontal_velocity() -- public read accessor
+        (Stage 3.4) for animation-state selection (Idle vs Walk)."""
+        vx, vz = self._current_velocity_xz
+        return _length3((vx, 0.0, vz))
+
+    def vertical_velocity(self) -> float:
+        """Current vertical (Y) velocity -- public read accessor (Stage
+        3.4) for animation-state selection (Jump vs Fall)."""
+        return self._velocity_y
+
     def _ray_test_grounded(self) -> bool:
         pos = self.np.getPos()
         foot_y = pos.y - self.half_height
