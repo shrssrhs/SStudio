@@ -51,6 +51,7 @@ from studio_editor_live import (
     StudioMainWindow,
     Vec3 as EditorVec3,
 )
+import character_controller
 import editor_history
 import lua_runtime
 import physics
@@ -1296,6 +1297,14 @@ class MultiplayerGame(Entity):
         self._physics_world: physics.PhysicsWorld | None = None
         self._physics_snapshot: dict[str, dict[str, list[float]]] = {}
 
+        # Stage 3.3: Play Mode character controller. Exists only between
+        # _start_character() and _stop_character() (mirrors physics/Lua's
+        # own Play-scoped lifecycle) -- recreated fresh every Play, fully
+        # destroyed on every Stop, never persisted, never serialized into
+        # the Place (see character_controller.py's module docstring for
+        # the full local-only networking boundary).
+        self._character_runtime: character_controller.CharacterRuntime | None = None
+
         # Stage 3.0: sandboxed Lua runtime (see lua_runtime.py). Exists
         # only between set_studio_playing(True) and set_studio_playing
         # (False), created AFTER physics (it binds to self._physics_world)
@@ -1377,6 +1386,7 @@ class MultiplayerGame(Entity):
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = False
             self._start_physics()
+            self._start_character()
             self._start_lua()
             self.history.refresh_ui()
         else:
@@ -1399,6 +1409,7 @@ class MultiplayerGame(Entity):
                 # the rest of Stop is unwinding the world under it (see
                 # Stage 3.0 report, "execution authority model").
                 self._stop_lua()
+                self._stop_character()
                 self._stop_physics()
             self.history.refresh_ui()
 
@@ -1508,6 +1519,168 @@ class MultiplayerGame(Entity):
         if self._physics_world is None:
             return
         self._physics_world.step(ursina_time.dt)
+
+    # --------------------------------------------------------
+    # STAGE 3.3: PLAY MODE CHARACTER CONTROLLER
+    # --------------------------------------------------------
+
+    def _collect_spawn_candidates(self) -> list[dict[str, Any]]:
+        """Every enabled SpawnPoint Instance, identified by ClassName (not
+        display name -- the schema already supports this, see shared/
+        object_registry.py's SpawnPoint registration)."""
+        candidates: list[dict[str, Any]] = []
+        for instance_id, record in self.instances.items():
+            if record.class_name != "SpawnPoint" or not record.enabled:
+                continue
+            properties = record.properties
+            position = properties.get("Position", [0.0, 0.0, 0.0])
+            size = properties.get("Size", [1.0, 1.0, 1.0])
+            candidates.append({
+                "id": instance_id,
+                "position": (float(position[0]), float(position[1]), float(position[2])),
+                "size": (float(size[0]), float(size[1]), float(size[2])),
+            })
+        return candidates
+
+    def _start_character(self) -> None:
+        """Creates the Play-session CharacterRuntime -- called AFTER
+        _start_physics() (needs self._physics_world.bullet_world to
+        already exist; see character_controller.py's "do not introduce a
+        second Bullet world" constraint) and BEFORE _start_lua(). Wrapped
+        in try/except that ALWAYS prints a full traceback and guarantees no
+        half-created Bullet node survives a failed spawn, for the same
+        reason _start_physics()/_start_lua() are (see their docstrings) --
+        a failed spawn must not leave Play looking broken with zero
+        console explanation, must still allow Stop, and must not corrupt
+        the editor scene (nothing here ever touches record.properties or
+        self.instances)."""
+        self._character_runtime = None
+        if self._physics_world is None:
+            print("[CHARACTER] _start_character(): no physics world available -- character NOT spawned.")
+            return
+
+        runtime: character_controller.CharacterRuntime | None = None
+        try:
+            capsule_half_height = character_controller.DEFAULT_HEIGHT / 2.0
+            chosen = character_controller.select_spawn_point(self._collect_spawn_candidates())
+            if chosen is not None:
+                spawn_position = character_controller.spawn_position_from_point(chosen, capsule_half_height)
+                print(f"[CHARACTER] SpawnPoint selected: {chosen['id']}")
+            else:
+                spawn_position = character_controller.fallback_spawn_position(capsule_half_height)
+                print("[CHARACTER] no SpawnPoint found -- using fallback spawn position")
+
+            runtime = character_controller.CharacterRuntime(
+                self._physics_world.bullet_world,
+                spawn_position,
+                initial_yaw_degrees=self.player_yaw,
+            )
+            self._character_runtime = runtime
+            print(f"[CHARACTER] spawned at {spawn_position}")
+        except Exception:
+            print("[CHARACTER] EXCEPTION in _start_character() -- Play mode continues but no character was spawned:")
+            traceback.print_exc()
+            if runtime is not None:
+                try:
+                    runtime.destroy()
+                except Exception:
+                    pass
+            self._character_runtime = None
+
+    def _stop_character(self) -> None:
+        if self._character_runtime is None:
+            return
+        self._character_runtime.destroy()
+        self._character_runtime = None
+        print("[CHARACTER] removed")
+
+    def update_character(self) -> None:
+        """Reads held movement keys + mouse-look delta into the Play
+        CharacterRuntime and applies movement to its Bullet capsule --
+        call BEFORE update_physics() runs this frame's doPhysics() step
+        (see character_controller.CharacterController.apply_movement's
+        docstring). Camera/position sync happens separately, AFTER the
+        physics step, in sync_character_camera()."""
+        runtime = self._character_runtime
+        if runtime is None:
+            return
+
+        runtime.input.forward = bool(held_keys["w"])
+        runtime.input.backward = bool(held_keys["s"])
+        runtime.input.left = bool(held_keys["a"])
+        runtime.input.right = bool(held_keys["d"])
+        runtime.input.jump_held = bool(held_keys["space"])
+        runtime.input.captured = self._mouse_look_captured()
+
+        if runtime.input.captured:
+            if self._qt_look_available():
+                delta_x, delta_y = self._poll_qt_look_delta()
+                if delta_x != 0.0 or delta_y != 0.0:
+                    runtime.camera.apply_delta(delta_x, delta_y)
+            elif mouse.locked:
+                # Non-embedded (--no-embed diagnostic) fallback path --
+                # mirrors update_mouse_look()'s own scaling exactly rather
+                # than going through CharacterCamera.apply_delta() (whose
+                # default sensitivity matches the embedded/QT_LOOK_
+                # SENSITIVITY_* path, a different unit convention than
+                # mouse.velocity here).
+                runtime.camera.yaw_degrees = wrap_angle(
+                    runtime.camera.yaw_degrees + mouse.velocity[0] * MOUSE_SENSITIVITY_X
+                )
+                runtime.camera.pitch_degrees = clamp(
+                    runtime.camera.pitch_degrees + mouse.velocity[1] * MOUSE_SENSITIVITY_Y,
+                    runtime.camera.min_pitch,
+                    runtime.camera.max_pitch,
+                )
+
+        runtime.step(ursina_time.dt)
+
+    def sync_character_camera(self) -> None:
+        """Call AFTER update_physics() has stepped the shared Bullet world
+        this frame -- copies the capsule's resulting position onto
+        local_player (camera-follow, since camera_pitch_pivot/camera stay
+        parented to local_player exactly as in editor free-look) and
+        applies the Play camera's yaw/pitch. Also mirrors those into
+        self.player_yaw/player_pitch so the pre-existing send_transform()
+        network message and the Play/Stop position-snapshot restore (see
+        set_studio_playing) keep working unchanged -- CharacterCamera's own
+        yaw/pitch remain the source of truth during Play; player_yaw/pitch
+        is just kept in sync as a read-only mirror for that existing
+        machinery, never the other way around."""
+        runtime = self._character_runtime
+        if runtime is None:
+            return
+        position = runtime.synced_position()
+        self.local_player.position = Vec3(position[0], position[1], position[2])
+        self.player_yaw = runtime.camera.yaw_degrees
+        self.player_pitch = runtime.camera.pitch_degrees
+        self.local_player.rotation = Vec3(0, self.player_yaw, 0)
+        self.camera_pitch_pivot.rotation = Vec3(-self.player_pitch, 0, 0)
+        camera.rotation_z = 0
+
+    def release_play_input_capture(self) -> None:
+        """Explicit, idempotent release of Play's mouse-look capture --
+        deliberately callable from OUTSIDE Ursina's own input() event loop
+        (see main()'s QApplication.focusChanged/applicationStateChanged
+        wiring, and _poll_qt_look_delta()'s own focus check below). This is
+        the fix for the known bug where clicking the embedded viewport
+        could leave Qt controls unclickable until process restart: capture
+        used to only ever release via Ursina's "escape"/"left mouse down"
+        key handling in input(), which requires the native Panda window to
+        still have OS keyboard focus -- but the continuous QCursor.setPos()
+        re-centering in _poll_qt_look_delta() ran every frame regardless,
+        so once the user tried to click a DIFFERENT Qt widget (Explorer,
+        Output, a menu...), the cursor snapping back to the viewport center
+        60 times a second made it physically impossible for that click to
+        ever land, which meant focus could never actually move away from
+        the viewport to let Escape (or anything else) reach it either --
+        a genuine deadlock. Safe to call any time, including when nothing
+        is captured or Play isn't running (both branches below are no-ops
+        in that case)."""
+        if self._mouse_look_captured():
+            self._stop_mouse_look()
+            if self.studio_playing:
+                print("[CHARACTER] Play input released")
 
     def _start_lua(self) -> None:
         """Wrapped in try/except that ALWAYS prints a full traceback, for
@@ -1796,6 +1969,22 @@ class MultiplayerGame(Entity):
 
             container = self.qt_viewport_container
             assert container is not None
+            # Stage 3.3: explicitly grant the container Qt focus here.
+            # Capture can start two ways: the user clicking the viewport
+            # (PandaWindowFocusFilter already moves Qt focus to the
+            # container as part of that click, before Ursina even sees the
+            # "left mouse down" that calls this) or Play auto-capturing on
+            # start (set_studio_playing(True) calls this directly, e.g.
+            # right after the user clicked the Qt Play button in the
+            # ribbon -- focus is still on that button, NOT the viewport, at
+            # this exact moment). Without this call, _poll_qt_look_delta()'s
+            # own-focus-lost safety check (see its docstring) would find
+            # focus is not on the container on the very next frame and
+            # immediately release the capture that was just granted --
+            # correct in spirit (capture should track real Qt focus) but
+            # wrong here, since Play hasn't actually lost the viewport as
+            # the active surface, it just never explicitly claimed it.
+            container.setFocus(Qt.FocusReason.OtherFocusReason)
             center_global = container.mapToGlobal(container.rect().center())
             QCursor.setPos(center_global)
             self._qt_look_last_pos = center_global
@@ -1816,6 +2005,23 @@ class MultiplayerGame(Entity):
     def _poll_qt_look_delta(self) -> tuple[float, float]:
         container = self.qt_viewport_container
         if container is None or self._qt_look_last_pos is None:
+            return 0.0, 0.0
+
+        # Stage 3.3 pointer-capture fix: once Qt focus has moved away from
+        # the viewport for ANY reason (clicked Explorer/Output/Inspector, a
+        # menu opened and grabbed focus, a dialog appeared...), stop
+        # re-centering the cursor immediately instead of continuing to warp
+        # it back to the viewport every frame -- that unconditional warp is
+        # exactly what previously made it impossible to ever complete a
+        # click on anything else (see release_play_input_capture()'s
+        # docstring for the full failure chain). This check runs every
+        # frame regardless of whether Ursina's own input() ever sees an
+        # "escape" key, which it structurally cannot once the native Panda
+        # window itself has lost keyboard focus.
+        if QApplication.focusWidget() is not container:
+            self._stop_mouse_look()
+            if self.studio_playing:
+                print("[CHARACTER] Play input released (Qt focus left the viewport)")
             return 0.0, 0.0
 
         current_global = QCursor.pos()
@@ -2020,15 +2226,23 @@ class MultiplayerGame(Entity):
             background=True,
         )
 
-        file_ok, file_message = model_file_status()
-        self.model_status_text = Text(
-            parent=self.hud_root,
-            text=file_message,
-            color=color.lime if file_ok else color.red,
-            position=(-0.87, -0.35),
-            origin=(-0.5, 0.5),
-            background=True,
-        )
+        # Stage 3.3: this label reports player.glb's on-disk status -- only
+        # meaningful when --legacy-demo's PlayerVisual path can actually
+        # use it (see create_local_visual()). In normal SStudio mode the
+        # Play HUD no longer references player.glb at all, so showing this
+        # by default would be confusing leftover legacy UI, not an actual
+        # error -- hidden unless --legacy-demo is active.
+        self.model_status_text: Text | None = None
+        if self.legacy_demo:
+            file_ok, file_message = model_file_status()
+            self.model_status_text = Text(
+                parent=self.hud_root,
+                text=file_message,
+                color=color.lime if file_ok else color.red,
+                position=(-0.87, -0.35),
+                origin=(-0.5, 0.5),
+                background=True,
+            )
 
         if not SIMPLEPBR_AVAILABLE:
             Text(
@@ -3193,13 +3407,20 @@ class MultiplayerGame(Entity):
                 self.focus_selected_part()
             return
 
-        if key == "escape":
-            if self._mouse_look_captured():
-                self._stop_mouse_look()
-            else:
-                self._start_mouse_look()
+        if key in ("escape", "escape up"):
+            # Stage 3.3 spec: Escape always RELEASES capture (it no longer
+            # toggles back on) -- re-capturing is exclusively via clicking
+            # the viewport again, the next branch below. Both edges are
+            # handled: confirmed via live testing that Panda3D's watcher
+            # does not always deliver the "escape" keydown edge to Ursina's
+            # input() while the embedded window is mid-recapture (only the
+            # "escape up" edge reliably arrives in that case) -- handling
+            # both is a safe, idempotent no-op when capture is already
+            # released (see release_play_input_capture()'s own guard).
+            self.release_play_input_capture()
         elif key == "left mouse down" and not self._mouse_look_captured():
             self._start_mouse_look()
+            print("[CHARACTER] Play input captured")
         elif key == "v":
             self.toggle_third_person()
         elif key == "b":
@@ -3825,12 +4046,9 @@ class MultiplayerGame(Entity):
                 )
                 self.remote_players[player_id] = remote_player
 
-                if remote_player.visual.using_custom_model:
+                if self.model_status_text is not None:
                     self.model_status_text.text = remote_player.visual.model_status
-                    self.model_status_text.color = color.lime
-                else:
-                    self.model_status_text.text = remote_player.visual.model_status
-                    self.model_status_text.color = color.red
+                    self.model_status_text.color = color.lime if remote_player.visual.using_custom_model else color.red
 
             else:
                 self.remote_players[player_id].set_target(
@@ -3888,12 +4106,22 @@ class MultiplayerGame(Entity):
         self.process_network_messages()
         if not self.studio_playing:
             self.update_gizmo()
-        if (self.studio_playing or self.editor_look_active) and not self.gizmo.dragging:
+        if self.studio_playing:
+            # Stage 3.3: Play input/movement now goes through the character
+            # controller instead of the editor's noclip update_flight() --
+            # update_mouse_look()'s free-look is reserved for editor RMB
+            # free-look (editor_look_active) below. update_character() must
+            # run BEFORE update_physics() (sets this frame's capsule
+            # movement); sync_character_camera() must run AFTER it (reads
+            # back the post-step position) -- see both methods' docstrings.
+            self.update_character()
+        elif self.editor_look_active and not self.gizmo.dragging:
             self.update_mouse_look()
             self.update_flight()
         if self.studio_playing:
             self.send_transform()
             self.update_physics()
+            self.sync_character_camera()
             self.update_lua()
         self.update_remote_smoothing()
         self.update_sky()
@@ -4475,6 +4703,41 @@ class MultiplayerStudioAdapter:
         return False
 
 
+class PlayInputReleaseFilter(QObject):
+    """Application-wide safety net for the Stage 3.3 pointer-capture fix.
+
+    _poll_qt_look_delta()'s own per-frame QApplication.focusWidget() check
+    (see its docstring) does not catch every case: confirmed empirically
+    that clicking an item in the Explorer panel updates Explorer's own
+    selection/highlight (and the 3D scene selection) WITHOUT ever changing
+    QApplication.focusWidget() at all -- the viewport container silently
+    remained "the focus widget" the entire time, even with a different
+    panel now visibly selected and receiving the user's clicks. Relying on
+    focusWidget() alone would leave capture (and the cursor-recentering
+    warp loop) running underneath an Explorer click, exactly the class of
+    stuck-pointer bug this stage exists to fix.
+
+    This filter is installed on the whole QApplication (see main()) and
+    catches the click itself: any MouseButtonPress whose target widget is
+    not the viewport container (or a descendant of it) releases capture
+    immediately, regardless of that widget's own FocusPolicy. Complements
+    (does not replace) the per-frame focus check, which still independently
+    covers keyboard-driven focus changes (e.g. Tab) that never generate a
+    mouse press at all."""
+
+    def __init__(self, container: QWidget, game: "MultiplayerGame") -> None:
+        super().__init__(container)
+        self.container = container
+        self.game = game
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.MouseButtonPress:
+            clicked = QApplication.widgetAt(QCursor.pos())
+            if clicked is not None and clicked is not self.container and not self.container.isAncestorOf(clicked):
+                self.game.release_play_input_capture()
+        return False
+
+
 class PandaWindowFocusFilter(QObject):
     def __init__(self, container: QWidget, foreign_window: QWindow, game: "MultiplayerGame") -> None:
         super().__init__(container)
@@ -4768,6 +5031,18 @@ def main() -> int:
         legacy_demo=arguments.legacy_demo,
     )
 
+    # Stage 3.3 pointer-capture fix, supplementary safety net: Qt's own
+    # focusWidget() tracking (already checked every frame in
+    # MultiplayerGame._poll_qt_look_delta()) does not reliably change when
+    # the whole APPLICATION loses OS foreground focus (Alt+Tab to another
+    # app) -- it only fires on click and Tab, so an app-level release is
+    # wired separately here to cover that case explicitly.
+    def _on_app_state_changed(state: Qt.ApplicationState) -> None:
+        if state != Qt.ApplicationState.ApplicationActive:
+            game.release_play_input_capture()
+
+    qt_app.applicationStateChanged.connect(_on_app_state_changed)
+
     bridge = EngineBridge(objects=[], live_mode=True)
     adapter = MultiplayerStudioAdapter(game)
     bridge.set_adapter(adapter)
@@ -4780,6 +5055,20 @@ def main() -> int:
     embedded = False
     if not arguments.no_embed:
         embedded = embed_panda_window(studio, bridge, game)
+    play_input_release_filter: PlayInputReleaseFilter | None = None
+    if embedded and game.qt_viewport_container is not None:
+        # Stage 3.3 pointer-capture fix, primary mechanism: see
+        # PlayInputReleaseFilter's docstring for why the per-frame
+        # focusWidget() check in _poll_qt_look_delta() alone is not
+        # sufficient (confirmed empirically that clicking Explorer items
+        # never changes QApplication.focusWidget()). The Python wrapper
+        # is kept alive via play_input_release_filter for main()'s whole
+        # lifetime (it never returns before the app quits) -- QObject
+        # parenting alone only keeps the underlying C++ object alive and
+        # is not sufficient to guarantee the Python-side eventFilter()
+        # override keeps getting dispatched.
+        play_input_release_filter = PlayInputReleaseFilter(game.qt_viewport_container, game)
+        qt_app.installEventFilter(play_input_release_filter)
     if not embedded:
         bridge.log(
             "warning",
