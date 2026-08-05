@@ -678,6 +678,14 @@ class CharacterVisualRig:
         accessory_count = sum(1 for entity in self._accessories.values() if entity is not None)
         return len(self.parts) + len(self._decorative_entities) + accessory_count
 
+    @property
+    def facing_yaw(self) -> float:
+        """Public read accessor (Stage 3.5) for the rig's current facing
+        yaw in degrees -- same value update() already maintains for
+        root.rotation.y, exposed for the Lua Character API's FacingYaw
+        property. Does not affect animation/movement."""
+        return self._facing_yaw
+
     def debug_snapshot(self) -> dict[str, Any]:
         return {
             "animation_state": self._state,

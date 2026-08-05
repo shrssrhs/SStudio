@@ -535,9 +535,16 @@ def test_start_character_never_touches_legacy_playervisual() -> None:
 
 
 def test_toggle_third_person_prefers_new_rig() -> None:
-    src = _source(cs.MultiplayerGame.toggle_third_person)
-    check("self._character_visual" in src, "toggle_third_person(): checks the new rig first")
-    check("set_first_person" in src, "toggle_third_person(): drives visibility via set_first_person(), not the legacy local_visual.enabled toggle for the new rig path")
+    # Stage 3.5 factored the actual rig-vs-legacy-avatar branching out of
+    # toggle_third_person() into set_camera_mode() (so the Lua Character
+    # API's SetCameraMode() can share the exact same logic) --
+    # toggle_third_person() itself is now just a one-line call into it, so
+    # the structural check moves with the logic it's actually verifying.
+    toggle_src = _source(cs.MultiplayerGame.toggle_third_person)
+    check("set_camera_mode" in toggle_src, "toggle_third_person(): delegates to set_camera_mode() (Stage 3.5 refactor)")
+    mode_src = _source(cs.MultiplayerGame.set_camera_mode)
+    check("self._character_visual" in mode_src, "set_camera_mode(): checks the new rig first")
+    check("set_first_person" in mode_src, "set_camera_mode(): drives visibility via set_first_person(), not the legacy local_visual.enabled toggle for the new rig path")
 
 
 def test_v_key_wired_in_play_mode_input() -> None:

@@ -400,6 +400,19 @@ function InstanceMethods.Destroy(self)
     __bridge_destroy(rawget(self, "__id"))
 end
 
+-- Stage 3.5: game:GetService(name) -- only meaningful on the "game"
+-- proxy (matching Roblox's DataModel:GetService()); the bridge itself
+-- rejects any other __id with the same "not a valid member" error style
+-- get_property() already uses elsewhere in this prelude. Returns a
+-- locked, cached service proxy table -- never a raw Python object -- see
+-- lua_gameplay_api.py, which is the only thing that ever populates
+-- what __bridge_get_service resolves.
+function InstanceMethods.GetService(self, name)
+    local ok, result = __bridge_get_service(rawget(self, "__id"), name)
+    if not ok then error(result, 2) end
+    return result
+end
+
 _G.__bridge_get_method = function(name) return InstanceMethods[name] end
 
 -- ---------------- Instance.new / typeof / game / workspace / script ----------------
@@ -995,11 +1008,15 @@ class RuntimeSceneLayer:
 class _ScheduledEntry:
     co_id: int
     owner_script_id: str
-    kind: str  # "wait_seconds" | "wait_for_child" | "deferred"
+    kind: str  # "wait_seconds" | "wait_for_child" | "deferred" | "signal_wait"
     args: tuple = ()
     deadline: Optional[float] = None
     parent_id: Optional[str] = None
     child_name: Optional[str] = None
+    # Stage 3.5: LuaGameplayContext's LuaSignal:Wait() support -- see
+    # mark_signal_fired()/the "signal_wait" branches in _resume()/update()
+    # below. Not used by anything from Stage 3.0-3.4.
+    signal_id: Optional[int] = None
     started: bool = False
 
 
@@ -1016,6 +1033,15 @@ class LuaTaskScheduler:
         self._deferred: list[_ScheduledEntry] = []
         self._task_counts: dict[str, int] = {}
         self.current_script_id: Optional[str] = None
+        # Stage 3.5: signal_id -> args tuple, populated by
+        # mark_signal_fired() (called by LuaGameplayContext right before it
+        # dispatches :Connect() listeners for the same firing), consumed by
+        # update()'s "signal_wait" branch. A plain dict is sufficient since
+        # a signal fires at most meaningfully-once per frame for any given
+        # :Wait() caller's purposes -- if it fires again before a waiter is
+        # polled, the newer args simply win, matching "the next time this
+        # event fires" semantics of a real Wait().
+        self._fired_signal_values: dict[int, tuple] = {}
 
     def reset(self) -> None:
         for entry in self._pending + self._deferred:
@@ -1023,6 +1049,7 @@ class LuaTaskScheduler:
         self._pending.clear()
         self._deferred.clear()
         self._task_counts.clear()
+        self._fired_signal_values.clear()
         self.current_script_id = None
 
     def cancel_owner(self, script_id: str) -> None:
@@ -1091,6 +1118,33 @@ class LuaTaskScheduler:
         )
         self._resume(entry)
 
+    def schedule_immediate_external(self, owner_script_id: str, co_id: int, args: tuple = ()) -> None:
+        """Stage 3.5: same as schedule_immediate(), but for callers OUTSIDE
+        any script's own execution context -- self.current_script_id is
+        only meaningful while _resume() is actively resuming a coroutine
+        (see its docstring), which is never the case when
+        LuaGameplayContext fires a signal from a native Python event
+        (character spawned, a key was pressed, ...). Every listener gets
+        its own coroutine/co_id (already created in Lua by
+        __gameplay_fire_signal before this is called) and its own fresh
+        instruction budget via the normal _resume() path -- this does not
+        bypass any of the existing per-resume protections, it only
+        supplies the owner attribution schedule_immediate() would
+        otherwise read from current_script_id."""
+        if not self._count_task(owner_script_id):
+            return
+        entry = _ScheduledEntry(co_id=co_id, owner_script_id=owner_script_id, kind="wait_seconds", deadline=0.0, args=tuple(args))
+        self._resume(entry)
+
+    def mark_signal_fired(self, signal_id: int, args: tuple) -> None:
+        """Stage 3.5: called by LuaGameplayContext immediately before it
+        asks Lua to dispatch a signal's :Connect() listeners -- makes the
+        fired value available to any coroutine currently parked in a
+        "signal_wait" pending entry for this signal_id (see update()'s
+        matching branch below), independent of whether that signal has
+        any :Connect() listeners at all."""
+        self._fired_signal_values[signal_id] = tuple(args)
+
     def schedule_deferred(self, co_id: int, args_table: Any = None) -> None:
         owner = self.current_script_id
         if owner is None or not self._count_task(owner):
@@ -1139,6 +1193,13 @@ class LuaTaskScheduler:
                     self._resume(entry, resume_value=None)
                 else:
                     still_pending.append(entry)
+            elif entry.kind == "signal_wait":
+                # Stage 3.5: see mark_signal_fired()'s docstring.
+                fired = self._fired_signal_values.pop(entry.signal_id, None) if entry.signal_id is not None else None
+                if fired is not None:
+                    self._resume(entry, resume_value=fired)
+                else:
+                    still_pending.append(entry)
             else:
                 still_pending.append(entry)
         self._pending = still_pending
@@ -1149,7 +1210,18 @@ class LuaTaskScheduler:
         try:
             resume = self.manager.lua.globals()["__registry_resume"]
             if entry.started:
-                result = resume(entry.co_id, resume_value)
+                # Stage 3.5: a "signal_wait" resume value is a tuple of
+                # every argument the signal fired with (LuaSignal:Wait()
+                # can return multiple values, e.g. a Character proxy) --
+                # unpacked into the real Lua call so coroutine.yield(...)
+                # gets them all back, not a single Lua table. Every
+                # pre-existing resume_value (wait_for_child's child_id,
+                # wait_seconds' None) is never a tuple, so this is a no-op
+                # for every call site that predates Stage 3.5.
+                if isinstance(resume_value, tuple):
+                    result = resume(entry.co_id, *resume_value)
+                else:
+                    result = resume(entry.co_id, resume_value)
             else:
                 entry.started = True
                 result = resume(entry.co_id, *entry.args)
@@ -1187,6 +1259,17 @@ class LuaTaskScheduler:
                 kind="wait_for_child", parent_id=self._payload_field(payload, "parent_id"),
                 child_name=self._payload_field(payload, "name"),
                 deadline=self._payload_field(payload, "deadline"), started=True,
+            ))
+            return
+        if kind == "signal_wait":
+            # Stage 3.5: LuaSignal:Wait() -- see mark_signal_fired()'s
+            # docstring and the matching branch in update() above. No
+            # deadline/timeout: a Wait() with nothing ever firing it parks
+            # here for the rest of the Play session, same as a real
+            # RBXScriptSignal:Wait() with no firer.
+            self._pending.append(_ScheduledEntry(
+                co_id=entry.co_id, owner_script_id=entry.owner_script_id,
+                kind="signal_wait", signal_id=self._payload_field(payload, "signal_id"), started=True,
             ))
             return
         # Unrecognized yield (e.g. a bare coroutine.yield() with no
@@ -1228,6 +1311,14 @@ class LuaRuntimeManager:
         self._print_window_start = 0.0
         self._suppressed_this_window = 0
         self._active = False
+        # Stage 3.5: set by client_studio.py right after constructing a
+        # LuaGameplayContext for this same Play session (see
+        # lua_gameplay_api.py) -- None whenever no gameplay layer is
+        # attached (e.g. a headless test that only exercises Script/
+        # LocalScript execution). __bridge_get_service (registered below)
+        # is the only thing that ever reads this; nothing in this class
+        # otherwise knows or cares that the gameplay layer exists.
+        self.gameplay: Any = None
 
     # ---------------- lifecycle ----------------
 
@@ -1527,6 +1618,30 @@ class LuaRuntimeManager:
         def bridge_require(module_id: Any) -> tuple:
             return self._require(str(module_id))
 
+        # Stage 3.5: game:GetService(name) -- only "game" itself may be
+        # asked for a service (matches get_property()'s own "game"/
+        # "Workspace" special-casing above); everything else, including
+        # "no gameplay layer attached at all" (e.g. a headless Script-only
+        # test), fails the exact same way Roblox's own GetService() does
+        # for an unrecognized name -- a clean, catchable Lua error, never
+        # a Python exception.
+        def bridge_get_service(instance_id: Any, name: Any) -> tuple:
+            if str(instance_id) != "game":
+                return False, "GetService is only callable on 'game'"
+            if self.gameplay is None:
+                return False, f"\"{name}\" is not a valid service"
+            return self.gameplay.get_service(str(name))
+
+        # Stage 3.5: lets LuaSignal:Connect() (defined in
+        # lua_gameplay_api.py's own prelude fragment, not this one) tag a
+        # new listener with the script that's connecting it, purely by
+        # reading the SAME current_script_id the scheduler already
+        # maintains for task.spawn/defer/delay attribution -- see
+        # LuaTaskScheduler.schedule_immediate_external()'s docstring for
+        # why this can't just be looked up from Lua's own `script` local.
+        def bridge_current_script_id() -> Optional[str]:
+            return self.scheduler.current_script_id
+
         g["__bridge_get"] = bridge_get
         g["__bridge_set"] = bridge_set
         g["__bridge_find_first_child"] = bridge_find_first_child
@@ -1538,6 +1653,8 @@ class LuaRuntimeManager:
         g["__bridge_instance_new"] = bridge_instance_new
         g["__bridge_now"] = bridge_now
         g["__bridge_require"] = bridge_require
+        g["__bridge_get_service"] = bridge_get_service
+        g["__bridge_current_script_id"] = bridge_current_script_id
         g["__bridge_schedule_immediate"] = self.scheduler.schedule_immediate
         g["__bridge_schedule_deferred"] = self.scheduler.schedule_deferred
         g["__bridge_schedule_delayed"] = self.scheduler.schedule_delayed

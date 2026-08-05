@@ -54,6 +54,7 @@ from studio_editor_live import (
 import character_controller
 import character_rig
 import editor_history
+import lua_gameplay_api
 import lua_runtime
 import physics
 import place_manager
@@ -1327,6 +1328,16 @@ class MultiplayerGame(Entity):
         # report).
         self._lua_runtime: lua_runtime.LuaRuntimeManager | None = None
 
+        # Stage 3.5: Lua Player/Character/Signal/UserInputService gameplay
+        # API (see lua_gameplay_api.py). Exists only between _start_lua()
+        # and _stop_lua() -- created AFTER LuaRuntimeManager.start()
+        # succeeds (needs a live VM to install its own prelude fragment
+        # into) and torn down BEFORE LuaRuntimeManager.stop() discards
+        # that VM, so CharacterRemoving listeners still have a live VM to
+        # run in when they fire (see LuaGameplayContext.stop()'s
+        # docstring).
+        self._lua_gameplay: lua_gameplay_api.LuaGameplayContext | None = None
+
         # Stage 2.5: authoritative Undo/Redo command history (see
         # editor_history.py for the full design). Sequence counter here is
         # deliberately SEPARATE from _model_drag_sequence_counter below —
@@ -1738,6 +1749,13 @@ class MultiplayerGame(Entity):
             self._stop_mouse_look()
             if self.studio_playing:
                 print("[CHARACTER] Play input released")
+            # Stage 3.5: whatever keys UserInputService still thought were
+            # held gets a synthetic InputEnded here -- covers every path
+            # that reaches this method (Escape, Qt focus loss,
+            # applicationStateChanged), not just Escape specifically, so
+            # "stuck key" can never survive losing capture for any reason.
+            if self._lua_gameplay is not None:
+                self._lua_gameplay.release_all_keys()
 
     def _start_lua(self) -> None:
         """Wrapped in try/except that ALWAYS prints a full traceback, for
@@ -1754,6 +1772,15 @@ class MultiplayerGame(Entity):
             print("[LUA_RUNTIME] EXCEPTION in _start_lua() -- Play mode continues but scripts did NOT start:")
             traceback.print_exc()
             self._lua_runtime = None
+            return
+
+        try:
+            self._lua_gameplay = lua_gameplay_api.LuaGameplayContext(self, self._lua_runtime)
+            self._lua_gameplay.start()
+        except Exception:
+            print("[LUA_GAMEPLAY] EXCEPTION in _start_lua() -- Play mode continues but Players/Character/UserInputService are NOT available to scripts this session:")
+            traceback.print_exc()
+            self._lua_gameplay = None
 
     def _forward_lua_diagnostic(self, diag: Any) -> None:
         """Stage 3.1: the code editor's gutter markers/Output-click
@@ -1774,6 +1801,18 @@ class MultiplayerGame(Entity):
             self.studio_adapter.on_lua_session_started(session_id)
 
     def _stop_lua(self) -> None:
+        if self._lua_gameplay is not None:
+            # MUST run before LuaRuntimeManager.stop() below -- see
+            # LuaGameplayContext.stop()'s docstring: CharacterRemoving
+            # needs a still-live VM (and a still-live character/rig, which
+            # _stop_character() hasn't torn down yet at this point in the
+            # existing Stop order) to fire correctly.
+            try:
+                self._lua_gameplay.stop()
+            except Exception:
+                print("[LUA_GAMEPLAY] EXCEPTION in _stop_lua():")
+                traceback.print_exc()
+            self._lua_gameplay = None
         if self._lua_runtime is None:
             return
         try:
@@ -1788,6 +1827,8 @@ class MultiplayerGame(Entity):
             return
         try:
             self._lua_runtime.update(ursina_time.dt)
+            if self._lua_gameplay is not None:
+                self._lua_gameplay.update(ursina_time.dt)
         except Exception:
             print("[LUA_RUNTIME] EXCEPTION in update_lua() -- stopping the Lua runtime for the rest of this Play session:")
             traceback.print_exc()
@@ -3464,6 +3505,20 @@ class MultiplayerGame(Entity):
                 self.focus_selected_part()
             return
 
+        # Stage 3.5: purely additive observer -- forwards every Play-mode
+        # key event to UserInputService's InputBegan/InputEnded (only for
+        # the small TRACKED_KEYS set; anything else is ignored internally,
+        # see LuaGameplayContext.on_key_event()) without replacing or
+        # reordering any of the existing handling below. Ursina's input()
+        # is only ever invoked for a genuine key event on the embedded
+        # viewport's own native window -- exactly why Script Editor/Qt
+        # text-field typing never reaches here in the first place (same
+        # native-focus boundary Stage 3.3's WASD movement already relies
+        # on), so no separate "suppress gameplay input while a Qt text
+        # field has focus" check is needed here.
+        if self._lua_gameplay is not None:
+            self._lua_gameplay.on_key_event(key)
+
         if key in ("escape", "escape up"):
             # Stage 3.3 spec: Escape always RELEASES capture (it no longer
             # toggles back on) -- re-capturing is exclusively via clicking
@@ -3502,6 +3557,30 @@ class MultiplayerGame(Entity):
         else:
             camera.position = Vec3(0, 0, 0)
 
+    def set_camera_mode(self, third_person: bool) -> None:
+        """Stage 3.5: explicit-set variant of the V-key toggle below, used
+        by the Lua Character API's SetCameraMode("FirstPerson"/
+        "ThirdPerson") -- see lua_gameplay_api.py. Shares the exact same
+        rig-vs-legacy-avatar branching and _apply_third_person_camera()
+        call toggle_third_person() already used; that method is now just
+        `self.set_camera_mode(not self.third_person_enabled)`, so both
+        callers can never drift out of sync with each other."""
+        third_person = bool(third_person)
+        if self._character_visual is not None:
+            self.third_person_enabled = third_person
+            self._character_visual.set_first_person(not third_person)
+            self._apply_third_person_camera()
+            return
+
+        if self.local_visual is None:
+            # No avatar to show in third person without --legacy-demo --
+            # no-op rather than raising, so the V shortcut (and the Lua
+            # API) stay harmless.
+            return
+        self.third_person_enabled = third_person
+        self.local_visual.enabled = third_person
+        self._apply_third_person_camera()
+
     def toggle_third_person(self) -> None:
         """Stage 3.4: prefers the new SStudio character rig (normal Play
         mode) over the legacy --legacy-demo PlayerVisual avatar, which this
@@ -3510,19 +3589,7 @@ class MultiplayerGame(Entity):
         local_visual toggle when no rig exists (e.g. --legacy-demo without
         the character controller having spawned one, or before Play has
         started), preserving that path's previous behavior unchanged."""
-        if self._character_visual is not None:
-            self.third_person_enabled = not self.third_person_enabled
-            self._character_visual.set_first_person(not self.third_person_enabled)
-            self._apply_third_person_camera()
-            return
-
-        if self.local_visual is None:
-            # No avatar to show in third person without --legacy-demo --
-            # no-op rather than raising, so the V shortcut stays harmless.
-            return
-        self.third_person_enabled = not self.third_person_enabled
-        self.local_visual.enabled = self.third_person_enabled
-        self._apply_third_person_camera()
+        self.set_camera_mode(not self.third_person_enabled)
 
     def update_mouse_look(self) -> None:
         if self._qt_look_available():
