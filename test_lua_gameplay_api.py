@@ -104,8 +104,8 @@ class _FakeGame:
             self._character_runtime.destroy()
 
 
-def add_script(game: _FakeGame, source: str, class_name: str = "LocalScript", name: str = "Script1", script_id: str = "script1") -> str:
-    game.instances[script_id] = cs.InstanceRecord(script_id, class_name, name, None, {"Source": source})
+def add_script(game: _FakeGame, source: str, class_name: str = "LocalScript", name: str = "Script1", script_id: str = "script1", parent_id: str | None = None) -> str:
+    game.instances[script_id] = cs.InstanceRecord(script_id, class_name, name, parent_id, {"Source": source})
     return script_id
 
 
@@ -938,6 +938,213 @@ def test_no_python_object_escapes_into_lua() -> None:
 
 
 # ============================================================
+# Stage 3.6 -- execution roots / gameplay-context startup ordering
+#
+# Unlike every test above (which adds scripts AFTER make_context() and
+# bypasses discovery via manager._start_script() directly, since Stage 3.5
+# never cared about WHERE a script lived), these tests add scripts to
+# game.instances BEFORE calling make_context()/manager.start(), so the
+# real build_script_execution_plan()-driven discovery in start() is what
+# actually finds and runs them -- exercising the full, real Play-time path
+# for the new StarterPlayer/ServerScriptService roots, not just the
+# lower-level lua_runtime tests in test_script_execution_plan.py.
+# ============================================================
+
+def test_localscript_under_starterplayer_is_auto_discovered_and_runs() -> None:
+    game = _FakeGame()
+    add_script(game, "print('starterplayer-ran')", class_name="LocalScript", script_id="s1", parent_id="StarterPlayer")
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(any("starterplayer-ran" in m for m in messages), "a LocalScript parented under StarterPlayer is auto-discovered and runs, with no manual _start_script() call")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_script_under_server_script_service_is_auto_discovered_and_runs() -> None:
+    game = _FakeGame()
+    add_script(game, "print('serverscriptservice-ran')", class_name="Script", script_id="s1", parent_id="ServerScriptService")
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(any("serverscriptservice-ran" in m for m in messages), "a Script parented under ServerScriptService is auto-discovered and runs")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_localscript_under_workspace_still_runs_and_gets_character_added() -> None:
+    """Regression guard: the Stage 3.5 Workspace-rooted path must not
+    regress now that discovery is multi-root."""
+    game = _FakeGame()
+    add_script(
+        game,
+        "game:GetService('Players').LocalPlayer.CharacterAdded:Connect(function(c) print('workspace-character-added') end)",
+        class_name="LocalScript", script_id="s1", parent_id="Workspace",
+    )
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(any("workspace-character-added" in m for m in messages), "CharacterAdded still fires normally for a Workspace-rooted LocalScript (no regression)")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_localscript_under_replicatedstorage_is_skipped_with_one_warning() -> None:
+    game = _FakeGame()
+    add_script(game, "print('should-never-run')", class_name="LocalScript", name="Input", script_id="s1", parent_id="ReplicatedStorage")
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(not any("should-never-run" in m for m in messages), "a LocalScript under ReplicatedStorage never actually executes")
+        warnings = [d for d in manager.diagnostics if d.severity == "warning" and "was skipped" in d.message]
+        check(len(warnings) == 1, "exactly one skipped-location warning is emitted, at Play startup")
+        check("ReplicatedStorage" in warnings[0].message and "s1" in warnings[0].message, "the warning names the actual (unsupported) location and the stable instance id")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_gameplay_services_available_on_first_line_of_starterplayer_localscript() -> None:
+    """The exact example script from the Stage 3.6 spec: Players and
+    UserInputService must both already be usable on a StarterPlayer
+    LocalScript's very first executed lines -- proving gameplay-context
+    startup ordering holds for the new root, not just the Workspace one
+    Stage 3.5 already verified."""
+    game = _FakeGame()
+    source = (
+        "local Players = game:GetService('Players')\n"
+        "local UserInputService = game:GetService('UserInputService')\n"
+        "local player = Players.LocalPlayer\n"
+        "print(player.Name)\n"
+    )
+    add_script(game, source, class_name="LocalScript", script_id="s1", parent_id="StarterPlayer")
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        errors = [d for d in manager.diagnostics if d.severity == "error"]
+        check(errors == [], f"no errors starting up services from a StarterPlayer LocalScript's first lines: {[e.message for e in errors]}")
+        messages = [d.message for d in manager.diagnostics]
+        check(any(lga.LOCAL_PLAYER_NAME in m for m in messages), "Players.LocalPlayer.Name printed correctly from a StarterPlayer LocalScript")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_userinputservice_works_from_starterplayer_localscript() -> None:
+    game = _FakeGame()
+    source = "game:GetService('UserInputService').InputBegan:Connect(function(input) print('starterplayer-input', input.KeyCode) end)"
+    add_script(game, source, class_name="LocalScript", script_id="s1", parent_id="StarterPlayer")
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        ctx.on_key_event("w")
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(any("starterplayer-input\tW" in m for m in messages), "UserInputService.InputBegan fires correctly for a StarterPlayer LocalScript")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_modulescript_required_from_replicatedstorage_via_getservice() -> None:
+    """Exercises the full real-syntax chain: game:GetService('ReplicatedStorage')
+    -> :FindFirstChild(name) -> require(proxy) -- not just the underlying
+    location-agnostic _require() Python method (already covered structurally
+    by Stage 3.0), and not just the discovery-plan question of WHETHER a
+    ModuleScript ever tries to auto-run (it must not, see
+    test_script_execution_plan.py)."""
+    game = _FakeGame()
+    game.instances["mod1"] = cs.InstanceRecord("mod1", "ModuleScript", "MyModule", "ReplicatedStorage", {"Source": "return 42"})
+    source = (
+        "local ReplicatedStorage = game:GetService('ReplicatedStorage')\n"
+        "local mod = ReplicatedStorage:FindFirstChild('MyModule')\n"
+        "local value = require(mod)\n"
+        "print('required', value)\n"
+    )
+    add_script(game, source, class_name="LocalScript", script_id="s1", parent_id="Workspace")
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        errors = [d for d in manager.diagnostics if d.severity == "error"]
+        check(errors == [], f"require() from ReplicatedStorage via GetService/FindFirstChild works with no errors: {[e.message for e in errors]}")
+        messages = [d.message for d in manager.diagnostics]
+        check(any("required\t42" in m for m in messages), "the ModuleScript's return value comes back correctly through require()")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_modulescript_cache_is_once_per_session() -> None:
+    game = _FakeGame()
+    game.instances["mod1"] = cs.InstanceRecord("mod1", "ModuleScript", "Counted", "ReplicatedStorage", {"Source": "_G.__load_count = (_G.__load_count or 0) + 1\nreturn _G.__load_count"})
+    source = (
+        "local RS = game:GetService('ReplicatedStorage')\n"
+        "local mod = RS:FindFirstChild('Counted')\n"
+        "local a = require(mod)\n"
+        "local b = require(mod)\n"
+        "print('counts', a, b)\n"
+    )
+    add_script(game, source, class_name="LocalScript", script_id="s1", parent_id="Workspace")
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(any("counts\t1\t1" in m for m in messages), "requiring the same ModuleScript twice in one session only executes its body once (cached)")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_diagnostics_preserve_correct_id_and_line_for_starterplayer_script() -> None:
+    game = _FakeGame()
+    source = "print('before')\nerror('boom')\n"
+    add_script(game, source, class_name="LocalScript", script_id="starterplayer_script_id", parent_id="StarterPlayer")
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        errors = [d for d in manager.diagnostics if d.severity == "error"]
+        check(len(errors) == 1, "exactly one error diagnostic for the runtime error")
+        check(errors and errors[0].script_id == "starterplayer_script_id", "the diagnostic's script_id is the StarterPlayer script's own stable instance id")
+        check(errors and errors[0].line == 2, f"the diagnostic points at line 2 (the error() call), got {errors[0].line if errors else None}")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_second_play_creates_fresh_execution_plan_and_old_callbacks_are_silent() -> None:
+    game = _FakeGame()
+    add_script(game, "print('session1-starterplayer')", class_name="LocalScript", script_id="s1", parent_id="StarterPlayer")
+    manager1, ctx1 = make_context(game)
+    run_frame(manager1, ctx1)
+    plan1_ids = [e.instance_id for e in manager1._execution_plan]
+    teardown(game, manager1, ctx1)
+    game.teardown()
+
+    game2 = _FakeGame()
+    add_script(game2, "print('session2-starterplayer')", class_name="LocalScript", script_id="s1", parent_id="StarterPlayer")
+    manager2, ctx2 = make_context(game2)
+    try:
+        run_frame(manager2, ctx2)
+        messages = [d.message for d in manager2.diagnostics]
+        check(any("session2-starterplayer" in m for m in messages), "the new session's own StarterPlayer script runs")
+        check(not any("session1-starterplayer" in m for m in messages), "the OLD session's StarterPlayer script never fires in the new session")
+        check(plan1_ids == ["s1"] and [e.instance_id for e in manager2._execution_plan] == ["s1"], "each session independently builds its own fresh execution plan")
+    finally:
+        teardown(game2, manager2, ctx2)
+        game.teardown()
+
+
+def test_build_script_execution_plan_never_touches_history_or_dirty_state() -> None:
+    """Structural check, same technique as
+    test_character_appearance_never_dirties_or_serializes: script
+    discovery/startup is a pure read of the authoritative hierarchy, never
+    a Place edit."""
+    import inspect
+    source = inspect.getsource(lua_runtime.build_script_execution_plan)
+    check("mark_place_dirty" not in source, "build_script_execution_plan(): never calls mark_place_dirty()")
+    check(".history" not in source, "build_script_execution_plan(): never touches editor Undo/Redo history")
+    check(source.count("instances[") == 0 and source.count("instances.pop") == 0, "build_script_execution_plan(): never writes to the instances dict (read-only)")
+
+
+# ============================================================
 # run everything
 # ============================================================
 
@@ -983,6 +1190,18 @@ test_no_input_events_outside_play()
 test_repeated_play_stop_creates_fresh_context_and_old_signals_silent()
 test_new_character_added_fires_in_new_session()
 test_no_python_object_escapes_into_lua()
+
+test_localscript_under_starterplayer_is_auto_discovered_and_runs()
+test_script_under_server_script_service_is_auto_discovered_and_runs()
+test_localscript_under_workspace_still_runs_and_gets_character_added()
+test_localscript_under_replicatedstorage_is_skipped_with_one_warning()
+test_gameplay_services_available_on_first_line_of_starterplayer_localscript()
+test_userinputservice_works_from_starterplayer_localscript()
+test_modulescript_required_from_replicatedstorage_via_getservice()
+test_modulescript_cache_is_once_per_session()
+test_diagnostics_preserve_correct_id_and_line_for_starterplayer_script()
+test_second_play_creates_fresh_execution_plan_and_old_callbacks_are_silent()
+test_build_script_execution_plan_never_touches_history_or_dirty_state()
 
 print()
 if FAILURES:

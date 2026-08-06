@@ -743,17 +743,25 @@ class RuntimeSceneLayer:
         return None
 
     def full_name_of(self, instance_id: str) -> str:
+        """Stage 3.6 fix: this used to hardcode "Workspace" as the only
+        recognized root, so a script under any OTHER pseudo-root (e.g.
+        ServerScriptService, StarterPlayer) hit name_of() returning None on
+        that root string (it isn't a real Instance) and silently fell back
+        to a path ending in ".Workspace" regardless of its real location.
+        Now every shared.object_registry.ROOT_SERVICES string is a
+        recognized terminal segment, not just "Workspace"."""
+        from shared.object_registry import ROOT_SERVICES
         parts: list[str] = []
         current: Optional[str] = instance_id
         seen: set[str] = set()
-        while current is not None and current not in ("Workspace",) and current not in seen:
+        while current is not None and current not in ROOT_SERVICES and current not in seen:
             seen.add(current)
             name = self.name_of(current)
             if name is None:
                 break
             parts.append(name)
             current = self.parent_of(current)
-        parts.append("Workspace")
+        parts.append(current if current in ROOT_SERVICES else "Workspace")
         return ".".join(reversed(parts))
 
     def is_a(self, instance_id: str, class_name: str) -> bool:
@@ -1282,6 +1290,177 @@ class LuaTaskScheduler:
 
 
 # ============================================================
+# SCRIPT EXECUTION PLAN -- Stage 3.6.
+#
+# Replaces the Stage 3.0-3.5 Workspace-only BFS (_discover_run_order, now
+# removed) with explicit, named execution roots per class:
+#   Script      auto-runs from Workspace, ServerScriptService.
+#   LocalScript auto-runs from Workspace, StarterPlayer.
+#   ModuleScript NEVER auto-runs (require()-only, unchanged from Stage 3.0).
+#
+# StarterPlayerScripts is intentionally NOT introduced here: it does not
+# exist anywhere in shared/object_registry.py's ROOT_SERVICES, in any of
+# the 12 templates, or in any allowed_parent_types list today. Inventing a
+# new pseudo-container purely for this stage would be schema surface with
+# no editor-side support (Insert Object, default_parent, drag-reparent
+# validation) behind it. StarterPlayer itself already covers the "a
+# LocalScript conventionally lives under StarterPlayer" case end-to-end
+# (it's already LocalScript's schema default_parent). A dedicated
+# StarterPlayerScripts container is a clean future extension: add it to
+# ROOT_SERVICES + LocalScript.allowed_parent_types, then add its literal
+# string to _LOCALSCRIPT_ROOTS below -- nothing else in this module would
+# need to change.
+#
+# Still no true server/client VM split: Script and LocalScript both run in
+# the SAME local Play VM, same sandbox, same scheduler budget -- only
+# their *discovery* is root-aware now. See LuaGameplayContext's module
+# docstring for the matching UserInputService-is-really-LocalScript-only
+# caveat this shares.
+# ============================================================
+
+_SCRIPT_ROOTS: tuple[str, ...] = ("Workspace", "ServerScriptService")
+_LOCALSCRIPT_ROOTS: tuple[str, ...] = ("Workspace", "StarterPlayer")
+# Fixed walk order -- this is what makes overall execution order
+# deterministic across repeated Play sessions: every Workspace-rooted
+# script (Script and LocalScript interleaved in natural parent-before-
+# child, id-tiebroken BFS order) runs first, then every ServerScriptService
+# script, then every StarterPlayer LocalScript. Walking "Workspace" only
+# ONCE (not once per class) is also what makes overlap-safety free: a
+# Script and a LocalScript can never both claim the same instance id (an
+# instance has exactly one class_name), and each of these three literal
+# root strings is only ever walked a single time.
+_EXECUTION_ROOTS: tuple[str, ...] = ("Workspace", "ServerScriptService", "StarterPlayer")
+
+# Names game:GetService() will hand back as a plain generic Instance proxy
+# (see bridge_get_service below) when no gameplay-specific service already
+# claimed them. Deliberately every shared.object_registry.ROOT_SERVICES
+# entry EXCEPT "Players" -- Players must stay gameplay-mediated-only so it
+# keeps failing cleanly when no gameplay layer is attached, instead of
+# silently handing back a useless memberless container.
+_GENERIC_CONTAINER_SERVICES: frozenset[str] = frozenset(
+    {"Workspace", "StarterPlayer", "StarterGui", "ReplicatedStorage", "ServerScriptService", "ServerStorage"}
+)
+
+
+@dataclass(frozen=True)
+class ScriptExecutionEntry:
+    """One Script/LocalScript that WILL be started this Play session, in
+    the exact order build_script_execution_plan() decided. order_key is
+    redundant with list position (entries are already returned in run
+    order) but kept explicit so tests/diagnostics can assert on it without
+    depending on list identity."""
+    instance_id: str
+    class_name: str  # "Script" | "LocalScript"
+    root_service: str  # which _EXECUTION_ROOTS entry this was discovered under
+    hierarchy_path: str
+    order_key: int
+
+
+@dataclass(frozen=True)
+class SkippedScriptInfo:
+    """One ENABLED Script/LocalScript that exists in the authoritative
+    hierarchy but is not reachable from any root valid for its class --
+    reported once as an Output warning, never executed. ModuleScript is
+    never represented here (see build_script_execution_plan)."""
+    instance_id: str
+    class_name: str
+    hierarchy_path: str
+    actual_root: str  # best-effort: the real top-level container it sits under
+
+
+def _find_top_level_root(instance_id: str, instances: dict[str, Any]) -> str:
+    """Walk parent_id upward from instance_id until a known ROOT_SERVICES
+    string is reached, for skipped-script diagnostics only. Defensive
+    depth cap + visited-set guard against a corrupted/cyclic parent chain
+    (see build_script_execution_plan's docstring for why an ordinary,
+    root-reachable cycle cannot actually occur given the single-parent_id
+    model -- this handles the pathological case of a chain that was
+    corrupted into a cycle disconnected from every known root)."""
+    from shared.object_registry import ROOT_SERVICES
+    visited: set[str] = set()
+    current_id = instance_id
+    for _ in range(10_000):
+        record = instances.get(current_id)
+        if record is None:
+            return "Workspace"
+        parent = record.parent_id or "Workspace"
+        if parent in ROOT_SERVICES:
+            return parent
+        if parent in visited:
+            return "Unknown"
+        visited.add(parent)
+        current_id = parent
+    return "Unknown"
+
+
+def build_script_execution_plan(
+    instances: dict[str, Any],
+    path_of: Optional[Callable[[str], str]] = None,
+) -> tuple[list[ScriptExecutionEntry], list[SkippedScriptInfo]]:
+    """Pure function, no Lua/Qt/Ursina dependency -- takes the same
+    `dict[str, InstanceRecord]` shape as MultiplayerGame.instances (or a
+    plain test double with .id/.class_name/.parent_id/.enabled) and
+    returns (entries to start in order, skipped-but-enabled scripts to
+    warn about). Never mutates `instances`.
+
+    Cycle safety: each instance has exactly ONE parent_id value, so it can
+    only ever appear in exactly one children_by_parent bucket -- a node
+    reachable from a fixed root string therefore has a unique, finite path
+    from that root (revisiting would require the same id to be a child of
+    two different already-visited parents simultaneously, which the data
+    model cannot represent). The per-root `visited_this_root` set below is
+    still kept as an explicit, cheap guard rather than relying on that
+    proof alone.
+    """
+    if path_of is None:
+        path_of = lambda instance_id: instance_id  # noqa: E731 -- trivial test fallback
+
+    children_by_parent: dict[str, list[str]] = {}
+    for record in instances.values():
+        children_by_parent.setdefault(record.parent_id or "Workspace", []).append(record.id)
+    for ids in children_by_parent.values():
+        ids.sort()
+
+    entries: list[ScriptExecutionEntry] = []
+    seen: set[str] = set()
+    order_key = 0
+
+    for root in _EXECUTION_ROOTS:
+        frontier: list[str] = list(children_by_parent.get(root, []))
+        visited_this_root: set[str] = set()
+        while frontier:
+            current_id = frontier.pop(0)
+            if current_id in visited_this_root:
+                continue
+            visited_this_root.add(current_id)
+            record = instances.get(current_id)
+            if record is None:
+                continue
+            if current_id not in seen:
+                if record.class_name == "Script" and record.enabled and root in _SCRIPT_ROOTS:
+                    entries.append(ScriptExecutionEntry(current_id, "Script", root, path_of(current_id), order_key))
+                    seen.add(current_id)
+                    order_key += 1
+                elif record.class_name == "LocalScript" and record.enabled and root in _LOCALSCRIPT_ROOTS:
+                    entries.append(ScriptExecutionEntry(current_id, "LocalScript", root, path_of(current_id), order_key))
+                    seen.add(current_id)
+                    order_key += 1
+            frontier.extend(children_by_parent.get(current_id, []))
+
+    skipped: list[SkippedScriptInfo] = []
+    for record in instances.values():
+        if record.class_name not in ("Script", "LocalScript"):
+            continue  # ModuleScript never auto-runs and never gets a skipped warning either
+        if not record.enabled or record.id in seen:
+            continue
+        skipped.append(SkippedScriptInfo(
+            record.id, record.class_name, path_of(record.id), _find_top_level_root(record.id, instances),
+        ))
+
+    return entries, skipped
+
+
+# ============================================================
 # LUA RUNTIME MANAGER -- top-level orchestrator, one per Play session.
 # ============================================================
 
@@ -1307,6 +1486,9 @@ class LuaRuntimeManager:
         self._module_cache: dict[str, Any] = {}
         self._module_in_progress: set[str] = set()
         self._script_names: dict[str, str] = {}
+        # Stage 3.6: the execution plan from the most recent start(), kept
+        # for introspection/tests -- see build_script_execution_plan().
+        self._execution_plan: list[ScriptExecutionEntry] = []
         self._print_count = 0
         self._print_window_start = 0.0
         self._suppressed_this_window = 0
@@ -1358,11 +1540,29 @@ class LuaRuntimeManager:
         self.lua.execute(_build_prelude_source())
         self._active = True
 
-        run_order = self._discover_run_order()
-        for script_id in run_order:
-            self._start_script(script_id)
+        # Stage 3.6: explicit multi-root execution plan replaces the old
+        # Workspace-only BFS. This still runs entirely BEFORE
+        # LuaGameplayContext.start() is even constructed (see
+        # client_studio.py's _start_lua()) -- but that's fine: start_script()
+        # only ENQUEUES each script's top-level coroutine via
+        # scheduler.start_script() (a deadline=0.0 pending entry), it does
+        # not resume it. The first time any script body actually executes
+        # is the first update_lua() tick next frame, by which point
+        # _start_lua() has already fully returned -- gameplay context
+        # construction included. game:GetService(...) is therefore already
+        # live before a single line of Script/LocalScript source runs.
+        self._execution_plan, skipped = build_script_execution_plan(self.game.instances, self.scene.full_name_of)
+        for skip in skipped:
+            self._report_error(
+                "<engine>",
+                f'{skip.class_name} "{skip.hierarchy_path}" (id={skip.instance_id}) was skipped: '
+                f'{skip.class_name} does not auto-run from {skip.actual_root}.',
+                severity="warning",
+            )
+        for entry in self._execution_plan:
+            self._start_script(entry.instance_id)
 
-        _debug(f"start(): {len(run_order)} script(s) launched, {len(self.diagnostics)} diagnostic(s) so far")
+        _debug(f"start(): {len(self._execution_plan)} script(s) launched, {len(skipped)} skipped, {len(self.diagnostics)} diagnostic(s) so far")
         return list(self.diagnostics)
 
     def update(self, dt: float) -> None:
@@ -1386,24 +1586,9 @@ class LuaRuntimeManager:
         _debug("stop(): runtime torn down")
 
     # ---------------- script discovery / startup ----------------
-
-    def _discover_run_order(self) -> list[str]:
-        children_by_parent: dict[str, list[str]] = {}
-        for record in self.game.instances.values():
-            children_by_parent.setdefault(record.parent_id or "Workspace", []).append(record.id)
-        for ids in children_by_parent.values():
-            ids.sort()
-
-        order: list[str] = []
-        frontier: list[str] = ["Workspace"]
-        while frontier:
-            current = frontier.pop(0)
-            for child_id in children_by_parent.get(current, []):
-                record = self.game.instances.get(child_id)
-                if record is not None and record.class_name in ("Script", "LocalScript") and record.enabled:
-                    order.append(child_id)
-                frontier.append(child_id)
-        return order
+    # See build_script_execution_plan() above (Stage 3.6) for the actual
+    # discovery algorithm; start() calls it directly and stores the result
+    # in self._execution_plan for introspection/tests.
 
     def _start_script(self, script_id: str) -> None:
         record = self.game.instances.get(script_id)
@@ -1625,12 +1810,33 @@ class LuaRuntimeManager:
         # test), fails the exact same way Roblox's own GetService() does
         # for an unrecognized name -- a clean, catchable Lua error, never
         # a Python exception.
+        #
+        # Stage 3.6 addition: the gameplay-mediated names (currently just
+        # "Players"/"UserInputService") are tried FIRST and, if attached,
+        # always win. Any OTHER name in shared.object_registry.ROOT_SERVICES
+        # except "Players" itself now falls back to a plain generic
+        # Instance proxy for that pseudo-root -- this is what makes
+        # `require(ReplicatedStorage:FindFirstChild("Foo"))` (and the
+        # equivalent for ServerScriptService/StarterPlayer/Workspace/
+        # StarterGui/ServerStorage) actually reachable from real script
+        # code, not just true "in theory" because _require() itself never
+        # cared about location. This is generic object-model plumbing
+        # (the same FindFirstChild/GetChildren machinery every other
+        # Instance proxy already has), not a new gameplay API -- "Players"
+        # is deliberately excluded here so it keeps failing cleanly
+        # (instead of returning a useless memberless container) whenever
+        # no gameplay layer is attached, exactly as before.
         def bridge_get_service(instance_id: Any, name: Any) -> tuple:
             if str(instance_id) != "game":
                 return False, "GetService is only callable on 'game'"
-            if self.gameplay is None:
-                return False, f"\"{name}\" is not a valid service"
-            return self.gameplay.get_service(str(name))
+            name = str(name)
+            if self.gameplay is not None:
+                ok, result = self.gameplay.get_service(name)
+                if ok:
+                    return True, result
+            if name in _GENERIC_CONTAINER_SERVICES:
+                return True, self.lua.eval("__make_proxy")(name)
+            return False, f"\"{name}\" is not a valid service"
 
         # Stage 3.5: lets LuaSignal:Connect() (defined in
         # lua_gameplay_api.py's own prelude fragment, not this one) tag a
