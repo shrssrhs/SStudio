@@ -848,6 +848,24 @@ def test_escape_release_clears_held_keys() -> None:
         teardown(game, manager, ctx)
 
 
+def test_on_key_event_ignores_mouse_and_scroll_keys() -> None:
+    """Stage 3.7: input() now forwards "right mouse down"/"right mouse
+    up"/"scroll up"/"scroll down" (and "left mouse down" is now also
+    reachable while third-person, uncaptured) to on_key_event() every Play
+    frame those fire, alongside every other key -- on_key_event() itself
+    needed no Stage 3.7 changes because TRACKED_KEYS never included any of
+    these, so this just confirms that stays true (spec: "RMB camera
+    movement must not generate excessive mouse-move Lua events")."""
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        for key in ("right mouse down", "right mouse up", "left mouse down", "scroll up", "scroll down"):
+            ctx.on_key_event(key)
+        check(not ctx._held_keys, "mouse/scroll key strings are never added to held-key state")
+    finally:
+        teardown(game, manager, ctx)
+
+
 def test_stop_clears_held_key_state() -> None:
     game = _FakeGame()
     manager, ctx = make_context(game)
@@ -1184,6 +1202,7 @@ test_jump_request_fires_on_space()
 test_is_key_down()
 test_is_input_captured_reflects_game_state()
 test_escape_release_clears_held_keys()
+test_on_key_event_ignores_mouse_and_scroll_keys()
 test_stop_clears_held_key_state()
 test_no_input_events_outside_play()
 

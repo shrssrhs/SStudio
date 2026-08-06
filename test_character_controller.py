@@ -457,6 +457,167 @@ def test_escape_releases_rather_than_toggles_in_play() -> None:
     check("release_play_input_capture" in source, "Play-mode Escape handling calls release_play_input_capture()")
 
 
+# ============================================================
+# TIER 4: Stage 3.7 -- Roblox-Studio-style Play input model
+# (third-person free cursor by default, temporary RMB-hold camera-look,
+# mouse-wheel zoom, and the explicit play_input_state() coordinator).
+# Same two techniques as Tier 3: real executable logic for the two new
+# methods that are pure enough to call against a duck-typed stand-in
+# (no live Ursina Entity/window needed), and inspect.getsource() structural
+# checks for everything else that genuinely requires one.
+# ============================================================
+
+
+class _PlayInputStateStandIn:
+    """Duck-typed stand-in for play_input_state()'s `self` -- the method
+    only ever reads studio_playing/third_person_enabled/
+    _mouse_look_captured() and the five PLAY_INPUT_STATE_* class
+    constants, so a real MultiplayerGame (which needs a live Ursina app)
+    is not required to exercise its actual branching logic."""
+
+    PLAY_INPUT_STATE_EDITOR_UI = cs.MultiplayerGame.PLAY_INPUT_STATE_EDITOR_UI
+    PLAY_INPUT_STATE_THIRD_PERSON_FREE_CURSOR = cs.MultiplayerGame.PLAY_INPUT_STATE_THIRD_PERSON_FREE_CURSOR
+    PLAY_INPUT_STATE_THIRD_PERSON_RMB_LOOK = cs.MultiplayerGame.PLAY_INPUT_STATE_THIRD_PERSON_RMB_LOOK
+    PLAY_INPUT_STATE_FIRST_PERSON_CAPTURED = cs.MultiplayerGame.PLAY_INPUT_STATE_FIRST_PERSON_CAPTURED
+    PLAY_INPUT_STATE_FIRST_PERSON_RELEASED = cs.MultiplayerGame.PLAY_INPUT_STATE_FIRST_PERSON_RELEASED
+
+    play_input_state = cs.MultiplayerGame.play_input_state
+
+    def __init__(self, studio_playing: bool, third_person_enabled: bool, captured: bool) -> None:
+        self.studio_playing = studio_playing
+        self.third_person_enabled = third_person_enabled
+        self._captured = captured
+
+    def _mouse_look_captured(self) -> bool:
+        return self._captured
+
+
+def test_play_input_state_editor_ui_when_not_playing() -> None:
+    state = _PlayInputStateStandIn(studio_playing=False, third_person_enabled=True, captured=False).play_input_state()
+    check(state == cs.MultiplayerGame.PLAY_INPUT_STATE_EDITOR_UI, "play_input_state(): EDITOR_UI whenever Play isn't running, regardless of leftover mode flags")
+
+
+def test_play_input_state_third_person_free_cursor() -> None:
+    state = _PlayInputStateStandIn(studio_playing=True, third_person_enabled=True, captured=False).play_input_state()
+    check(state == cs.MultiplayerGame.PLAY_INPUT_STATE_THIRD_PERSON_FREE_CURSOR, "play_input_state(): third-person + not captured -> PLAY_THIRD_PERSON_FREE_CURSOR (the Play default)")
+
+
+def test_play_input_state_third_person_rmb_look() -> None:
+    state = _PlayInputStateStandIn(studio_playing=True, third_person_enabled=True, captured=True).play_input_state()
+    check(state == cs.MultiplayerGame.PLAY_INPUT_STATE_THIRD_PERSON_RMB_LOOK, "play_input_state(): third-person + captured -> PLAY_THIRD_PERSON_RMB_LOOK")
+
+
+def test_play_input_state_first_person_captured() -> None:
+    state = _PlayInputStateStandIn(studio_playing=True, third_person_enabled=False, captured=True).play_input_state()
+    check(state == cs.MultiplayerGame.PLAY_INPUT_STATE_FIRST_PERSON_CAPTURED, "play_input_state(): first-person + captured -> PLAY_FIRST_PERSON_CAPTURED")
+
+
+def test_play_input_state_first_person_released() -> None:
+    state = _PlayInputStateStandIn(studio_playing=True, third_person_enabled=False, captured=False).play_input_state()
+    check(state == cs.MultiplayerGame.PLAY_INPUT_STATE_FIRST_PERSON_RELEASED, "play_input_state(): first-person + not captured -> PLAY_FIRST_PERSON_RELEASED (post-Escape)")
+
+
+class _ZoomStandIn:
+    """Duck-typed stand-in for _adjust_third_person_distance()'s `self` --
+    only reads/writes _third_person_distance and, while actually Playing in
+    third-person, calls _apply_third_person_camera() (counted here rather
+    than executed for real, since that needs a live `camera` Entity)."""
+
+    _adjust_third_person_distance = cs.MultiplayerGame._adjust_third_person_distance
+
+    def __init__(self, distance: float, studio_playing: bool, third_person_enabled: bool) -> None:
+        self._third_person_distance = distance
+        self.studio_playing = studio_playing
+        self.third_person_enabled = third_person_enabled
+        self.camera_apply_calls = 0
+
+    def _apply_third_person_camera(self) -> None:
+        self.camera_apply_calls += 1
+
+
+def test_third_person_zoom_step_and_bounds_are_sane() -> None:
+    check(cs.THIRD_PERSON_MIN_DISTANCE < cs.THIRD_PERSON_DISTANCE < cs.THIRD_PERSON_MAX_DISTANCE, "THIRD_PERSON_DISTANCE (the Play-start default) sits strictly inside [MIN, MAX]")
+    check(cs.THIRD_PERSON_ZOOM_STEP > 0, "THIRD_PERSON_ZOOM_STEP is a positive step size")
+
+
+def test_third_person_zoom_clamps_to_min() -> None:
+    standin = _ZoomStandIn(cs.THIRD_PERSON_MIN_DISTANCE, studio_playing=True, third_person_enabled=True)
+    standin._adjust_third_person_distance(-999.0)
+    check(standin._third_person_distance == cs.THIRD_PERSON_MIN_DISTANCE, "zooming in past the minimum clamps to THIRD_PERSON_MIN_DISTANCE")
+    check(standin.camera_apply_calls == 1, "zoom re-applies the camera transform exactly once while playing in third-person")
+
+
+def test_third_person_zoom_clamps_to_max() -> None:
+    standin = _ZoomStandIn(cs.THIRD_PERSON_MAX_DISTANCE, studio_playing=True, third_person_enabled=True)
+    standin._adjust_third_person_distance(999.0)
+    check(standin._third_person_distance == cs.THIRD_PERSON_MAX_DISTANCE, "zooming out past the maximum clamps to THIRD_PERSON_MAX_DISTANCE")
+
+
+def test_third_person_zoom_noop_outside_play_or_first_person() -> None:
+    not_playing = _ZoomStandIn(cs.THIRD_PERSON_DISTANCE, studio_playing=False, third_person_enabled=True)
+    not_playing._adjust_third_person_distance(1.0)
+    check(not_playing.camera_apply_calls == 0, "zoom never re-applies the camera transform while Play isn't running")
+
+    first_person = _ZoomStandIn(cs.THIRD_PERSON_DISTANCE, studio_playing=True, third_person_enabled=False)
+    first_person._adjust_third_person_distance(1.0)
+    check(first_person.camera_apply_calls == 0, "zoom never re-applies the camera transform while in first-person (mouse wheel is third-person-only)")
+    check(first_person._third_person_distance != cs.THIRD_PERSON_DISTANCE, "the stored distance itself is still tracked even in first-person, so it's ready the moment the user switches back")
+
+
+def test_play_defaults_to_third_person_free_cursor_not_captured() -> None:
+    source = inspect.getsource(cs.MultiplayerGame.set_studio_playing)
+    check("self.third_person_enabled = True" in source, "set_studio_playing(True) defaults every fresh Play session to third-person")
+    playing_branch = source.split("else:")[0]
+    check("self._start_mouse_look()" not in playing_branch, "set_studio_playing(True) no longer force-captures the pointer on Play start (Stage 3.6 and earlier did) -- the free cursor is the default now")
+
+
+def test_stop_releases_capture_through_shared_idempotent_path() -> None:
+    source = inspect.getsource(cs.MultiplayerGame.set_studio_playing)
+    stop_branch = source.split("else:", 1)[1]
+    check("self.release_play_input_capture()" in stop_branch, "Stop routes through release_play_input_capture() (releases capture, ends RMB drag, and clears held keys in one idempotent call), not a bare _stop_mouse_look()")
+    check("self._stop_mouse_look()" not in stop_branch, "Stop no longer calls _stop_mouse_look() directly -- release_play_input_capture() is the single chokepoint so Stop works first-click from every Play input state")
+
+
+def test_left_click_never_captures_in_third_person() -> None:
+    source = inspect.getsource(cs.MultiplayerGame.input)
+    play_branch = source.split("if self._lua_gameplay is not None:", 1)[1]
+    check('elif key == "left mouse down":' in play_branch, "Play-mode input() still has its own left-mouse-down branch")
+    left_click_branch = play_branch.split('elif key == "left mouse down":', 1)[1].split("elif key ==", 1)[0]
+    check("not self.third_person_enabled" in left_click_branch, "left-click only ever starts mouse-look capture when third_person_enabled is False (first-person) -- third-person's free cursor is never captured by a plain click")
+
+
+def test_rmb_hold_only_captures_in_third_person() -> None:
+    source = inspect.getsource(cs.MultiplayerGame.input)
+    play_branch = source.split("if self._lua_gameplay is not None:", 1)[1]
+    rmb_down_branch = play_branch.split('elif key == "right mouse down":', 1)[1].split('elif key == "right mouse up":', 1)[0]
+    check("self.third_person_enabled" in rmb_down_branch, "Play-mode RMB-down only starts mouse-look while third_person_enabled -- it's a deliberate no-op in first-person (Escape is the only way to shorten first-person capture)")
+    rmb_up_branch = play_branch.split('elif key == "right mouse up":', 1)[1].split('elif key == "left mouse down":', 1)[0]
+    check("self.third_person_enabled" in rmb_up_branch, "Play-mode RMB-up only releases mouse-look while third_person_enabled -- releasing RMB never shortens first-person's permanent capture")
+
+
+def test_scroll_keys_adjust_third_person_zoom() -> None:
+    source = inspect.getsource(cs.MultiplayerGame.input)
+    play_branch = source.split("if self._lua_gameplay is not None:", 1)[1]
+    check('"scroll up"' in play_branch and "_adjust_third_person_distance" in play_branch.split('"scroll up"', 1)[1].split('"scroll down"', 1)[0], "scroll up in Play calls _adjust_third_person_distance()")
+    check('"scroll down"' in play_branch and "_adjust_third_person_distance" in play_branch.split('"scroll down"', 1)[1], "scroll down in Play calls _adjust_third_person_distance()")
+
+
+def test_set_camera_mode_transitions_capture_during_play() -> None:
+    source = inspect.getsource(cs.MultiplayerGame.set_camera_mode)
+    check(source.count("self._set_play_capture(not third_person)") == 2, "set_camera_mode() drives the capture transition from BOTH branches (rig path and legacy-avatar path) so neither can drift out of sync with the other")
+
+
+def test_set_play_capture_is_a_play_only_noop_outside_play() -> None:
+    source = inspect.getsource(cs.MultiplayerGame._set_play_capture)
+    check("if not self.studio_playing" in source and "return" in source.split("if not self.studio_playing", 1)[1].split("\n")[1], "_set_play_capture() is a no-op outside Play -- switching camera mode in the editor (before/after Play) must never touch native pointer capture")
+
+
+def test_first_person_switch_acquires_capture_third_person_releases() -> None:
+    source = inspect.getsource(cs.MultiplayerGame._set_play_capture)
+    check("self._start_mouse_look()" in source, "_set_play_capture(captured=True) (switching to first-person mid-Play) acquires capture immediately")
+    check("self.release_play_input_capture()" in source, "_set_play_capture(captured=False) (switching to third-person mid-Play) always releases capture -- RMB-hold is the only way back in")
+
+
 if __name__ == "__main__":
     test_movement_axes()
     test_diagonal_movement_not_faster_than_straight()
@@ -487,6 +648,24 @@ if __name__ == "__main__":
     test_character_not_included_in_place_save_path()
     test_pointer_capture_fix_checks_qt_focus()
     test_escape_releases_rather_than_toggles_in_play()
+
+    test_play_input_state_editor_ui_when_not_playing()
+    test_play_input_state_third_person_free_cursor()
+    test_play_input_state_third_person_rmb_look()
+    test_play_input_state_first_person_captured()
+    test_play_input_state_first_person_released()
+    test_third_person_zoom_step_and_bounds_are_sane()
+    test_third_person_zoom_clamps_to_min()
+    test_third_person_zoom_clamps_to_max()
+    test_third_person_zoom_noop_outside_play_or_first_person()
+    test_play_defaults_to_third_person_free_cursor_not_captured()
+    test_stop_releases_capture_through_shared_idempotent_path()
+    test_left_click_never_captures_in_third_person()
+    test_rmb_hold_only_captures_in_third_person()
+    test_scroll_keys_adjust_third_person_zoom()
+    test_set_camera_mode_transitions_capture_during_play()
+    test_set_play_capture_is_a_play_only_noop_outside_play()
+    test_first_person_switch_acquires_capture_third_person_releases()
 
     print()
     if FAILURES:

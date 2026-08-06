@@ -560,6 +560,12 @@ EYE_HEIGHT = 0.65
 THIRD_PERSON_DISTANCE = 4.0
 THIRD_PERSON_HEIGHT = 0.4
 
+# Stage 3.7: Roblox-Studio-style third-person camera zoom (mouse wheel,
+# RMB-hold-to-look only -- see MultiplayerGame._adjust_third_person_distance()).
+THIRD_PERSON_MIN_DISTANCE = 2.0
+THIRD_PERSON_MAX_DISTANCE = 10.0
+THIRD_PERSON_ZOOM_STEP = 0.5
+
 
 # ============================================================
 # МОДЕЛЬ ДРУГИХ ИГРОКОВ
@@ -1201,6 +1207,16 @@ class InstanceRecord:
 # ============================================================
 
 class MultiplayerGame(Entity):
+    # Stage 3.7: named Play input-ownership states -- see play_input_state()
+    # below. Class attributes (not an Enum) purely so they stay easy to
+    # reference as self.PLAY_INPUT_STATE_* / MultiplayerGame.PLAY_INPUT_STATE_*
+    # from both this class and tests without an extra import.
+    PLAY_INPUT_STATE_EDITOR_UI = "EDITOR_UI"
+    PLAY_INPUT_STATE_THIRD_PERSON_FREE_CURSOR = "PLAY_THIRD_PERSON_FREE_CURSOR"
+    PLAY_INPUT_STATE_THIRD_PERSON_RMB_LOOK = "PLAY_THIRD_PERSON_RMB_LOOK"
+    PLAY_INPUT_STATE_FIRST_PERSON_CAPTURED = "PLAY_FIRST_PERSON_CAPTURED"
+    PLAY_INPUT_STATE_FIRST_PERSON_RELEASED = "PLAY_FIRST_PERSON_RELEASED"
+
     def __init__(self, server_url: str, player_name: str, legacy_demo: bool = False) -> None:
         super().__init__()
 
@@ -1243,6 +1259,10 @@ class MultiplayerGame(Entity):
         self.player_pitch = 0.0
         self.last_send_time = 0.0
         self.third_person_enabled = False
+        # Stage 3.7: mutable per-session third-person zoom distance (mouse
+        # wheel while RMB-look is available) -- see _adjust_third_person_distance().
+        # THIRD_PERSON_DISTANCE remains the fixed reset-to default.
+        self._third_person_distance = THIRD_PERSON_DISTANCE
 
         # Заполняется embed_panda_window() при успешном встраивании
         # viewport'а в Qt. Пока None — используется штатный путь Ursina
@@ -1404,7 +1424,14 @@ class MultiplayerGame(Entity):
             self.camera_pitch_pivot.rotation = Vec3(-self.player_pitch, 0, 0)
             self.studio_playing = True
             self.hud_root.enabled = True
-            self._start_mouse_look()
+            # Stage 3.7: third-person with a free, uncaptured cursor is the
+            # default Play camera mode (Roblox Studio-style), not permanent
+            # first-person mouse-look -- capture is now only ever entered
+            # explicitly (RMB-hold in third-person, or switching to
+            # first-person; see input()/set_camera_mode()). Reset any zoom
+            # left over from a previous session to the fixed default.
+            self.third_person_enabled = True
+            self._third_person_distance = THIRD_PERSON_DISTANCE
             self.gizmo.set_target(None)
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = False
@@ -1421,7 +1448,14 @@ class MultiplayerGame(Entity):
             self.studio_playing = False
             self.editor_look_active = False
             self.hud_root.enabled = False
-            self._stop_mouse_look()
+            # Stage 3.7: Stop must work on the first click from EVERY Play
+            # input state, including mid-RMB-drag or first-person capture --
+            # release_play_input_capture() (not a bare _stop_mouse_look())
+            # is what also clears any held W/A/S/D/Space state and emits
+            # their InputEnded events, and it's idempotent/safe even when
+            # nothing was captured. Must run before _stop_lua() below so
+            # LuaGameplayContext is still active to receive release_all_keys().
+            self.release_play_input_capture()
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = True
             if was_playing:
@@ -1756,6 +1790,24 @@ class MultiplayerGame(Entity):
             # "stuck key" can never survive losing capture for any reason.
             if self._lua_gameplay is not None:
                 self._lua_gameplay.release_all_keys()
+
+    def play_input_state(self) -> str:
+        """Stage 3.7: pure derivation of the current Play input-ownership
+        state from the handful of independent flags that already exist
+        (studio_playing, third_person_enabled, _mouse_look_captured()) --
+        deliberately NOT a separately-tracked field of its own, so it can
+        never drift out of sync with the flags that actually drive
+        behavior elsewhere in this class. See the PLAY_INPUT_STATE_*
+        constants on this class for the five possible results."""
+        if not self.studio_playing:
+            return self.PLAY_INPUT_STATE_EDITOR_UI
+        if self.third_person_enabled:
+            if self._mouse_look_captured():
+                return self.PLAY_INPUT_STATE_THIRD_PERSON_RMB_LOOK
+            return self.PLAY_INPUT_STATE_THIRD_PERSON_FREE_CURSOR
+        if self._mouse_look_captured():
+            return self.PLAY_INPUT_STATE_FIRST_PERSON_CAPTURED
+        return self.PLAY_INPUT_STATE_FIRST_PERSON_RELEASED
 
     def _start_lua(self) -> None:
         """Wrapped in try/except that ALWAYS prints a full traceback, for
@@ -3530,9 +3582,41 @@ class MultiplayerGame(Entity):
             # both is a safe, idempotent no-op when capture is already
             # released (see release_play_input_capture()'s own guard).
             self.release_play_input_capture()
-        elif key == "left mouse down" and not self._mouse_look_captured():
-            self._start_mouse_look()
-            print("[CHARACTER] Play input captured")
+        elif key == "right mouse down":
+            # Stage 3.7: in third-person, RMB-hold is the ONLY way to enter
+            # mouse-look -- a temporary capture that ends the instant RMB
+            # is released (see "right mouse up" below), never on Escape
+            # alone (nothing to release if RMB isn't held). In first-person,
+            # capture is already permanent (entered via "left mouse down"
+            # below or set_camera_mode()'s transition), so RMB here is a
+            # deliberate no-op -- it must never SHORTEN first-person's
+            # capture lifetime, only Escape does that.
+            if self.third_person_enabled and not self._mouse_look_captured():
+                self._start_mouse_look()
+        elif key == "right mouse up":
+            # Only ever releases the temporary third-person RMB-look --
+            # first-person's permanent capture is untouched by RMB release
+            # (see the "right mouse down" comment above).
+            if self.third_person_enabled and self._mouse_look_captured():
+                self._stop_mouse_look()
+        elif key == "left mouse down":
+            # Stage 3.7: a plain left click in third-person must NEVER
+            # start mouse-look/pointer capture -- the free cursor stays
+            # free (spec: "the viewport must not consume left-click events
+            # merely to enter movement mode"). Left-clicking the viewport
+            # already transfers gameplay keyboard focus on its own, via
+            # PandaWindowFocusFilter, independent of anything in this
+            # method. First-person keeps its original click-to-(re)capture
+            # behavior unchanged.
+            if not self.third_person_enabled and not self._mouse_look_captured():
+                self._start_mouse_look()
+                print("[CHARACTER] Play input captured")
+        elif key == "scroll up":
+            if self.third_person_enabled:
+                self._adjust_third_person_distance(-THIRD_PERSON_ZOOM_STEP)
+        elif key == "scroll down":
+            if self.third_person_enabled:
+                self._adjust_third_person_distance(THIRD_PERSON_ZOOM_STEP)
         elif key == "v":
             self.toggle_third_person()
         elif key == "b":
@@ -3552,10 +3636,39 @@ class MultiplayerGame(Entity):
         view already uses."""
         camera.parent = self.camera_pitch_pivot
         if self.third_person_enabled:
-            camera.position = Vec3(0, 0, -THIRD_PERSON_DISTANCE)
+            camera.position = Vec3(0, 0, -self._third_person_distance)
             camera.y = THIRD_PERSON_HEIGHT
         else:
             camera.position = Vec3(0, 0, 0)
+
+    def _adjust_third_person_distance(self, delta: float) -> None:
+        """Stage 3.7: mouse-wheel zoom while in third-person Play. Clamped
+        to [THIRD_PERSON_MIN_DISTANCE, THIRD_PERSON_MAX_DISTANCE] and only
+        ever re-applies the camera transform (never touches capture state,
+        never modifies/serializes the editor Camera Instance -- this only
+        moves the runtime `camera` Entity, same as _apply_third_person_camera()
+        elsewhere)."""
+        self._third_person_distance = max(
+            THIRD_PERSON_MIN_DISTANCE,
+            min(THIRD_PERSON_MAX_DISTANCE, self._third_person_distance + delta),
+        )
+        if self.studio_playing and self.third_person_enabled:
+            self._apply_third_person_camera()
+
+    def _set_play_capture(self, captured: bool) -> None:
+        """Stage 3.7: shared capture-transition helper for set_camera_mode()
+        below -- only takes effect while actually in Play (mode switches in
+        the editor, before/after Play, must never touch native pointer
+        capture). `captured=True` is used when switching into first-person
+        (acquire immediately); `captured=False` when switching into
+        third-person (always release -- RMB-hold is the only way back in)."""
+        if not self.studio_playing:
+            return
+        if captured:
+            if not self._mouse_look_captured():
+                self._start_mouse_look()
+        else:
+            self.release_play_input_capture()
 
     def set_camera_mode(self, third_person: bool) -> None:
         """Stage 3.5: explicit-set variant of the V-key toggle below, used
@@ -3564,12 +3677,21 @@ class MultiplayerGame(Entity):
         rig-vs-legacy-avatar branching and _apply_third_person_camera()
         call toggle_third_person() already used; that method is now just
         `self.set_camera_mode(not self.third_person_enabled)`, so both
-        callers can never drift out of sync with each other."""
+        callers can never drift out of sync with each other.
+
+        Stage 3.7: also owns the capture transition between the two Play
+        camera modes -- switching to third-person ALWAYS releases capture
+        (free cursor is mandatory there; RMB-hold is the only way back in),
+        switching to first-person immediately ACQUIRES it (permanent
+        capture is mandatory there). This runs for both the rig branch and
+        the legacy-avatar branch below, and is a no-op outside of Play (see
+        _set_play_capture())."""
         third_person = bool(third_person)
         if self._character_visual is not None:
             self.third_person_enabled = third_person
             self._character_visual.set_first_person(not third_person)
             self._apply_third_person_camera()
+            self._set_play_capture(not third_person)
             return
 
         if self.local_visual is None:
@@ -3580,6 +3702,7 @@ class MultiplayerGame(Entity):
         self.third_person_enabled = third_person
         self.local_visual.enabled = third_person
         self._apply_third_person_camera()
+        self._set_play_capture(not third_person)
 
     def toggle_third_person(self) -> None:
         """Stage 3.4: prefers the new SStudio character rig (normal Play
