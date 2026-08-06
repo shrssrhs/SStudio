@@ -3941,10 +3941,20 @@ class StudioMainWindow(QMainWindow):
         place_manager.commit() -- which is what actually updates current_
         path/display_name/resets dirty/records Recents -- runs ONLY inside
         the success branch, never speculatively (spec section 8/17: a
-        rejected create/open leaves the current Place untouched)."""
+        rejected create/open leaves the current Place untouched).
+
+        This is the one chokepoint every successful Place-load path funnels
+        through -- template creation, File > Open Place, Recent Places, and
+        the --place startup flag all call this (directly, or via
+        _open_place_path()) -- which is why activate_scene_for_loaded_place()
+        is called from here rather than separately by each caller: a single
+        authoritative switch back to Scene, gated on the same real success
+        confirmation as everything else in this method, instead of one copy
+        per caller that could drift out of sync with it."""
         def _on_result(success: bool, message: str) -> None:
             if success:
                 self.place_manager.commit(result)
+                self.activate_scene_for_loaded_place()
                 self._update_title()
                 self.bridge.log("info", result.message)
             else:
@@ -3955,6 +3965,33 @@ class StudioMainWindow(QMainWindow):
         accepted = self.bridge.replace_world(result.objects or [], _on_result)
         if not accepted:
             QMessageBox.critical(self, "Not Connected", "Not connected to a live server.")
+
+    def activate_scene_for_loaded_place(self) -> None:
+        """Stage 3.7 defect fix: the single authoritative switch from the
+        Templates/Home page back to the Scene workspace after a Place has
+        actually finished loading.
+
+        Root cause of the reported bug: TemplateBrowserBinding.show_editor()
+        (sstudio_templates.py) is the only thing that ever moves
+        central_stack's current widget back to the Scene page -- but before
+        this fix it was only ever called from _on_template_activated()
+        (client_studio.py, the two Templates-page create flows), never from
+        _open_place_path() (File > Open Place, Recent Places, and the
+        --place startup flag all funnel through it). A successful Open
+        would load the Explorer/Inspector data correctly but leave
+        central_stack showing whatever page (almost always Templates/Home)
+        was already visible.
+
+        Deliberately a thin wrapper rather than inlined at each call site:
+        _replace_world_and_report() above is the only caller, invoked from
+        its success branch alone, so a cancelled QFileDialog, a cancelled
+        Recents dialog, a local place_manager.open()/create_from_template()
+        failure, or a server-rejected REPLACE_WORLD all leave the current
+        page untouched -- none of those paths ever reach this method. No-op
+        when there's no template browser attached (headless tests, the
+        offline --legacy-demo path)."""
+        if self.templates_binding is not None:
+            self.templates_binding.show_editor()
 
     def _place_save(self) -> bool:
         if not self.bridge.live_mode:

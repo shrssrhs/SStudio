@@ -33,10 +33,14 @@ plain top-level-assertion script, run directly, offscreen Qt platform.
 """
 import os
 import sys
+import tempfile
+from pathlib import Path
+from typing import Any
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, '.')
 
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QWidget
 
 app = QApplication.instance() or QApplication([])
@@ -187,12 +191,239 @@ def test_no_second_viewport_frame_or_stray_stack() -> None:
     check(len(inner_stacks) >= 1, "ViewportFrame still owns its own internal viewport-swap QStackedWidget")
 
 
+# ============================================================
+# Stage 3.7 defect fix: Open Place / Recent Places / --place left Studio
+# on the Templates/Home page instead of switching to Scene. Root cause:
+# TemplateBrowserBinding.show_editor() (the only thing that ever moves
+# central_stack's current widget back to the editor page) was only ever
+# called from the template-creation callback, never from
+# _open_place_path() (which File > Open Place, Recent Places, and the
+# --place startup flag all funnel through). Fix: a single authoritative
+# activate_scene_for_loaded_place() helper, called only from
+# _replace_world_and_report()'s success branch -- the one chokepoint
+# every successful Place-load path shares.
+# ============================================================
+
+
+class _StubMessageBox:
+    """Stand-in for QMessageBox.critical() -- a real QMessageBox.exec()
+    blocks forever offscreen waiting for a click that will never come
+    (same reasoning as test_script_editor.py's _FakeMessageBox). These
+    tests only ever hit the .critical(...) static-call path (never a
+    button-choice dialog), so a bare call-recording stub is enough."""
+
+    calls: list = []
+
+    @staticmethod
+    def critical(*args, **kwargs) -> None:
+        _StubMessageBox.calls.append(args)
+
+
+class _FakeAdapter:
+    """Stand-in for MultiplayerStudioAdapter's replace_world() -- lets
+    these tests drive EngineBridge.replace_world()'s on_result callback
+    synchronously with a controlled outcome, without needing a real
+    Ursina/Panda3D game object.
+
+    outcome=True  -> request accepted, server confirms success
+    outcome=False -> request accepted, server rejects it
+    outcome=None  -> request never even accepted (e.g. not connected):
+                     on_result is never called at all"""
+
+    def __init__(self, outcome: bool | None, message: str = "") -> None:
+        self.outcome = outcome
+        self.message = message
+        self.received_objects: Any = None
+
+    def replace_world(self, objects, on_result) -> bool:
+        self.received_objects = objects
+        if self.outcome is None:
+            return False
+        on_result(self.outcome, self.message)
+        return True
+
+
+def make_live_win_with_templates(outcome: bool | None, message: str = "", tmp_dir: Path | None = None):
+    """Builds a StudioMainWindow wired exactly like main() wires it: a
+    live EngineBridge with a controllable fake adapter, and the template
+    browser installed with show_immediately=True (host=central_stack) --
+    i.e. Studio starts on the Templates/Home page, same as a real launch
+    with no --place, which is the exact scenario the reported bug needs."""
+    bridge = m.EngineBridge(objects=[], live_mode=True)
+    bridge.set_adapter(_FakeAdapter(outcome, message))
+    win = m.StudioMainWindow(bridge)
+    if tmp_dir is not None:
+        ini_path = tmp_dir / "recents.ini"
+        win.place_manager.recents._settings = QSettings(str(ini_path), QSettings.Format.IniFormat)
+    binding = sstudio_templates.install_template_browser(
+        win, host=win.central_stack, show_immediately=True,
+    )
+    win.set_templates_binding(binding)
+    return win, binding
+
+
+def make_result(tmp_dir: Path, success: bool = True) -> "m.place_manager.PlaceOperationResult":
+    return m.place_manager.PlaceOperationResult(
+        success=success,
+        message="ok" if success else "rejected",
+        path=tmp_dir / "TestPlace.nebula.json",
+        objects=[],
+        display_name="TestPlace",
+        project_dir=tmp_dir,
+        template_id=None,
+    )
+
+
+def test_activate_scene_for_loaded_place_switches_to_editor() -> None:
+    """Direct unit test of the new authoritative helper itself."""
+    with tempfile.TemporaryDirectory() as tmp:
+        win, binding = make_live_win_with_templates(True, tmp_dir=Path(tmp))
+        editor_page = win.central_stack.widget(0)
+        check(win.central_stack.currentWidget() is binding.page, "precondition: Studio starts on the Templates page")
+        win.activate_scene_for_loaded_place()
+        check(win.central_stack.currentWidget() is editor_page, "activate_scene_for_loaded_place() switches central_stack back to the Scene/editor page")
+
+
+def test_activate_scene_for_loaded_place_noop_without_binding() -> None:
+    """No template browser attached (headless/offline demo) -- must not
+    raise, must not touch central_stack."""
+    bridge = m.EngineBridge(objects=[], live_mode=False)
+    win = m.StudioMainWindow(bridge)
+    check(win.templates_binding is None, "precondition: no templates_binding attached")
+    win.activate_scene_for_loaded_place()
+    check(win.central_stack.currentWidget() is win.central_stack.widget(0), "activate_scene_for_loaded_place() is a harmless no-op with no templates_binding")
+
+
+def test_replace_world_success_activates_scene() -> None:
+    """The actual bug scenario: a successful REPLACE_WORLD (Open Place,
+    Recent Places, template creation, or --place) must bring Scene to
+    front, even though _replace_world_and_report() itself never touches
+    central_stack directly -- it goes through activate_scene_for_loaded_place()."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        win, binding = make_live_win_with_templates(True, tmp_dir=tmp_dir)
+        editor_page = win.central_stack.widget(0)
+        result = make_result(tmp_dir, success=True)
+        win._replace_world_and_report(result)
+        check(win.central_stack.currentWidget() is editor_page, "a successful REPLACE_WORLD switches Studio from Templates/Home to the Scene workspace")
+        check(win.place_manager.current_path == result.path, "place_manager.commit() ran -- current_path was updated")
+
+
+def test_replace_world_server_rejection_preserves_current_page() -> None:
+    """Spec: a server-rejected Open/Create must leave the current page
+    (and the current Place) untouched -- must NOT switch to Scene."""
+    original_box = m.QMessageBox
+    m.QMessageBox = _StubMessageBox
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            win, binding = make_live_win_with_templates(False, "server said no", tmp_dir=tmp_dir)
+            result = make_result(tmp_dir, success=True)
+            win._replace_world_and_report(result)
+            check(win.central_stack.currentWidget() is binding.page, "a server-rejected REPLACE_WORLD leaves Studio on whatever page it was already on (Templates/Home)")
+            check(win.place_manager.current_path is None, "a server-rejected REPLACE_WORLD never commits (current Place is untouched)")
+    finally:
+        m.QMessageBox = original_box
+
+
+def test_replace_world_not_connected_preserves_current_page() -> None:
+    """Spec: a request that never even reaches the server (not connected)
+    must also leave the current page untouched."""
+    original_box = m.QMessageBox
+    m.QMessageBox = _StubMessageBox
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            win, binding = make_live_win_with_templates(None, tmp_dir=tmp_dir)
+            result = make_result(tmp_dir, success=True)
+            win._replace_world_and_report(result)
+            check(win.central_stack.currentWidget() is binding.page, "a not-accepted REPLACE_WORLD (not connected) leaves Studio on the Templates/Home page")
+    finally:
+        m.QMessageBox = original_box
+
+
+def test_open_place_path_local_failure_preserves_current_page() -> None:
+    """File > Open Place / Recent Places / --place all funnel through
+    _open_place_path() -- a LOCAL failure (bad/missing file, before any
+    network round trip) must also never switch to Scene."""
+    original_box = m.QMessageBox
+    m.QMessageBox = _StubMessageBox
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            win, binding = make_live_win_with_templates(True, tmp_dir=tmp_dir)
+            missing_path = tmp_dir / "does_not_exist.nebula.json"
+            win._open_place_path(missing_path)
+            check(win.central_stack.currentWidget() is binding.page, "opening a nonexistent Place file leaves Studio on the Templates/Home page")
+            check(len(_StubMessageBox.calls) >= 1, "a local open failure reports an error to the user")
+    finally:
+        m.QMessageBox = original_box
+        _StubMessageBox.calls = []
+
+
+def test_open_place_path_success_activates_scene() -> None:
+    """End-to-end: a real Place file on disk, opened via _open_place_path()
+    (the exact method File > Open Place / Recent Places / --place all
+    call), must switch Studio to Scene once the (fake, but here
+    successful) server confirms it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        win, binding = make_live_win_with_templates(True, tmp_dir=tmp_dir)
+        editor_page = win.central_stack.widget(0)
+        create_result = win.place_manager.create_from_template("blank", "RealPlace", tmp_dir)
+        check(create_result.success, "precondition: creating a real Place file on disk succeeded")
+        win.place_manager.commit(create_result)
+        real_path = win.place_manager.current_path
+        check(real_path is not None and real_path.exists(), "precondition: the Place file actually exists on disk")
+
+        # Fresh window, back on the Templates page, simulating a second
+        # launch/File > Open Place against that same file.
+        win2, binding2 = make_live_win_with_templates(True, tmp_dir=tmp_dir)
+        editor_page2 = win2.central_stack.widget(0)
+        check(win2.central_stack.currentWidget() is binding2.page, "precondition: the second window also starts on Templates/Home")
+        win2._open_place_path(real_path)
+        check(win2.central_stack.currentWidget() is editor_page2, "_open_place_path() on a real, successfully-opened Place switches to Scene (File > Open Place / Recent Places / --place all share this method)")
+
+
+def test_repeated_home_to_scene_transitions_do_not_duplicate_widgets() -> None:
+    """Cycling create/open-success (Home -> Scene) many times must never
+    grow central_stack's page count or recreate the editor/viewport
+    widgets -- same invariant test_repeated_page_switching_preserves_
+    identity() already proves for the manual binding.show()/show_editor()
+    calls, extended to the actual _replace_world_and_report() call path."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        win, binding = make_live_win_with_templates(True, tmp_dir=tmp_dir)
+        editor_page = win.central_stack.widget(0)
+        viewport_frame_id = id(win.viewport_frame)
+        starting_count = win.central_stack.count()
+
+        for i in range(10):
+            binding.show()
+            check(win.central_stack.currentWidget() is binding.page, f"cycle {i}: back on Templates page before the next load")
+            result = make_result(tmp_dir, success=True)
+            win._replace_world_and_report(result)
+            check(win.central_stack.currentWidget() is editor_page, f"cycle {i}: activate_scene_for_loaded_place() returned to the same editor page object")
+
+        check(win.central_stack.count() == starting_count, "10 Home->Scene load cycles never add extra central_stack pages")
+        check(id(win.viewport_frame) == viewport_frame_id, "10 Home->Scene load cycles never recreate viewport_frame")
+
+
 if __name__ == "__main__":
     test_central_stack_exists_before_any_embedding()
     test_install_template_browser_does_not_reparent_central_widget()
     test_repeated_page_switching_preserves_identity()
     test_set_start_page_never_reparents_existing_pages()
     test_no_second_viewport_frame_or_stray_stack()
+
+    test_activate_scene_for_loaded_place_switches_to_editor()
+    test_activate_scene_for_loaded_place_noop_without_binding()
+    test_replace_world_success_activates_scene()
+    test_replace_world_server_rejection_preserves_current_page()
+    test_replace_world_not_connected_preserves_current_page()
+    test_open_place_path_local_failure_preserves_current_page()
+    test_open_place_path_success_activates_scene()
+    test_repeated_home_to_scene_transitions_do_not_duplicate_widgets()
 
     print()
     if FAILURES:

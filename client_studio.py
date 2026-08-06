@@ -5215,8 +5215,12 @@ def _on_template_activated(studio: StudioMainWindow, spec: sstudio_templates.Tem
     if not result.success:
         QMessageBox.critical(studio, "Create Place Failed", result.message)
         return
-    if studio.templates_binding is not None:
-        studio.templates_binding.show_editor()
+    # Stage 3.7: no longer switches to Scene eagerly here -- that's now
+    # activate_scene_for_loaded_place()'s job, called from
+    # _replace_world_and_report()'s success branch below (the same
+    # chokepoint File > Open Place / Recent Places / --place go through),
+    # so the switch only ever happens once the server has actually
+    # confirmed the REPLACE_WORLD, not speculatively before it.
     studio._replace_world_and_report(result)
 
 
