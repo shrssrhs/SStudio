@@ -110,14 +110,38 @@ class PhysicsWorld:
     Stop, so repeated Play/Stop cannot leak bodies (see Stage 2.4 report,
     §12 test)."""
 
-    def __init__(self) -> None:
+    def __init__(self, gravity: float = GRAVITY_Y) -> None:
+        """Stage 3.8: `gravity` is the SIGNED Y-axis value (negative =
+        downward, matching the module-level GRAVITY_Y default) -- callers
+        pass -(Workspace.Gravity magnitude) here, never the raw positive
+        magnitude the Inspector/Lua property exposes. Stored as instance
+        state (not just applied once) so set_gravity() below can update it
+        for the rest of this Play session -- see workspace.Gravity's
+        runtime-write path in lua_runtime.py."""
         self.bullet_world = BulletWorld()
-        self.bullet_world.setGravity(PVec3(0, GRAVITY_Y, 0))
+        self._gravity_y = float(gravity)
+        self.bullet_world.setGravity(PVec3(0, self._gravity_y, 0))
         self._rotation = _RotationScratch()
         self._bodies: dict[str, _PhysicsBody] = {}
         self._frame_count = 0
         if DEBUG_PHYSICS:
-            print(f"[PHYSICS] backend initialized: Bullet, gravity=(0,{GRAVITY_Y},0)")
+            print(f"[PHYSICS] backend initialized: Bullet, gravity=(0,{self._gravity_y},0)")
+
+    @property
+    def gravity(self) -> float:
+        """Current SIGNED Y-axis gravity (negative = downward) -- may
+        differ from what PhysicsWorld() was constructed with if a runtime
+        Lua write already called set_gravity() this session."""
+        return self._gravity_y
+
+    def set_gravity(self, gravity: float) -> None:
+        """Runtime Lua `workspace.Gravity = X` write -- takes effect
+        immediately for both Bullet's own dynamic bodies (setGravity, the
+        engine's built-in per-step integration) and the manual ghost-body
+        integration in step() below, which does NOT go through Bullet's
+        gravity at all (see class docstring's "ghost" category)."""
+        self._gravity_y = float(gravity)
+        self.bullet_world.setGravity(PVec3(0, self._gravity_y, 0))
 
     def add_part(
         self,
@@ -288,7 +312,7 @@ class PhysicsWorld:
                         f"active={body.node.isActive()} copied_to_entity=True"
                     )
             elif body.kind == "ghost":
-                body.velocity_y += GRAVITY_Y * dt
+                body.velocity_y += self._gravity_y * dt
                 body.entity.y += body.velocity_y * dt
                 if verbose:
                     print(

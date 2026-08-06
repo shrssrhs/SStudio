@@ -283,6 +283,100 @@ def test_open_upgrades_legacy_sceneobject_files() -> None:
 
 
 # ============================================================
+# Stage 3.8: "services" (root-service persistent properties) --
+# format version 2 -> 3
+# ============================================================
+
+def test_open_version2_place_gets_full_schema_defaulted_services() -> None:
+    """A version-2 Place file (pre-Stage-3.8, no "services" key at all)
+    must still load successfully -- open() fills in a COMPLETE,
+    schema-defaulted services snapshot rather than leaving it None/partial
+    (spec: "missing service values use descriptor defaults")."""
+    tmp = make_temp_dir()
+    try:
+        legacy_v2_path = tmp / "v2.nebula.json"
+        legacy_v2_path.write_text(json.dumps({
+            "format": "nebula-scene", "version": 2,
+            "objects": [{"id": "p1", "class_name": "Part", "name": "P", "parent_id": None, "properties": {}}],
+        }), encoding="utf-8")
+
+        manager = pm.PlaceManager(projects_root=tmp)
+        manager.recents = isolated_recents_store(tmp)
+        result = manager.open(legacy_v2_path)
+        check(result.success, "open() accepts a version-2 Place with no 'services' key")
+        check(result.services is not None, "open() never returns services=None, even for a version-2 file")
+        check(result.services.get("Workspace", {}).get("Gravity") == 24.0, "a version-2 Place's Workspace.Gravity defaults to the accepted 24.0 magnitude")
+        check("StarterPlayer" in result.services, "a version-2 Place still gets a complete StarterPlayer services entry")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_save_then_open_round_trips_services() -> None:
+    tmp = make_temp_dir()
+    try:
+        manager = pm.PlaceManager(projects_root=tmp)
+        manager.recents = isolated_recents_store(tmp)
+        created = manager.create_from_template("blank", "ServicesRoundTrip", tmp)
+        manager.commit(created)
+
+        custom_services = {
+            "Workspace": {"Gravity": 5.0},
+            "StarterPlayer": {"CameraMode": "LockFirstPerson", "CharacterWalkSpeed": 12.0},
+        }
+        saved = manager.save(created.objects or [], custom_services)
+        check(saved.success, "save() with an explicit services dict succeeds")
+        check(saved.services is not None and saved.services["Workspace"]["Gravity"] == 5.0, "save() returns the sanitized services it actually wrote")
+
+        reopened = pm.PlaceManager(projects_root=tmp)
+        reopened.recents = isolated_recents_store(tmp)
+        result = reopened.open(created.path)
+        check(result.success, "reopening a saved Place succeeds")
+        check(result.services["Workspace"]["Gravity"] == 5.0, "Workspace.Gravity persists exactly through Save/Open")
+        check(result.services["StarterPlayer"]["CameraMode"] == "LockFirstPerson", "StarterPlayer.CameraMode persists exactly through Save/Open")
+        check(result.services["StarterPlayer"]["CharacterWalkSpeed"] == 12.0, "StarterPlayer.CharacterWalkSpeed persists exactly through Save/Open")
+        # Unedited StarterPlayer properties still round-trip at their defaults.
+        check(result.services["StarterPlayer"]["CharacterJumpPower"] == 8.0, "an unedited StarterPlayer property still round-trips at its default")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_open_rejects_malformed_service_values_without_failing_the_whole_load() -> None:
+    tmp = make_temp_dir()
+    try:
+        path = tmp / "malformed_services.nebula.json"
+        path.write_text(json.dumps({
+            "format": "nebula-scene", "version": 3,
+            "objects": [],
+            "services": {
+                "Workspace": {"Gravity": -999.0, "UnknownFutureProperty": "ignored"},
+                "StarterPlayer": {"CameraMode": "NotARealMode"},
+            },
+        }), encoding="utf-8")
+
+        manager = pm.PlaceManager(projects_root=tmp)
+        manager.recents = isolated_recents_store(tmp)
+        result = manager.open(path)
+        check(result.success, "a malformed 'services' value never fails the whole Place load")
+        check(result.services["Workspace"]["Gravity"] == 24.0, "an invalid stored Gravity (negative) falls back to the default instead of loading garbage")
+        check(result.services["StarterPlayer"]["CameraMode"] == "Classic", "an invalid stored CameraMode falls back to the default")
+        check("UnknownFutureProperty" not in result.services["Workspace"], "an unknown future service property is silently dropped, not carried through")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_create_from_template_produces_default_services() -> None:
+    tmp = make_temp_dir()
+    try:
+        manager = pm.PlaceManager(projects_root=tmp)
+        manager.recents = isolated_recents_store(tmp)
+        created = manager.create_from_template("baseplate", "FreshServices", tmp)
+        check(created.success, "create_from_template() succeeds")
+        check(created.services is not None and created.services["Workspace"]["Gravity"] == 24.0, "a freshly created Place starts with full schema-default services")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ============================================================
 # save() / save_as() / dirty state
 # ============================================================
 
@@ -470,6 +564,70 @@ def test_server_replace_world_object_sanitization() -> None:
           "server rejects a non-dict entry in replace_world data")
 
 
+def test_server_singleton_conflict_starter_player_scripts() -> None:
+    import server
+    from shared.instance import Instance
+
+    existing = {
+        "sps1": Instance(id="sps1", class_name="StarterPlayerScripts", name="StarterPlayerScripts", parent_id="StarterPlayer", properties={}),
+    }
+    check(
+        server._singleton_conflict(existing, "StarterPlayerScripts", "StarterPlayerScripts", "StarterPlayer") is not None,
+        "creating a second StarterPlayerScripts is rejected",
+    )
+    check(
+        server._singleton_conflict(existing, "StarterPlayerScripts", "StarterPlayerScripts", "StarterPlayer", exclude_id="sps1") is None,
+        "renaming/reparenting the EXISTING StarterPlayerScripts (excluded from the scan) is not a conflict with itself",
+    )
+    check(
+        server._singleton_conflict({}, "StarterPlayerScripts", "StarterPlayerScripts", "StarterPlayer") is None,
+        "creating the first StarterPlayerScripts is allowed",
+    )
+
+
+def test_server_singleton_conflict_starter_character() -> None:
+    import server
+    from shared.instance import Instance
+
+    existing = {
+        "m1": Instance(id="m1", class_name="Model", name="StarterCharacter", parent_id="StarterPlayer", properties={}),
+    }
+    check(
+        server._singleton_conflict(existing, "Model", "StarterCharacter", "StarterPlayer") is not None,
+        "creating a second exact StarterCharacter under StarterPlayer is rejected",
+    )
+    check(
+        server._singleton_conflict(existing, "Model", "SomeOtherModel", "StarterPlayer") is None,
+        "creating a differently-named Model under StarterPlayer is allowed (ordinary Model, not the special role)",
+    )
+    check(
+        server._singleton_conflict(existing, "Model", "StarterCharacter", "Workspace") is None,
+        "creating a Model named StarterCharacter under Workspace is allowed (wrong parent -- not the special role at all)",
+    )
+
+
+def test_server_replace_world_rejects_multiple_starter_characters() -> None:
+    import server
+    from shared.instance import Instance
+
+    conflict = server._replace_world_singleton_conflict({
+        "a": Instance(id="a", class_name="Model", name="StarterCharacter", parent_id="StarterPlayer", properties={}),
+        "b": Instance(id="b", class_name="Model", name="StarterCharacter", parent_id="StarterPlayer", properties={}),
+    })
+    check(conflict is not None, "REPLACE_WORLD data with two StarterCharacter Models under StarterPlayer is rejected")
+
+
+def test_server_replace_world_rejects_multiple_starter_player_scripts() -> None:
+    import server
+    from shared.instance import Instance
+
+    conflict = server._replace_world_singleton_conflict({
+        "a": Instance(id="a", class_name="StarterPlayerScripts", name="StarterPlayerScripts", parent_id="StarterPlayer", properties={}),
+        "b": Instance(id="b", class_name="StarterPlayerScripts", name="StarterPlayerScripts", parent_id="StarterPlayer", properties={}),
+    })
+    check(conflict is not None, "REPLACE_WORLD data with two StarterPlayerScripts is rejected")
+
+
 def test_server_replace_world_rejects_non_local_connection() -> None:
     """Spec section 9: the server never accepts REPLACE_WORLD from a
     non-local connection. _is_local_connection() is the entire enforcement
@@ -504,6 +662,10 @@ if __name__ == "__main__":
     test_open_defers_state_until_commit_and_round_trips()
     test_open_rejects_missing_and_malformed_files_without_mutating_state()
     test_open_upgrades_legacy_sceneobject_files()
+    test_open_version2_place_gets_full_schema_defaulted_services()
+    test_save_then_open_round_trips_services()
+    test_open_rejects_malformed_service_values_without_failing_the_whole_load()
+    test_create_from_template_produces_default_services()
     test_save_requires_current_path()
     test_save_as_then_save_round_trip_and_dirty_tracking()
     test_reset_to_untitled()
@@ -512,6 +674,10 @@ if __name__ == "__main__":
     test_place_create_dialog_unique_default_name()
     test_server_hierarchy_validation()
     test_server_replace_world_object_sanitization()
+    test_server_singleton_conflict_starter_player_scripts()
+    test_server_singleton_conflict_starter_character()
+    test_server_replace_world_rejects_multiple_starter_characters()
+    test_server_replace_world_rejects_multiple_starter_player_scripts()
     test_server_replace_world_rejects_non_local_connection()
 
     print()

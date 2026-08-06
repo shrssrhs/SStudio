@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+import datamodel_schema
 from shared import object_registry
 from shared.instance import (
     is_valid_vector3,
@@ -71,7 +72,7 @@ SCENE_FORMAT = "nebula-scene"
 # the same `.nebula.json` envelope; only the shape of "objects" differs
 # between the offline SceneObject path and this module's Instance path, and
 # open() tells them apart per-file (see _looks_like_legacy_scene_object).
-SCENE_FORMAT_VERSION = 2
+SCENE_FORMAT_VERSION = 3
 
 PROJECT_METADATA_FILENAME = "project.sstudio.json"
 PROJECT_METADATA_FORMAT_VERSION = 1
@@ -121,6 +122,12 @@ class PlaceOperationResult:
     display_name: Optional[str] = None
     project_dir: Optional[Path] = None
     template_id: Optional[str] = None
+    # Stage 3.8: always a COMPLETE, schema-defaulted services snapshot on
+    # success (create_from_template()/open() both fill in every missing
+    # service/property via datamodel_schema.sanitize_services_snapshot()) --
+    # never partial, so callers can hand this straight to REPLACE_WORLD
+    # without any extra merging of their own.
+    services: Optional[dict[str, dict[str, Any]]] = None
 
 
 @dataclass
@@ -249,8 +256,15 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
         raise
 
 
-def _place_envelope(objects: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"format": SCENE_FORMAT, "version": SCENE_FORMAT_VERSION, "objects": objects}
+def _place_envelope(objects: list[dict[str, Any]], services: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    envelope: dict[str, Any] = {"format": SCENE_FORMAT, "version": SCENE_FORMAT_VERSION, "objects": objects}
+    # Stage 3.8: "services" always written from here on (format version 3)
+    # -- a version-2 reader simply never looks at the extra key, and
+    # open() below always produces a complete, schema-defaulted dict
+    # regardless of what's actually on disk, so there's no reason to ever
+    # omit it once we're writing at all.
+    envelope["services"] = services if services is not None else datamodel_schema.sanitize_services_snapshot(None)
+    return envelope
 
 
 # ============================================================
@@ -600,8 +614,13 @@ class PlaceManager:
             modified_at=now,
             template_id=template_id,
         )
+        # Stage 3.8: templates don't (yet) define their own service values --
+        # a freshly created Place always starts from full schema defaults,
+        # same as datamodel_schema.default_properties() would give any
+        # brand-new instance of a class with no template.
+        default_services = datamodel_schema.sanitize_services_snapshot(None)
         try:
-            _atomic_write_json(place_path, _place_envelope(objects))
+            _atomic_write_json(place_path, _place_envelope(objects, default_services))
             _atomic_write_json(project_dir / PROJECT_METADATA_FILENAME, metadata.to_dict())
         except Exception as error:
             return PlaceOperationResult(False, f"Could not write project files: {error}")
@@ -610,6 +629,7 @@ class PlaceManager:
         return PlaceOperationResult(
             True, f"Created '{display_name}'.", path=place_path, objects=objects,
             display_name=display_name, project_dir=project_dir, template_id=template_id,
+            services=default_services,
         )
 
     def open(self, path: str | Path) -> PlaceOperationResult:
@@ -654,6 +674,14 @@ class PlaceManager:
                 sanitized.append(clean)
         sanitized = _validate_hierarchy(sanitized)
 
+        # Stage 3.8: version-3+ Places carry a "services" key; a version-2
+        # Place (or a version-3 file with a malformed/missing one) simply
+        # has no raw values to sanitize -- sanitize_services_snapshot(None)
+        # still returns a COMPLETE, schema-defaulted snapshot either way,
+        # which is what "missing service values use descriptor defaults"
+        # and "saving an old Place upgrades it cleanly" require.
+        services = datamodel_schema.sanitize_services_snapshot(raw.get("services"))
+
         project_dir = place_path.parent
         metadata_path = project_dir / PROJECT_METADATA_FILENAME
         display_name = place_path.stem
@@ -669,6 +697,7 @@ class PlaceManager:
         return PlaceOperationResult(
             True, f"Loaded '{place_path.name}'.", path=place_path, objects=sanitized,
             display_name=display_name, project_dir=project_dir, template_id=template_id,
+            services=services,
         )
 
     def commit(self, result: PlaceOperationResult) -> None:
@@ -688,19 +717,33 @@ class PlaceManager:
         self._saved_revision = 0
         self.recents.add(self.current_path, self.display_name, self.template_id)
 
-    def save(self, objects: list[dict[str, Any]]) -> PlaceOperationResult:
+    def save(
+        self, objects: list[dict[str, Any]], services: dict[str, dict[str, Any]] | None = None,
+    ) -> PlaceOperationResult:
         if self.current_path is None:
             return PlaceOperationResult(False, "No current Place path -- use Save As.")
-        return self.save_as(self.current_path, objects)
+        return self.save_as(self.current_path, objects, services)
 
-    def save_as(self, path: str | Path, objects: list[dict[str, Any]]) -> PlaceOperationResult:
+    def save_as(
+        self,
+        path: str | Path,
+        objects: list[dict[str, Any]],
+        services: dict[str, dict[str, Any]] | None = None,
+    ) -> PlaceOperationResult:
         try:
             place_path = Path(path).expanduser().resolve()
         except OSError as error:
             return PlaceOperationResult(False, f"Invalid destination: {error}")
 
+        # Stage 3.8: `services` is whatever the caller's CURRENT live
+        # session state is (bridge.export_services(), mirroring
+        # export_world()) -- sanitize_services_snapshot() still fills in
+        # any service the caller's dict happens to omit, so Save can never
+        # write a partial/invalid snapshot even if the caller only passes
+        # a subset.
+        clean_services = datamodel_schema.sanitize_services_snapshot(services)
         try:
-            _atomic_write_json(place_path, _place_envelope(objects))
+            _atomic_write_json(place_path, _place_envelope(objects, clean_services))
         except Exception as error:
             return PlaceOperationResult(False, f"Save failed: {error}")
 
@@ -711,7 +754,9 @@ class PlaceManager:
         self._mark_saved()
 
         self.recents.add(place_path, self.display_name, self.template_id)
-        return PlaceOperationResult(True, f"Saved '{place_path.name}'.", path=place_path, objects=objects)
+        return PlaceOperationResult(
+            True, f"Saved '{place_path.name}'.", path=place_path, objects=objects, services=clean_services,
+        )
 
     def reset_to_untitled(self) -> None:
         """Return to Start Page / New Place bookkeeping reset -- does not

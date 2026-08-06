@@ -38,6 +38,7 @@ from panda3d.core import NodePath, Vec3 as PVec3
 import character_controller as cc
 import character_rig as cr
 import client_studio as cs
+import datamodel_schema
 import lua_gameplay_api as lga
 import lua_runtime
 
@@ -80,6 +81,12 @@ class _FakeGame:
         self._captured = False
         self._character_runtime = None
         self._character_visual = None
+        # Stage 3.8: RuntimeSceneLayer.start() reads self.game.services to
+        # seed its runtime overlay -- see lua_runtime.py.
+        self.services: dict[str, dict] = datamodel_schema.sanitize_services_snapshot(None)
+        self._runtime_min_zoom = 2.0
+        self._runtime_max_zoom = 10.0
+        self.applied_service_writes: list[tuple[str, dict]] = []
         if with_character:
             world = BulletWorld()
             world.setGravity((0, -24.0, 0))
@@ -87,6 +94,13 @@ class _FakeGame:
             _add_static_floor(world)
             self._character_runtime = cc.CharacterRuntime(world, (0.0, 3.0, 0.0))
             self._character_visual = cr.CharacterVisualRig()
+
+    def apply_runtime_service_write(self, service_name: str, properties: dict) -> None:
+        """Stand-in for MultiplayerGame.apply_runtime_service_write() --
+        records what was applied without touching any real physics/
+        character state, so tests can assert on self.applied_service_writes
+        instead of needing a live PhysicsWorld/CharacterRuntime."""
+        self.applied_service_writes.append((service_name, dict(properties)))
 
     def _mouse_look_captured(self) -> bool:
         return self._captured
@@ -1163,6 +1177,178 @@ def test_build_script_execution_plan_never_touches_history_or_dirty_state() -> N
 
 
 # ============================================================
+# Stage 3.8: Lua root-service property access
+# (game:GetService("Workspace")/"StarterPlayer" property get/set)
+# ============================================================
+
+def test_workspace_gravity_read_default() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        source = "print(game:GetService('Workspace').Gravity)"
+        add_script(game, source, script_id="s1")
+        manager._start_script("s1")
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(any("24" in m for m in messages), f"workspace.Gravity reads the persistent default (24.0): {messages}")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_workspace_alias_and_get_service_same_identity() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        source = "print(workspace == game:GetService('Workspace'))"
+        add_script(game, source, script_id="s1")
+        manager._start_script("s1")
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check("true" in messages, "the `workspace` global and game:GetService('Workspace') refer to the same runtime service")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_workspace_gravity_runtime_write_applies_and_is_session_local() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        source = "game:GetService('Workspace').Gravity = 5\nprint(game:GetService('Workspace').Gravity)"
+        add_script(game, source, script_id="s1")
+        manager._start_script("s1")
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check("5.0" in messages, f"a runtime write to workspace.Gravity is immediately reflected on the next read: {messages}")
+        check(game.applied_service_writes == [("Workspace", {"Gravity": 5.0})], f"the write reached apply_runtime_service_write() with the full current overlay: {game.applied_service_writes}")
+        check(game.services["Workspace"]["Gravity"] == 24.0, "the PERSISTENT self.game.services dict is never touched by a runtime Lua write")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_workspace_gravity_zero_and_negative() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        source = "game:GetService('Workspace').Gravity = 0\nprint('zero-ok')"
+        add_script(game, source, script_id="s1")
+        manager._start_script("s1")
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check("zero-ok" in messages, "zero gravity is accepted")
+
+        source2 = "local ok, err = pcall(function() game:GetService('Workspace').Gravity = -1 end)\nprint(ok, err)"
+        add_script(game, source2, script_id="s2")
+        manager._start_script("s2")
+        run_frame(manager, ctx)
+        messages2 = [d.message for d in manager.diagnostics]
+        check(any("false" in m for m in messages2), f"negative gravity is rejected with a catchable Lua error: {messages2}")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_starter_player_property_read_and_runtime_write() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        source = (
+            "local sp = game:GetService('StarterPlayer')\n"
+            "print(sp.CharacterWalkSpeed)\n"
+            "sp.CharacterWalkSpeed = 20\n"
+            "print(sp.CharacterWalkSpeed)\n"
+        )
+        add_script(game, source, script_id="s1")
+        manager._start_script("s1")
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check("6.0" in messages, f"StarterPlayer.CharacterWalkSpeed reads the persistent default (6.0): {messages}")
+        check("20.0" in messages, f"a runtime write to StarterPlayer.CharacterWalkSpeed is reflected on the next read: {messages}")
+        # apply_runtime_service_write() receives the FULL current overlay
+        # for the service (not just the single changed key) -- see its own
+        # docstring for why (derived values like jump_speed need the whole
+        # picture regardless of write order).
+        walk_speed_writes = [props.get("CharacterWalkSpeed") for name, props in game.applied_service_writes if name == "StarterPlayer"]
+        check(20.0 in walk_speed_writes, f"the walk-speed write reached apply_runtime_service_write() with the new value somewhere in its overlay: {walk_speed_writes}")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_starter_player_camera_mode_enum_error_diagnostic() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        source = "local ok, err = pcall(function() game:GetService('StarterPlayer').CameraMode = 'NotAMode' end)\nprint(ok, err)"
+        add_script(game, source, script_id="s1")
+        manager._start_script("s1")
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(any("false" in m for m in messages), f"an invalid CameraMode enum write is rejected with a catchable Lua error: {messages}")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_workspace_read_only_write_diagnostic() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        source = "local ok, err = pcall(function() game:GetService('Workspace').CurrentCamera = nil end)\nprint(ok, err)"
+        add_script(game, source, script_id="s1")
+        manager._start_script("s1")
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(any("false" in m for m in messages), f"writing a read-only service property (CurrentCamera) is rejected with a catchable Lua error: {messages}")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_no_service_property_write_dirties_or_creates_history() -> None:
+    """Spec: "runtime writes do not dirty or serialize the Place" / "runtime
+    writes create no Undo entry" -- RuntimeSceneLayer's service overlay has
+    no reference to editor history/PlaceManager at all, proven the same
+    way test_character_appearance_never_dirties_or_serializes() proves it
+    for character appearance writes."""
+    import inspect
+    source = inspect.getsource(lua_runtime.RuntimeSceneLayer._set_service_property)
+    check("mark_place_dirty" not in source, "_set_service_property() never calls mark_place_dirty()")
+    check(".history" not in source, "_set_service_property() never touches editor Undo/Redo history")
+    check("apply_service_property_edit" not in source, "_set_service_property() never calls the network-facing apply_service_property_edit() (that is the EDITOR/Inspector path only)")
+
+
+def test_stale_service_overlay_after_stop() -> None:
+    """Spec: "stale service proxies fail safely after Stop" / "service
+    proxies are recreated next Play" -- the overlay itself is cleared on
+    stop(), so a lingering Lua reference reads back nothing meaningful
+    rather than stale Play-session data leaking into the next session."""
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    source = "game:GetService('Workspace').Gravity = 999"
+    add_script(game, source, script_id="s1")
+    manager._start_script("s1")
+    run_frame(manager, ctx)
+    teardown(game, manager, ctx)
+    check(manager.scene._service_overlay == {}, "the service overlay is fully cleared on Stop")
+    # Remove session 1's script -- a LocalScript left in game.instances
+    # would correctly auto-run again on the next Play (Stage 3.6 behavior)
+    # and re-apply the SAME write, which would make session 2 legitimately
+    # end up at 999 too. That is not what this test is isolating: it wants
+    # to prove the OVERLAY itself doesn't leak stale state into a session
+    # that never re-runs anything.
+    del game.instances["s1"]
+
+    # Next Play session starts fresh from the (untouched) persistent value.
+    manager2, ctx2 = make_context(game)
+    try:
+        check(manager2.scene._service_overlay["Workspace"]["Gravity"] == 24.0, "a new Play session's overlay is freshly reseeded from the untouched persistent value, not the previous session's stale overlay")
+        source2 = "print(game:GetService('Workspace').Gravity)"
+        add_script(game, source2, script_id="s2")
+        manager2._start_script("s2")
+        run_frame(manager2, ctx2)
+        messages = [d.message for d in manager2.diagnostics]
+        check(any("24" in m for m in messages), f"a new Play session starts from the persistent value, unaffected by the previous session's runtime write: {messages}")
+    finally:
+        teardown(game, manager2, ctx2)
+
+
+# ============================================================
 # run everything
 # ============================================================
 
@@ -1221,6 +1407,16 @@ test_modulescript_cache_is_once_per_session()
 test_diagnostics_preserve_correct_id_and_line_for_starterplayer_script()
 test_second_play_creates_fresh_execution_plan_and_old_callbacks_are_silent()
 test_build_script_execution_plan_never_touches_history_or_dirty_state()
+
+test_workspace_gravity_read_default()
+test_workspace_alias_and_get_service_same_identity()
+test_workspace_gravity_runtime_write_applies_and_is_session_local()
+test_workspace_gravity_zero_and_negative()
+test_starter_player_property_read_and_runtime_write()
+test_starter_player_camera_mode_enum_error_diagnostic()
+test_workspace_read_only_write_diagnostic()
+test_no_service_property_write_dirties_or_creates_history()
+test_stale_service_overlay_after_stop()
 
 print()
 if FAILURES:

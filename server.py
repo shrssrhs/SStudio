@@ -7,6 +7,7 @@ from typing import Any
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
+import datamodel_schema
 from shared import object_registry, protocol
 from shared.instance import (
     DEFAULT_PART_PROPERTIES,
@@ -46,6 +47,15 @@ players: dict[str, dict[str, Any]] = {}
 # Источник правды о построенном мире. Ключ — Instance.id.
 # Клиенты никогда не хранят "оригинал" — только то, что им прислал сервер.
 world: dict[str, Instance] = {}
+
+# Stage 3.8: persistent root-service properties (Workspace.Gravity,
+# StarterPlayer.CharacterWalkSpeed, ...). Root services are never Instances
+# (see object_registry.ROOT_SERVICES) so they live in their own dict, keyed
+# by service name, validated through datamodel_schema instead of the
+# Instance-shaped sanitizers above. Seeded with every registered service
+# class's own defaults so a brand-new server (or a Place with no "services"
+# key at all -- format version < 3) always has a complete, valid set.
+services: dict[str, dict[str, Any]] = datamodel_schema.sanitize_services_snapshot(None)
 
 state_lock = asyncio.Lock()
 
@@ -268,6 +278,9 @@ async def handle_message(
     elif message_type == protocol.REPLACE_WORLD:
         await handle_replace_world(player_id, message)
 
+    elif message_type == protocol.UPDATE_SERVICE_PROPERTY:
+        await handle_update_service_property(player_id, message)
+
 
 async def handle_create_part(
     player_id: str,
@@ -318,6 +331,12 @@ async def handle_create_part(
     )
 
     async with state_lock:
+        conflict = _singleton_conflict(world, part.class_name, part.name, part.parent_id)
+        if conflict is not None:
+            logging.warning(
+                "Игрок %s: create_part отклонён (%s)", player_id, conflict,
+            )
+            return
         world[part.id] = part
 
     logging.info(
@@ -381,6 +400,19 @@ async def handle_update_property(
         if part is None:
             return
 
+        if clean_name is not None:
+            conflict = _singleton_conflict(
+                world, part.class_name, clean_name, part.parent_id, exclude_id=part.id,
+            )
+            if conflict is not None:
+                logging.warning(
+                    "Игрок %s: rename отклонён для %s (%s)", player_id, part_id, conflict,
+                )
+                clean_name = None
+
+        if not clean_properties and clean_name is None and clean_enabled is None:
+            return
+
         if clean_properties:
             part.properties.update(clean_properties)
         if clean_name is not None:
@@ -400,6 +432,42 @@ async def handle_update_property(
         payload["enabled"] = clean_enabled
 
     await broadcast_to_all(payload)
+
+
+async def handle_update_service_property(
+    player_id: str,
+    message: dict[str, Any],
+) -> None:
+    """Root-service counterpart to handle_update_property() -- see
+    protocol.UPDATE_SERVICE_PROPERTY's docstring for why this is a
+    separate message pair. Same optimistic-broadcast shape: sanitize via
+    datamodel_schema (never trust the client), merge onto the persistent
+    `services` dict, echo back to everyone (including the requester) as
+    SERVICE_PROPERTY_UPDATED. Unknown service names and properties are
+    silently dropped, matching handle_update_property's own "malformed
+    input is untrusted, not fatal" contract."""
+    service_name = str(message.get("id", ""))
+    descriptor = datamodel_schema.get_class(service_name)
+    if descriptor is None or not descriptor.service:
+        return
+
+    raw_properties = message.get("properties", {})
+    if not isinstance(raw_properties, dict) or not raw_properties:
+        return
+
+    clean_properties = datamodel_schema.sanitize_persistent_properties(service_name, raw_properties)
+    if not clean_properties:
+        return
+
+    async with state_lock:
+        services.setdefault(service_name, datamodel_schema.default_properties(service_name))
+        services[service_name].update(clean_properties)
+
+    await broadcast_to_all({
+        "type": protocol.SERVICE_PROPERTY_UPDATED,
+        "id": service_name,
+        "properties": clean_properties,
+    })
 
 
 async def handle_delete_part(
@@ -521,8 +589,19 @@ async def handle_set_parent(
         instance = world.get(instance_id)
         if instance is None:
             return
-        instance.set_parent(parent_id)
-        instance_name = instance.name
+        conflict = _singleton_conflict(
+            world, instance.class_name, instance.name, parent_id, exclude_id=instance.id,
+        )
+        if conflict is not None:
+            reject = True
+        else:
+            instance.set_parent(parent_id)
+            instance_name = instance.name
+            reject = False
+
+    if reject:
+        await _reject_set_parent(player_id, instance_id, conflict)
+        return
 
     logging.info(
         "Игрок %s: реродитель %s (%s) -> %s",
@@ -877,6 +956,38 @@ def _sanitize_replace_world_object(raw: Any) -> Instance | None:
     )
 
 
+def _singleton_conflict(
+    world_snapshot: dict[str, Instance],
+    class_name: str,
+    name: str,
+    parent_id: Any,
+    exclude_id: str | None = None,
+) -> str | None:
+    """Stage 3.8: authoritative singleton enforcement for
+    StarterPlayerScripts (at most one anywhere) and the StarterCharacter
+    special-Model role (at most one exact match under StarterPlayer) --
+    called from every path that could introduce a duplicate: create,
+    rename, reparent, and REPLACE_WORLD. Returns a rejection reason, or
+    None if (class_name, name, parent_id) is fine. `exclude_id` lets a
+    rename/reparent of an EXISTING singleton check against every OTHER
+    instance without tripping over itself."""
+    parent_key = parent_id or "Workspace"
+    if class_name == "StarterPlayerScripts":
+        for other in world_snapshot.values():
+            if other.id == exclude_id:
+                continue
+            if other.class_name == "StarterPlayerScripts":
+                return "Only one StarterPlayerScripts is allowed."
+    if datamodel_schema.is_starter_character(class_name, name, parent_key):
+        for other in world_snapshot.values():
+            if other.id == exclude_id:
+                continue
+            other_parent = other.parent_id or "Workspace"
+            if datamodel_schema.is_starter_character(other.class_name, other.name, other_parent):
+                return "Only one StarterCharacter is allowed under StarterPlayer."
+    return None
+
+
 def _hierarchy_is_valid(instances: dict[str, Instance]) -> bool:
     for instance in instances.values():
         parent_key = instance.parent_id or "Workspace"
@@ -890,6 +1001,19 @@ def _hierarchy_is_valid(instances: dict[str, Instance]) -> bool:
             visited.add(walker)
             walker = instances[walker].parent_id or "Workspace"
     return True
+
+
+def _replace_world_singleton_conflict(new_world: dict[str, Instance]) -> str | None:
+    starter_scripts_count = sum(1 for i in new_world.values() if i.class_name == "StarterPlayerScripts")
+    if starter_scripts_count > 1:
+        return "Rejected: more than one StarterPlayerScripts in Place data."
+    starter_character_count = sum(
+        1 for i in new_world.values()
+        if datamodel_schema.is_starter_character(i.class_name, i.name, i.parent_id or "Workspace")
+    )
+    if starter_character_count > 1:
+        return "Rejected: more than one StarterCharacter under StarterPlayer in Place data."
+    return None
 
 
 async def handle_replace_world(player_id: str, message: dict[str, Any]) -> None:
@@ -939,10 +1063,31 @@ async def handle_replace_world(player_id: str, message: dict[str, Any]) -> None:
         )
         return
 
+    singleton_conflict = _replace_world_singleton_conflict(new_world)
+    if singleton_conflict is not None:
+        await _send_replace_world_result(player_id, request_id, False, singleton_conflict)
+        return
+
+    # Stage 3.8: "services" is optional (an older/offline client, or a
+    # version<3 Place with no services key at all -- see place_manager.py)
+    # -- when omitted, the persistent service state (Gravity,
+    # StarterPlayer.*, ...) is left exactly as it already was rather than
+    # silently reset to defaults, matching every other REPLACE_WORLD field
+    # this handler treats as "absent means unchanged" nowhere else applies,
+    # but this one setting genuinely differs per Place, so ANY REPLACE_WORLD
+    # that DOES include "services" (every current client always does, see
+    # client_studio.py's request_replace_world) fully replaces it.
+    raw_services = message.get("services")
+    new_services = datamodel_schema.sanitize_services_snapshot(raw_services) if isinstance(raw_services, dict) else None
+
     async with state_lock:
         world.clear()
         world.update(new_world)
+        if new_services is not None:
+            services.clear()
+            services.update(new_services)
         snapshot = serialize_world(world)
+        services_snapshot = {name: dict(props) for name, props in services.items()}
 
     logging.info(
         "Игрок %s заменил мир целиком (%d объектов)", player_id, len(new_world),
@@ -952,7 +1097,9 @@ async def handle_replace_world(player_id: str, message: dict[str, Any]) -> None:
     # WORLD_SNAPSHOT handling -- which already clears history and rebuilds
     # the scene, see Stage 3.2 baseline report question 6 -- has run by the
     # time the requester's UI acts on the result below.
-    await broadcast_to_all({"type": protocol.WORLD_SNAPSHOT, "parts": snapshot})
+    await broadcast_to_all({
+        "type": protocol.WORLD_SNAPSHOT, "parts": snapshot, "services": services_snapshot,
+    })
     await _send_replace_world_result(player_id, request_id, True, "World replaced.")
 
 
@@ -1003,12 +1150,14 @@ async def client_handler(
 
     async with state_lock:
         world_snapshot = serialize_world(world)
+        services_snapshot = {name: dict(props) for name, props in services.items()}
 
     await send_json(
         websocket,
         {
             "type": protocol.WORLD_SNAPSHOT,
             "parts": world_snapshot,
+            "services": services_snapshot,
         },
     )
 

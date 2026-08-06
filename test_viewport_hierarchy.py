@@ -234,9 +234,11 @@ class _FakeAdapter:
         self.outcome = outcome
         self.message = message
         self.received_objects: Any = None
+        self.received_services: Any = None
 
-    def replace_world(self, objects, on_result) -> bool:
+    def replace_world(self, objects, on_result, services=None) -> bool:
         self.received_objects = objects
+        self.received_services = services
         if self.outcome is None:
             return False
         on_result(self.outcome, self.message)
@@ -409,6 +411,110 @@ def test_repeated_home_to_scene_transitions_do_not_duplicate_widgets() -> None:
         check(id(win.viewport_frame) == viewport_frame_id, "10 Home->Scene load cycles never recreate viewport_frame")
 
 
+# ============================================================
+# Stage 3.8: root-service selection / Inspector rendering
+# ============================================================
+
+def _inspector_section_titles(win) -> list[str]:
+    layout = win.inspector_panel.contents_layout
+    titles = []
+    for i in range(layout.count() - 1):  # last item is the trailing stretch
+        widget = layout.itemAt(i).widget()
+        if isinstance(widget, m.CollapsibleSection):
+            titles.append(widget.header.text())
+    return titles
+
+
+def test_selecting_workspace_produces_non_blank_properties() -> None:
+    bridge = make_bridge()
+    win = m.StudioMainWindow(bridge)
+    win.bridge.select("Workspace")
+    check(win.inspector_panel.current_object is not None, "selecting Workspace in Explorer resolves to a real Inspector target (not None)")
+    titles = _inspector_section_titles(win)
+    check(len(titles) > 0, f"Workspace Properties is non-empty: {titles}")
+    check("Data" in titles, "Workspace Properties has a Data section (Name/ClassName/Parent)")
+    check("Behavior" in titles, "Workspace Properties has a Behavior section (Gravity)")
+    check("Debug" in titles, "Workspace Properties has a Debug section (SStudio instance id)")
+
+
+def test_selecting_starter_player_produces_non_blank_properties() -> None:
+    bridge = make_bridge()
+    win = m.StudioMainWindow(bridge)
+    win.bridge.select("StarterPlayer")
+    check(win.inspector_panel.current_object is not None, "selecting StarterPlayer resolves to a real Inspector target")
+    titles = _inspector_section_titles(win)
+    check("Camera" in titles and "Character" in titles, f"StarterPlayer Properties has both Camera and Character sections: {titles}")
+
+
+def test_selecting_common_services_no_blank_inspector() -> None:
+    """"Lighting" and "Camera" are deliberately excluded here -- confirmed
+    via shared.object_registry.ROOT_SERVICES that neither is actually a
+    root service in this codebase (both are ordinary offline-demo
+    SceneObjects with random ids, unrelated to Explorer's root-service
+    tree items -- see datamodel_schema.py's own comment on this)."""
+    bridge = make_bridge()
+    win = m.StudioMainWindow(bridge)
+    for name in ("ReplicatedStorage", "ServerScriptService", "ServerStorage", "StarterGui", "Players"):
+        win.bridge.select(name)
+        check(win.inspector_panel.current_object is not None, f"selecting {name} resolves to a real Inspector target")
+        titles = _inspector_section_titles(win)
+        check("Data" in titles, f"{name} Properties shows at least the common Data section: {titles}")
+
+
+def test_service_class_name_and_parent_are_read_only() -> None:
+    """Attempting to write ClassName/Parent through the authoritative
+    property path must be rejected -- these are never exposed as editable
+    widgets in _build_schema_sections()/_build_schema_property_editor(),
+    but the write path itself must also refuse, not just the UI."""
+    bridge = make_bridge()
+    win = m.StudioMainWindow(bridge)
+    win.bridge.select("Workspace")
+    before = win.bridge.get_object("Workspace").name
+    win.bridge.set_property("Workspace", "properties.ClassName", "SomethingElse")
+    after = win.bridge.get_object("Workspace").properties.get("ClassName")
+    check(after != "SomethingElse", "writing Workspace.ClassName through set_property() is rejected (unknown/read-only property)")
+
+
+def test_invalid_gravity_edit_preserves_old_value_and_no_dirty() -> None:
+    bridge = make_bridge()
+    win = m.StudioMainWindow(bridge)
+    win.bridge.select("Workspace")
+    check(not win.bridge.is_dirty, "precondition: bridge starts clean")
+    win.bridge.set_property("Workspace", "properties.Gravity", -5.0)
+    check(win.bridge.get_object("Workspace").properties.get("Gravity") == 24.0, "an invalid Gravity edit (-5.0) leaves the old value (24.0) unchanged")
+    check(not win.bridge.is_dirty, "an invalid Gravity edit never marks the Place dirty")
+
+
+def test_selection_switching_does_not_duplicate_inspector_rows() -> None:
+    bridge = make_bridge()
+    win = m.StudioMainWindow(bridge)
+    for _ in range(3):
+        win.bridge.select("Workspace")
+        win.bridge.select("StarterPlayer")
+        win.bridge.select(None)
+    win.bridge.select("Workspace")
+    titles = _inspector_section_titles(win)
+    check(titles.count("Behavior") == 1, f"repeated selection switching never duplicates Inspector sections: {titles}")
+
+
+def test_part_and_script_inspector_unaffected_by_service_rendering() -> None:
+    """Selecting a normal Part/Script must still use the LEGACY
+    object_registry-driven Inspector path -- proves the new schema-driven
+    branch in InspectorPanel.set_object() is gated correctly and doesn't
+    regress existing classes (spec: "incremental migration")."""
+    bridge = make_bridge()
+    win = m.StudioMainWindow(bridge)
+    part = win.bridge.add_part("Part", parent="Workspace")
+    win.bridge.select(part.id)
+    titles = _inspector_section_titles(win)
+    check("Transform" in titles and "Appearance" in titles and "Behavior" in titles, f"a normal Part still shows its accepted Transform/Appearance/Behavior sections: {titles}")
+
+    script = win.bridge.add_part("Script", parent="ServerScriptService")
+    win.bridge.select(script.id)
+    titles = _inspector_section_titles(win)
+    check("Script" in titles, f"a Script still shows its Script section (Source/Open Script preserved): {titles}")
+
+
 if __name__ == "__main__":
     test_central_stack_exists_before_any_embedding()
     test_install_template_browser_does_not_reparent_central_widget()
@@ -424,6 +530,14 @@ if __name__ == "__main__":
     test_open_place_path_local_failure_preserves_current_page()
     test_open_place_path_success_activates_scene()
     test_repeated_home_to_scene_transitions_do_not_duplicate_widgets()
+
+    test_selecting_workspace_produces_non_blank_properties()
+    test_selecting_starter_player_produces_non_blank_properties()
+    test_selecting_common_services_no_blank_inspector()
+    test_service_class_name_and_parent_are_read_only()
+    test_invalid_gravity_edit_preserves_old_value_and_no_dirty()
+    test_selection_switching_does_not_duplicate_inspector_rows()
+    test_part_and_script_inspector_unaffected_by_service_rendering()
 
     print()
     if FAILURES:

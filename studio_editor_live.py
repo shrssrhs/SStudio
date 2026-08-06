@@ -108,6 +108,7 @@ from PySide6.QtWidgets import (
 
 import place_manager
 import script_editor
+import datamodel_schema
 from shared import object_registry, transform_math
 from shared.object_registry import ObjectTypeDefinition, ROOT_SERVICES
 
@@ -197,6 +198,35 @@ class SceneObject:
         clean["pivot_rotation"] = Vec3.from_value(clean.get("pivot_rotation"))
         clean["pivot_is_explicit"] = bool(clean.get("pivot_is_explicit", False))
         return cls(**clean)
+
+
+def _build_service_scene_objects(
+    services_state: Optional[dict[str, dict[str, Any]]] = None,
+) -> dict[str, "SceneObject"]:
+    """Stage 3.8: one SceneObject per registered root service, id ==
+    ClassName == the service's own name (e.g. "Workspace") -- kept in
+    EngineBridge.services, a dict SEPARATE from EngineBridge.objects (root
+    services are not ordinary scene objects; ExplorerPanel.rebuild()
+    already builds their tree-root QTreeWidgetItems directly from
+    shared.object_registry.ROOT_SERVICES, never from self.objects). All
+    service-specific data lives in SceneObject.properties, the same
+    generic bag Script.Source/PointLight.Brightness already use -- no new
+    fields needed on SceneObject itself."""
+    result: dict[str, SceneObject] = {}
+    for descriptor in datamodel_schema.get_all_classes():
+        if not descriptor.service:
+            continue
+        properties = datamodel_schema.default_properties(descriptor.class_name)
+        if services_state is not None and descriptor.class_name in services_state:
+            properties.update(services_state[descriptor.class_name])
+        result[descriptor.class_name] = SceneObject(
+            id=descriptor.class_name,
+            name=descriptor.class_name,
+            object_type=descriptor.class_name,
+            parent="",
+            properties=properties,
+        )
+    return result
 
 
 def demo_scene() -> list[SceneObject]:
@@ -333,6 +363,14 @@ class EngineBridge(QObject):
             self.objects = [] if self.live_mode else demo_scene()
         else:
             self.objects = list(objects)
+        # Stage 3.8: root-service selection targets (Workspace, StarterPlayer,
+        # ...) -- see _build_service_scene_objects(). Populated with schema
+        # defaults immediately so Workspace/StarterPlayer/etc. are already
+        # selectable (non-blank Inspector) even before a live server
+        # connection exists; MultiplayerStudioAdapter.sync_full_scene()
+        # (client_studio.py) overwrites this with the actual synced
+        # WORLD_SNAPSHOT services state once connected.
+        self.services: dict[str, SceneObject] = _build_service_scene_objects()
         self.selected_id: Optional[str] = None
         self.is_playing = False
         self.is_dirty = False
@@ -381,7 +419,46 @@ class EngineBridge(QObject):
     def get_object(self, object_id: Optional[str]) -> Optional[SceneObject]:
         if not object_id:
             return None
-        return next((obj for obj in self.objects if obj.id == object_id), None)
+        found = next((obj for obj in self.objects if obj.id == object_id), None)
+        if found is not None:
+            return found
+        # Stage 3.8: root services (Workspace, StarterPlayer, ...) live in
+        # a separate dict, never in self.objects -- see
+        # _build_service_scene_objects(). Checked second so an ordinary
+        # object can never be shadowed by a same-named service (object ids
+        # are opaque hex/uuid strings, service ids are the fixed
+        # ROOT_SERVICES names, so a collision is not actually possible in
+        # practice, but the ordering documents the intended precedence).
+        return self.services.get(object_id)
+
+    def sync_services(self, services_state: dict[str, dict[str, Any]]) -> None:
+        """Full resync of every root service's properties from the
+        authoritative server state -- called from MultiplayerStudioAdapter.
+        sync_full_scene() (initial connect, WORLD_SNAPSHOT after Open
+        Place/template creation). Rebuilds self.services wholesale (same
+        "brand-new authoritative state" semantics as sync_scene() for
+        ordinary objects) and, if a service happens to be the current
+        selection, re-emits selection_changed so the Inspector refreshes
+        with the new values instead of going stale."""
+        self.services = _build_service_scene_objects(services_state)
+        self.scene_changed.emit()
+        if self.selected_id in self.services:
+            self.selection_changed.emit(self.services[self.selected_id])
+
+    def sync_service_property(self, service_name: str, properties: dict[str, Any]) -> None:
+        """Granular counterpart to sync_services() -- one
+        SERVICE_PROPERTY_UPDATED broadcast (including the echo of this
+        client's own edit). Mirrors sync_upsert()'s role for ordinary
+        Instances: updates the stored SceneObject in place and, if
+        selected, notifies the Inspector via property_changed (the SAME
+        signal ordinary property edits use -- InspectorPanel/ExplorerPanel
+        already know how to handle it generically)."""
+        obj = self.services.get(service_name)
+        if obj is None:
+            return
+        obj.properties.update(properties)
+        for key, value in properties.items():
+            self.property_changed.emit(service_name, f"properties.{key}", value)
 
     def unique_name(self, base: str, parent: str = "Workspace") -> str:
         """Uniqueness is scoped to siblings under the same parent — same
@@ -845,15 +922,31 @@ class EngineBridge(QObject):
         if obj is None:
             return
 
+        # Stage 3.8: root services go through datamodel_schema validation
+        # BEFORE anything is written locally -- a rejected edit must leave
+        # the old value unchanged, create no history entry, and not dirty
+        # the Place (spec), so this has to happen ahead of _write_property()
+        # rather than being caught only by the (nonexistent, for services)
+        # server reject path ordinary Instance edits rely on.
+        is_service = object_id in ROOT_SERVICES
+        if is_service and property_path.startswith("properties."):
+            key = property_path.split(".", 1)[1]
+            result = datamodel_schema.validate_property_value(object_id, key, value)
+            if not result.ok:
+                self.log("warning", f"{object_id}.{key}: {result.error}")
+                return
+            value = result.value
+
         old_value = self._read_property(obj, property_path)
         if not self._write_property(obj, property_path, value):
             return
 
         accepted = True
         if self.live_mode:
+            adapter_method = "set_service_property" if is_service else "set_property"
             accepted = bool(
                 self._adapter_call(
-                    "set_property",
+                    adapter_method,
                     object_id,
                     property_path,
                     value,
@@ -1002,7 +1095,12 @@ class EngineBridge(QObject):
         self.replace_scene(objects, mark_dirty=False)
         self.log("info", f"Scene loaded: {source.name}")
 
-    def replace_world(self, objects: list[dict[str, Any]], on_result: Callable[[bool, str], None]) -> bool:
+    def replace_world(
+        self,
+        objects: list[dict[str, Any]],
+        on_result: Callable[[bool, str], None],
+        services: dict[str, dict[str, Any]] | None = None,
+    ) -> bool:
         """Stage 3.2: Create Place from template / Open Place. Instance-
         shaped (id/class_name/name/parent_id/properties/tags/attributes/
         enabled) objects, NOT SceneObject-shaped -- distinct from load_
@@ -1010,11 +1108,16 @@ class EngineBridge(QObject):
         offline (non-live) demo path. on_result fires asynchronously once
         the server's REPLACE_WORLD_RESULT arrives; this method itself
         never blocks and never mutates local state -- see PlaceManager
-        for the file-side half of this operation."""
+        for the file-side half of this operation.
+
+        Stage 3.8: `services` (root-service persistent properties) rides
+        along in the SAME atomic REPLACE_WORLD request when provided --
+        see place_manager.PlaceOperationResult.services, always a
+        complete schema-defaulted snapshot by the time it reaches here."""
         if not self.live_mode:
             on_result(False, "Place file operations require a live server connection.")
             return False
-        return bool(self._adapter_call("replace_world", objects, on_result, default=False))
+        return bool(self._adapter_call("replace_world", objects, on_result, services, default=False))
 
     def export_world(self) -> list[dict[str, Any]]:
         """Stage 3.2 Save Place: Instance-shaped snapshot of whatever is
@@ -1023,6 +1126,24 @@ class EngineBridge(QObject):
         if not self.live_mode:
             return []
         return list(self._adapter_call("export_world", default=[]))
+
+    def create_starter_character(self) -> bool:
+        """Stage 3.8: Explorer's "Insert StarterCharacter" action -- see
+        MultiplayerStudioAdapter.create_starter_character() for the actual
+        singleton pre-check and CreateObjectCommand. Requires a live
+        server connection, same as every other creation path."""
+        if not self.live_mode:
+            self.log("warning", "StarterCharacter requires a live server connection.")
+            return False
+        return bool(self._adapter_call("create_starter_character", default=False))
+
+    def export_services(self) -> dict[str, dict[str, Any]]:
+        """Stage 3.8 Save Place counterpart to export_world() -- current
+        persistent root-service properties. Empty in non-live mode, same
+        reasoning as export_world()."""
+        if not self.live_mode:
+            return {}
+        return dict(self._adapter_call("export_services", default={}))
 
 # ---------------------------------------------------------------------------
 # Icon factory
@@ -1676,7 +1797,13 @@ class ExplorerPanel(QWidget):
 
         for root_name in ROOT_SERVICES:
             root = QTreeWidgetItem([root_name])
-            root.setData(0, Qt.ItemDataRole.UserRole, None)
+            # Stage 3.8: the root's own name is now its selection identity
+            # (was None) -- this is what makes clicking Workspace/
+            # StarterPlayer/etc. in Explorer actually select something
+            # instead of silently emitting selection_changed(None). See
+            # EngineBridge.get_object()'s services-dict fallback and
+            # InspectorPanel.set_object()'s service-aware branch.
+            root.setData(0, Qt.ItemDataRole.UserRole, root_name)
             root.setIcon(0, self._icon_for_root(root_name))
             roots[root_name] = root
             self.tree.addTopLevelItem(root)
@@ -1810,7 +1937,15 @@ class ExplorerPanel(QWidget):
 
     def _rename_current(self) -> None:
         item = self.tree.currentItem()
-        if item is not None and item.data(0, Qt.ItemDataRole.UserRole):
+        object_id = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
+        # Stage 3.8: root-service items now carry their own name as
+        # UserRole (was None, see rebuild()) -- explicitly excluded here
+        # too, not just relying on them lacking the ItemIsEditable flag,
+        # since root services are never renameable regardless of how F2
+        # is triggered (spec: "root service ClassName cannot change" /
+        # "renameability follows the class descriptor", and every service
+        # ClassDescriptor sets renameable=False).
+        if item is not None and object_id and object_id not in ROOT_SERVICES:
             self.tree.editItem(item)
 
     def _on_item_text_changed(self, item: QTreeWidgetItem, column: int) -> None:
@@ -1891,10 +2026,28 @@ class ExplorerPanel(QWidget):
             lambda: open_insert_object_dialog(self.bridge, self, object_id)
         )
 
+        if object_id == "StarterPlayer":
+            # Stage 3.8: StarterCharacter is a special Model ROLE, not its
+            # own ClassName (see datamodel_schema.is_starter_character()),
+            # so it can't just be picked from the generic Insert Object
+            # type list the way StarterPlayerScripts can -- a dedicated
+            # action is the only way to insert one with the exact required
+            # name.
+            insert_starter_character_action = menu.addAction("Insert StarterCharacter")
+            insert_starter_character_action.triggered.connect(self.bridge.create_starter_character)
+
         if object_id:
             obj = self.bridge.get_object(object_id)
             is_system = object_id.startswith("system:")
-            is_protected = obj is not None and obj.object_type in self.SYSTEM_PROTECTED_TYPES
+            # Stage 3.8: root services now have a real UserRole (their own
+            # name, see rebuild()) so this branch reaches them too --
+            # explicitly protected here since is_system/SYSTEM_PROTECTED_TYPES
+            # were never meant to cover them (spec: "root-service deletion/
+            # duplication is forbidden", "renameability follows the class
+            # descriptor" -- every service ClassDescriptor is renameable=False,
+            # deletable=False).
+            is_service = object_id in ROOT_SERVICES
+            is_protected = is_service or (obj is not None and obj.object_type in self.SYSTEM_PROTECTED_TYPES)
             menu.addSeparator()
 
             if self._is_script_object(object_id) is not None:
@@ -1903,11 +2056,11 @@ class ExplorerPanel(QWidget):
                 menu.addSeparator()
 
             rename_action = menu.addAction("Rename")
-            rename_action.setEnabled(not is_system)
+            rename_action.setEnabled(not is_system and not is_service)
             rename_action.triggered.connect(lambda: self.tree.editItem(item))
 
             duplicate_action = menu.addAction("Duplicate")
-            duplicate_action.setEnabled(not is_system)
+            duplicate_action.setEnabled(not is_system and not is_service)
             duplicate_action.triggered.connect(
                 lambda: (self.bridge.select(object_id), self.bridge.duplicate_selected())
             )
@@ -1940,6 +2093,12 @@ class ExplorerPanel(QWidget):
         dragged_id = dragged_item.data(0, Qt.ItemDataRole.UserRole)
         if not dragged_id:
             return False, "System objects cannot be reparented."
+        if dragged_id in ROOT_SERVICES:
+            # Stage 3.8: root-service items now carry their own name as
+            # UserRole (was None, which the check above used to catch) --
+            # explicitly excluded here too (spec: "root services cannot be
+            # reparented").
+            return False, "Root services cannot be reparented."
 
         dragged_obj = self.bridge.get_object(dragged_id)
         if dragged_obj is None:
@@ -2179,12 +2338,32 @@ class InspectorPanel(QWidget):
             self._building = False
             return
 
+        # Stage 3.8: root services (Workspace, StarterPlayer, ...) render
+        # ENTIRELY from datamodel_schema metadata -- never touching
+        # shared/object_registry.py or the legacy section_builders dispatch
+        # below, since services were never registered there at all (that's
+        # the root cause of the "blank Properties" bug this stage fixes).
+        # This is also the one Inspector code path a genuinely new class
+        # (e.g. a future ProximityPrompt) could reuse with zero Inspector
+        # changes -- see _build_schema_sections()'s own docstring.
+        if obj.id in ROOT_SERVICES:
+            self.object_icon.setPixmap(IconFactory.make("cube", 18, QColor("#d6c068")).pixmap(18, 18))
+            self.object_name.setText(obj.name)
+            self.lock_button.setChecked(False)
+            self.lock_button.setEnabled(False)
+            for section in self._build_schema_sections(obj):
+                self._insert_section(section)
+            self._building = False
+            self._apply_filter(self.filter_edit.text())
+            return
+
         definition = object_registry.get_object_type(obj.object_type)
         icon_kind = definition.icon if definition is not None else "cube"
         icon_tint = QColor(obj.color) if (definition is None or definition.has_3d_entity) else QColor("#b9bec2")
         pix = IconFactory.make(icon_kind, 18, icon_tint).pixmap(18, 18)
         self.object_icon.setPixmap(pix)
         self.object_name.setText(obj.name)
+        self.lock_button.setEnabled(True)
         self.lock_button.setChecked(obj.locked)
 
         self._insert_section(self._build_general_section(obj, definition))
@@ -2258,6 +2437,89 @@ class InspectorPanel(QWidget):
         general.add_row("Enabled", enabled)
 
         return general
+
+    def _build_schema_sections(self, obj: SceneObject) -> list[CollapsibleSection]:
+        """Stage 3.8: fully metadata-driven Inspector rendering -- ONE
+        generic path any datamodel_schema-registered class can use, no
+        per-class Inspector code. Currently wired only for root services
+        (see set_object() above), but the dispatch on PropertyDescriptor.
+        value_type below is written generically enough for a future
+        legacy_managed=False class (a real ProximityPrompt, eventually) to
+        reuse verbatim -- that's the whole point of the metadata registry
+        (see datamodel_schema.py's module docstring)."""
+        sections: list[CollapsibleSection] = []
+
+        data_section = CollapsibleSection("Data")
+        name_label = QLabel(obj.name)
+        name_label.setObjectName("MutedLabel")
+        data_section.add_row("Name", name_label)
+        class_label = QLabel(obj.object_type)
+        class_label.setObjectName("MutedLabel")
+        data_section.add_row("ClassName", class_label)
+        parent_label = QLabel("(none)")
+        parent_label.setObjectName("MutedLabel")
+        data_section.add_row("Parent", parent_label)
+        sections.append(data_section)
+
+        for category, props in datamodel_schema.properties_by_category(obj.object_type):
+            if category in ("Data", "Debug", "Runtime"):
+                continue  # Data is handled above; Debug/Runtime get their own section below
+            section = CollapsibleSection(category)
+            for prop in props:
+                section.add_row(prop.label(), self._build_schema_property_editor(obj, prop))
+            sections.append(section)
+
+        runtime_props = [p for cat, props in datamodel_schema.properties_by_category(obj.object_type) if cat == "Runtime" for p in props]
+        if runtime_props:
+            runtime_section = CollapsibleSection("Runtime")
+            for prop in runtime_props:
+                label = QLabel("(available during Play)")
+                label.setObjectName("MutedLabel")
+                runtime_section.add_row(prop.label(), label)
+            sections.append(runtime_section)
+
+        debug_section = CollapsibleSection("Debug")
+        id_label = QLabel(obj.id)
+        id_label.setObjectName("MutedLabel")
+        debug_section.add_row("Instance Id (SStudio)", id_label)
+        sections.append(debug_section)
+
+        return sections
+
+    def _build_schema_property_editor(self, obj: SceneObject, prop: "datamodel_schema.PropertyDescriptor") -> QWidget:
+        current = obj.properties.get(prop.name, prop.default)
+        path = f"properties.{prop.name}"
+
+        if not prop.editable:
+            label = QLabel(str(current))
+            label.setObjectName("MutedLabel")
+            return label
+
+        if prop.value_type == "bool":
+            box = QCheckBox()
+            box.setChecked(bool(current))
+            box.toggled.connect(lambda value, p=path: self._set_value(p, bool(value)))
+            return box
+
+        if prop.value_type == "enum":
+            assert prop.enum is not None
+            combo = QComboBox()
+            combo.addItems(list(prop.enum.values))
+            if current in prop.enum.values:
+                combo.setCurrentText(str(current))
+            combo.currentTextChanged.connect(lambda value, p=path: self._set_value(p, value))
+            return combo
+
+        if prop.value_type in ("int", "float"):
+            minimum = prop.minimum if prop.minimum is not None else -1_000_000.0
+            maximum = prop.maximum if prop.maximum is not None else 1_000_000.0
+            box = self._float_box(float(current), float(minimum), float(maximum), 0.1)
+            box.valueChanged.connect(lambda value, p=path: self._set_value(p, float(value)))
+            return box
+
+        edit = QLineEdit(str(current))
+        edit.editingFinished.connect(lambda w=edit, p=path: self._set_value(p, w.text()))
+        return edit
 
     def _build_transform_section(self, obj: SceneObject) -> CollapsibleSection:
         transform = CollapsibleSection("Transform")
@@ -3962,7 +4224,7 @@ class StudioMainWindow(QMainWindow):
                     self, "Place Operation Failed", message or "The server rejected the request.",
                 )
                 self.bridge.log("error", f"Place operation rejected: {message}")
-        accepted = self.bridge.replace_world(result.objects or [], _on_result)
+        accepted = self.bridge.replace_world(result.objects or [], _on_result, result.services)
         if not accepted:
             QMessageBox.critical(self, "Not Connected", "Not connected to a live server.")
 
@@ -3999,7 +4261,7 @@ class StudioMainWindow(QMainWindow):
         if self.place_manager.current_path is None:
             return self._place_save_as()
         objects = self.bridge.export_world()
-        result = self.place_manager.save(objects)
+        result = self.place_manager.save(objects, self.bridge.export_services())
         if not result.success:
             QMessageBox.critical(self, "Save Failed", result.message)
             self.bridge.log("error", result.message)
@@ -4018,7 +4280,7 @@ class StudioMainWindow(QMainWindow):
         if not path.lower().endswith(".json"):
             path += ".nebula.json"
         objects = self.bridge.export_world()
-        result = self.place_manager.save_as(path, objects)
+        result = self.place_manager.save_as(path, objects, self.bridge.export_services())
         if not result.success:
             QMessageBox.critical(self, "Save Failed", result.message)
             self.bridge.log("error", result.message)

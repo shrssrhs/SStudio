@@ -580,6 +580,18 @@ class RuntimeSceneLayer:
         self._snapshot: dict[str, dict[str, Any]] = {}
         self._next_runtime_index = 0
         self._physics = None  # bound in start()
+        # Stage 3.8: root-service (Workspace, StarterPlayer, ...) runtime
+        # property overlay -- same "session-local overlay on top of a
+        # Play-start snapshot" shape self._overlay already uses for
+        # ordinary Instances, just keyed by service name instead of
+        # instance id. Seeded from self.game.services (the PERSISTENT,
+        # editor-time values) in start(); every read/write in get_property()/
+        # set_property() below goes through THIS dict, never
+        # self.game.services directly -- that is what keeps a runtime Lua
+        # `workspace.Gravity = X` from ever touching the persistent/saved
+        # value (spec: "runtime writes do not dirty or serialize the
+        # Place"). Discarded wholesale in stop().
+        self._service_overlay: dict[str, dict[str, Any]] = {}
 
     # ---------------- lifecycle ----------------
 
@@ -593,6 +605,12 @@ class RuntimeSceneLayer:
         self._snapshot.clear()
         self._next_runtime_index = 0
         self._physics = self.game._physics_world
+        # Stage 3.8: deep-copy so mutating the overlay (runtime Lua writes)
+        # can never reach back into self.game.services (the persistent,
+        # serialized dict) through a shared nested dict reference.
+        self._service_overlay = {
+            name: dict(properties) for name, properties in self.game.services.items()
+        }
 
         for instance_id, record in self.game.instances.items():
             definition = object_registry.get_object_type(record.class_name)
@@ -660,6 +678,7 @@ class RuntimeSceneLayer:
         self._deleted.clear()
         self._runtime.clear()
         self._snapshot.clear()
+        self._service_overlay.clear()
         self._physics = None
 
     # ---------------- lookups shared by proxy + scheduler ----------------
@@ -669,7 +688,8 @@ class RuntimeSceneLayer:
         return object_registry.get_object_type(class_name)
 
     def exists(self, instance_id: str) -> bool:
-        if instance_id in ("game", "Workspace"):
+        from shared.object_registry import ROOT_SERVICES
+        if instance_id == "game" or instance_id in ROOT_SERVICES:
             return True
         if instance_id in self._deleted:
             return False
@@ -678,10 +698,14 @@ class RuntimeSceneLayer:
         return instance_id in self.game.instances
 
     def class_name_of(self, instance_id: str) -> Optional[str]:
+        from shared.object_registry import ROOT_SERVICES
         if instance_id == "game":
             return "DataModel"
-        if instance_id == "Workspace":
-            return "Workspace"
+        # Stage 3.8: generalized from a Workspace-only special case -- every
+        # root service's ClassName is its own name (Workspace, StarterPlayer,
+        # Lighting, ...), same as Roblox's DataModel services.
+        if instance_id in ROOT_SERVICES:
+            return instance_id
         item = self._runtime.get(instance_id)
         if item is not None:
             return item.class_name
@@ -689,10 +713,11 @@ class RuntimeSceneLayer:
         return record.class_name if record is not None else None
 
     def name_of(self, instance_id: str) -> Optional[str]:
+        from shared.object_registry import ROOT_SERVICES
         if instance_id == "game":
             return "game"
-        if instance_id == "Workspace":
-            return "Workspace"
+        if instance_id in ROOT_SERVICES:
+            return instance_id
         if instance_id in self._name_overlay:
             return self._name_overlay[instance_id]
         item = self._runtime.get(instance_id)
@@ -702,7 +727,8 @@ class RuntimeSceneLayer:
         return record.name if record is not None else None
 
     def parent_of(self, instance_id: str) -> Optional[str]:
-        if instance_id in ("game", "Workspace"):
+        from shared.object_registry import ROOT_SERVICES
+        if instance_id == "game" or instance_id in ROOT_SERVICES:
             return None
         item = self._runtime.get(instance_id)
         if item is not None:
@@ -777,17 +803,66 @@ class RuntimeSceneLayer:
 
     # ---------------- property get/set (the __bridge_get/__bridge_set backends) ----------------
 
+    @staticmethod
+    def _lua_kind_for_value(value_type: str, value: Any) -> tuple[str, Any]:
+        """Maps a datamodel_schema PropertyDescriptor.value_type + its
+        current Python value to the (kind, raw) shape __bridge_get's Lua
+        caller (wrap_value() in the prelude, see this module's top) already
+        knows how to turn into a real Lua value."""
+        if value_type == "vector3":
+            return "vector3", [float(v) for v in value]
+        if value_type == "color3":
+            return "color3", [float(v) for v in value]
+        if value_type == "bool":
+            return "bool", bool(value)
+        if value_type == "int":
+            return "number", int(value)
+        if value_type == "float":
+            return "number", float(value)
+        if value_type == "instance_ref":
+            return ("nil", None) if value is None else ("instance", value)
+        return "string", str(value)  # "string" / "enum"
+
+    def _get_service_property(self, service_name: str, key: str) -> tuple[str, Any]:
+        import datamodel_schema
+        prop = datamodel_schema.get_property_descriptor(service_name, key)
+        if prop is None or not prop.lua_readable:
+            return "error", f"'{key}' is not a valid member of {service_name}"
+        if prop.runtime_getter is not None:
+            return prop.runtime_getter(self.game, service_name)
+        overlay = self._service_overlay.get(service_name, {})
+        value = overlay.get(key, prop.default)
+        return self._lua_kind_for_value(prop.value_type, value)
+
+    def _set_service_property(self, service_name: str, key: str, value: Any) -> tuple[bool, Optional[str]]:
+        import datamodel_schema
+        prop = datamodel_schema.get_property_descriptor(service_name, key)
+        if prop is None or not prop.lua_writable:
+            return False, f"'{key}' cannot be assigned to (read-only)"
+        result = datamodel_schema.validate_property_value(service_name, key, value)
+        if not result.ok:
+            return False, result.error
+        self._service_overlay.setdefault(service_name, {})[key] = result.value
+        self.game.apply_runtime_service_write(service_name, dict(self._service_overlay[service_name]))
+        return True, None
+
     def get_property(self, instance_id: str, key: str) -> tuple[str, Any]:
+        from shared.object_registry import ROOT_SERVICES
         if instance_id == "game":
             if key == "Workspace":
                 return "instance", "Workspace"
             return "error", f"'{key}' is not a valid member of DataModel"
-        if instance_id == "Workspace":
+        if instance_id in ROOT_SERVICES:
+            # Stage 3.8: generalized from a Workspace-only special case --
+            # every root service answers Name/ClassName/Parent the same
+            # way (Name==ClassName==its own name, Parent==nil); anything
+            # else is dispatched through datamodel_schema (Workspace.
+            # Gravity, StarterPlayer.CharacterWalkSpeed, ...).
             if key == "Name" or key == "ClassName":
-                return "string", "Workspace"
+                return "string", instance_id
             if key == "Parent":
                 return "nil", None
-            return "error", f"'{key}' is not a valid member of Workspace"
+            return self._get_service_property(instance_id, key)
 
         if not self.exists(instance_id):
             return "error", "attempt to use a destroyed Instance"
@@ -831,8 +906,18 @@ class RuntimeSceneLayer:
         return record.properties if record is not None else {}
 
     def set_property(self, instance_id: str, key: str, value: Any) -> tuple[bool, Optional[str]]:
-        if instance_id in ("game", "Workspace"):
+        from shared.object_registry import ROOT_SERVICES
+        if instance_id == "game":
             return False, f"'{key}' cannot be assigned to (read-only)"
+        if instance_id in ROOT_SERVICES:
+            # Stage 3.8: generalized from a Workspace-only unconditional
+            # read-only reject -- Name/ClassName/Parent stay read-only for
+            # every service (services are never renamed/reparented), but
+            # datamodel_schema-registered properties (Workspace.Gravity,
+            # StarterPlayer.*) now genuinely accept writes.
+            if key in ("Name", "ClassName", "Parent"):
+                return False, f"'{key}' cannot be assigned to (read-only)"
+            return self._set_service_property(instance_id, key, value)
         if not self.exists(instance_id):
             return False, "attempt to use a destroyed Instance"
 

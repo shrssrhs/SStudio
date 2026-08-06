@@ -299,6 +299,28 @@ class PropertyEditCommand(_PropertyDeltaCommand):
     MultiplayerStudioAdapter.set_property()."""
 
 
+class ServicePropertyEditCommand(_PropertyDeltaCommand):
+    """Stage 3.8: Inspector edits to a root service's persistent properties
+    (Workspace.Gravity, StarterPlayer.CharacterWalkSpeed, ...) -- goes
+    through MultiplayerStudioAdapter.set_service_property(), the service
+    counterpart to set_property() above. `instance_id` holds the service
+    NAME ("Workspace"), not a real instance id -- root services are not
+    Instances (see shared/object_registry.ROOT_SERVICES), so this
+    deliberately does NOT touch name/enabled (services are never renamed
+    or disabled), only before/after_properties. Reuses _PropertyDeltaCommand's
+    float-tolerant is_noop() as-is; only send_forward()/send_inverse()
+    differ, calling apply_service_property_edit() (UPDATE_SERVICE_PROPERTY)
+    instead of apply_property_edit() (UPDATE_PROPERTY)."""
+
+    def send_forward(self, host: Any) -> Any:
+        host.apply_service_property_edit(self.instance_id, self.after_properties or {})
+        return _SingleIdTracker(self.instance_id, protocol.SERVICE_PROPERTY_UPDATED)
+
+    def send_inverse(self, host: Any) -> Any:
+        host.apply_service_property_edit(self.instance_id, self.before_properties or {})
+        return _SingleIdTracker(self.instance_id, protocol.SERVICE_PROPERTY_UPDATED)
+
+
 class PartTransformCommand(_PropertyDeltaCommand):
     """One complete gizmo Move or Rotate drag on a single Part."""
 

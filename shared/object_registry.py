@@ -248,6 +248,27 @@ def _register_defaults() -> None:
         inspector_sections=("container", "pivot"),
     ))
 
+    # Stage 3.8: singleton container -- allowed_parent_types restricts it
+    # to StarterPlayer alone; the "at most one" rule itself is enforced
+    # server-side (handle_create_part/handle_replace_world), same
+    # authority boundary every other creation rule already uses. LocalScript/
+    # ModuleScript children already execute/require correctly once parented
+    # here, since build_script_execution_plan() (lua_runtime.py) walks
+    # StarterPlayer's ENTIRE subtree, not just its direct children.
+    register_object_type(ObjectTypeDefinition(
+        type_id="StarterPlayerScripts",
+        display_name="StarterPlayerScripts",
+        category="Basic",
+        description="Container for LocalScripts/ModuleScripts that run for every player. At most one per Place.",
+        icon="folder",
+        default_parent="StarterPlayer",
+        allowed_parent_types=("StarterPlayer",),
+        keywords=("scripts", "client", "container"),
+        default_properties={},
+        is_container=True,
+        inspector_sections=("container",),
+    ))
+
     register_object_type(ObjectTypeDefinition(
         type_id="Folder",
         display_name="Folder",
@@ -286,7 +307,7 @@ def _register_defaults() -> None:
         description="Runs on the client. Lua execution is not implemented yet.",
         icon="script",
         default_parent="StarterPlayer",
-        allowed_parent_types=(*_CONTAINER_PARENTS, "StarterPlayer", "StarterGui", "ReplicatedStorage"),
+        allowed_parent_types=(*_CONTAINER_PARENTS, "StarterPlayer", "StarterPlayerScripts", "StarterGui", "ReplicatedStorage"),
         keywords=("lua", "client", "code"),
         default_properties={"Source": "-- LocalScript\n", "RunContext": "Client"},
         property_schema={
@@ -303,7 +324,7 @@ def _register_defaults() -> None:
         description="A reusable Lua module, required by other scripts.",
         icon="script",
         default_parent="ReplicatedStorage",
-        allowed_parent_types=(*_CONTAINER_PARENTS, "ServerScriptService", "ServerStorage", "ReplicatedStorage", "StarterPlayer"),
+        allowed_parent_types=(*_CONTAINER_PARENTS, "ServerScriptService", "ServerStorage", "ReplicatedStorage", "StarterPlayer", "StarterPlayerScripts"),
         keywords=("lua", "module", "require", "code"),
         default_properties={"Source": "-- ModuleScript\nlocal module = {}\n\nreturn module\n"},
         property_schema={"Source": PropertySpec("string", 20000)},

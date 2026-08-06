@@ -621,6 +621,13 @@ class LuaGameplayContext:
                 return False, "Character is no longer available"
             if mode not in CAMERA_MODES:
                 return False, f"'{mode}' is not a valid camera mode (expected \"FirstPerson\" or \"ThirdPerson\")"
+            # Stage 3.8: StarterPlayer.CameraMode == "LockFirstPerson" for
+            # this Play session blocks the ThirdPerson direction with a
+            # real, catchable Lua error (unlike the V-key path, which has
+            # no error-reporting channel and just silently no-ops via the
+            # same guard inside set_camera_mode() itself).
+            if mode == "ThirdPerson" and getattr(self.game, "_camera_mode_locked_first_person", False):
+                return False, "SetCameraMode('ThirdPerson') is not allowed while StarterPlayer.CameraMode is LockFirstPerson"
             self.game.set_camera_mode(mode == "ThirdPerson")
             return True, None
 

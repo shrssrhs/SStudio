@@ -530,6 +530,13 @@ class _ZoomStandIn:
         self.studio_playing = studio_playing
         self.third_person_enabled = third_person_enabled
         self.camera_apply_calls = 0
+        # Stage 3.8: _adjust_third_person_distance() now clamps against
+        # these session-local runtime limits (seeded from StarterPlayer at
+        # Play start) instead of the fixed THIRD_PERSON_MIN/MAX_DISTANCE
+        # module constants directly -- default to the same values so
+        # existing clamp-behavior tests below are unaffected.
+        self._runtime_min_zoom = cs.THIRD_PERSON_MIN_DISTANCE
+        self._runtime_max_zoom = cs.THIRD_PERSON_MAX_DISTANCE
 
     def _apply_third_person_camera(self) -> None:
         self.camera_apply_calls += 1
@@ -566,9 +573,23 @@ def test_third_person_zoom_noop_outside_play_or_first_person() -> None:
 
 def test_play_defaults_to_third_person_free_cursor_not_captured() -> None:
     source = inspect.getsource(cs.MultiplayerGame.set_studio_playing)
-    check("self.third_person_enabled = True" in source, "set_studio_playing(True) defaults every fresh Play session to third-person")
+    # Stage 3.8: third_person_enabled is now DERIVED from StarterPlayer.
+    # CameraMode rather than unconditionally True -- "Classic" (the
+    # descriptor default) still starts third-person, same observable
+    # behavior as the old hardcoded assignment.
+    check(
+        "self.third_person_enabled = not self._camera_mode_locked_first_person" in source,
+        "set_studio_playing(True) derives third_person_enabled from StarterPlayer.CameraMode (Classic -> third-person, the same default behavior as before this stage)",
+    )
     playing_branch = source.split("else:")[0]
-    check("self._start_mouse_look()" not in playing_branch, "set_studio_playing(True) no longer force-captures the pointer on Play start (Stage 3.6 and earlier did) -- the free cursor is the default now")
+    # _start_mouse_look() now DOES appear in the playing branch, but only
+    # ever inside the LockFirstPerson-gated block -- Classic (the default)
+    # must still never force-capture the pointer.
+    check(
+        "if self._camera_mode_locked_first_person:" in playing_branch
+        and "self._start_mouse_look()" in playing_branch.split("if self._camera_mode_locked_first_person:", 1)[1].split("self._start_lua()", 1)[0],
+        "set_studio_playing(True) only force-captures the pointer when StarterPlayer.CameraMode is LockFirstPerson -- Classic (the default) still starts with the free cursor",
+    )
 
 
 def test_stop_releases_capture_through_shared_idempotent_path() -> None:

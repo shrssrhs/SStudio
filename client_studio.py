@@ -53,6 +53,7 @@ from studio_editor_live import (
 )
 import character_controller
 import character_rig
+import datamodel_schema
 import editor_history
 import lua_gameplay_api
 import lua_runtime
@@ -1241,6 +1242,15 @@ class MultiplayerGame(Entity):
         # это то, что видит Explorer/Inspector через адаптер.
         self.parts: dict[str, Entity] = {}
         self.instances: dict[str, InstanceRecord] = {}
+        # Stage 3.8: persistent root-service properties (Workspace.Gravity,
+        # StarterPlayer.CharacterWalkSpeed, ...) -- keyed by service name,
+        # NOT part of self.instances (root services are not Instances, see
+        # shared/object_registry.ROOT_SERVICES). Seeded with schema
+        # defaults so Inspector/Lua/Play never see a missing key even
+        # before the first WORLD_SNAPSHOT arrives. Overwritten wholesale by
+        # load_world_snapshot() and merged into by SERVICE_PROPERTY_UPDATED
+        # -- see process_network_messages().
+        self.services: dict[str, dict[str, Any]] = datamodel_schema.sanitize_services_snapshot(None)
         self.selected_part_id: str | None = None
         self.selection_highlight: Entity | None = None
         self.studio_adapter: MultiplayerStudioAdapter | None = None
@@ -1263,6 +1273,19 @@ class MultiplayerGame(Entity):
         # wheel while RMB-look is available) -- see _adjust_third_person_distance().
         # THIRD_PERSON_DISTANCE remains the fixed reset-to default.
         self._third_person_distance = THIRD_PERSON_DISTANCE
+        # Stage 3.8: session-local zoom limits, seeded from the persistent
+        # StarterPlayer.CameraMin/MaxZoomDistance at Play start (see
+        # set_studio_playing()) -- _adjust_third_person_distance() clamps
+        # against THESE, not the fixed THIRD_PERSON_MIN/MAX_DISTANCE
+        # constants, which now exist only as a pre-connection/editor-time
+        # fallback (used here before the first Play ever runs).
+        self._runtime_min_zoom = THIRD_PERSON_MIN_DISTANCE
+        self._runtime_max_zoom = THIRD_PERSON_MAX_DISTANCE
+        # Stage 3.8: True while StarterPlayer.CameraMode == "LockFirstPerson"
+        # for the CURRENT Play session -- blocks V/SetCameraMode("ThirdPerson")
+        # for this session only (spec: does not persist, is not itself a
+        # persistent/serialized property). Always False outside Play.
+        self._camera_mode_locked_first_person = False
 
         # Заполняется embed_panda_window() при успешном встраивании
         # viewport'а в Qt. Пока None — используется штатный путь Ursina
@@ -1430,13 +1453,31 @@ class MultiplayerGame(Entity):
             # explicitly (RMB-hold in third-person, or switching to
             # first-person; see input()/set_camera_mode()). Reset any zoom
             # left over from a previous session to the fixed default.
-            self.third_person_enabled = True
-            self._third_person_distance = THIRD_PERSON_DISTANCE
+            #
+            # Stage 3.8: StarterPlayer.CameraMode selects the STARTING mode
+            # for this session -- "Classic" keeps the Stage 3.7 default
+            # above; "LockFirstPerson" starts captured in first-person
+            # instead and blocks toggling back out for the rest of this
+            # session (see toggle_third_person()/set_camera_mode() and
+            # lua_gameplay_api.character_set_camera_mode()). Zoom limits
+            # are re-seeded from the CURRENT persistent values every Play
+            # start, same reasoning as _starter_player_controller_kwargs().
+            starter_player = self.services.get("StarterPlayer", {})
+            self._runtime_min_zoom = float(starter_player.get("CameraMinZoomDistance", THIRD_PERSON_MIN_DISTANCE))
+            self._runtime_max_zoom = float(starter_player.get("CameraMaxZoomDistance", THIRD_PERSON_MAX_DISTANCE))
+            self._camera_mode_locked_first_person = starter_player.get("CameraMode") == "LockFirstPerson"
+            self.third_person_enabled = not self._camera_mode_locked_first_person
+            self._third_person_distance = max(self._runtime_min_zoom, min(self._runtime_max_zoom, THIRD_PERSON_DISTANCE))
             self.gizmo.set_target(None)
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = False
             self._start_physics()
             self._start_character()
+            if self._camera_mode_locked_first_person:
+                # LockFirstPerson starts captured immediately -- the same
+                # primitive RMB-hold/set_camera_mode() already use, just
+                # invoked once here at Play start instead of on a click.
+                self._start_mouse_look()
             self._start_lua()
             self.history.refresh_ui()
         else:
@@ -1504,7 +1545,16 @@ class MultiplayerGame(Entity):
 
         self._physics_snapshot = {}
         try:
-            self._physics_world = physics.PhysicsWorld()
+            # Stage 3.8: Workspace.Gravity is a positive MAGNITUDE (see
+            # datamodel_schema.py); PhysicsWorld/physics.GRAVITY_Y are
+            # signed (negative = downward, matching the existing Y-up
+            # world) -- negate here, the one place editor-magnitude and
+            # engine-signed-value meet. self.services is already a
+            # complete, schema-defaulted snapshot by the time Play can
+            # start (see load_world_snapshot()/__init__), so no extra
+            # default-handling is needed here.
+            gravity_magnitude = float(self.services.get("Workspace", {}).get("Gravity", 24.0))
+            self._physics_world = physics.PhysicsWorld(gravity=-gravity_magnitude)
             body_count = 0
             for instance_id, entity in self.parts.items():
                 record = self.instances.get(instance_id)
@@ -1599,6 +1649,79 @@ class MultiplayerGame(Entity):
             })
         return candidates
 
+    def apply_runtime_service_write(self, service_name: str, properties: dict[str, Any]) -> None:
+        """Stage 3.8: called from lua_runtime.RuntimeSceneLayer's service
+        property overlay for every runtime Lua write to a root service
+        (workspace.Gravity = X, StarterPlayer.CharacterWalkSpeed = X, ...)
+        -- `properties` is the FULL current overlay for service_name
+        (post-write), not just the single changed key, so derived values
+        (jump_speed from JumpHeight+Gravity) can always be recomputed
+        correctly regardless of write order. Applies REAL effects to the
+        CURRENT Play session only -- never touches self.services (the
+        persistent/serialized dict) or the network; discarded on Stop the
+        same way every other Lua runtime overlay already is."""
+        if service_name == "Workspace":
+            gravity_magnitude = float(properties.get("Gravity", 24.0))
+            if self._physics_world is not None:
+                self._physics_world.set_gravity(-gravity_magnitude)
+            if self._character_runtime is not None:
+                self._character_runtime.controller.gravity = gravity_magnitude
+            return
+
+        if service_name != "StarterPlayer":
+            return
+
+        gravity_magnitude = -self._physics_world.gravity if self._physics_world is not None else 24.0
+        if self._character_runtime is not None:
+            controller = self._character_runtime.controller
+            controller.walk_speed = float(properties.get("CharacterWalkSpeed", controller.walk_speed))
+            if bool(properties.get("CharacterUseJumpPower", True)):
+                controller.jump_speed = float(properties.get("CharacterJumpPower", controller.jump_speed))
+            else:
+                jump_height = float(properties.get("CharacterJumpHeight", 2.0))
+                controller.jump_speed = math.sqrt(2.0 * gravity_magnitude * jump_height) if gravity_magnitude > 0.0 else 0.0
+            # CharacterMaxSlopeAngle deliberately NOT applied here -- baked
+            # into the Bullet node at construction (see character_controller.
+            # CharacterController.__init__), takes effect on the NEXT
+            # character spawn only (documented limitation, same as the
+            # Inspector-edit path -- see _starter_player_controller_kwargs()).
+
+        self._runtime_min_zoom = float(properties.get("CameraMinZoomDistance", self._runtime_min_zoom))
+        self._runtime_max_zoom = float(properties.get("CameraMaxZoomDistance", self._runtime_max_zoom))
+        self._clamp_third_person_distance_to_runtime_limits()
+
+    def _starter_player_controller_kwargs(self) -> dict[str, float]:
+        """Stage 3.8: translates the persistent StarterPlayer/Workspace
+        service properties into character_controller.CharacterController's
+        constructor kwargs -- called once per _start_character(), so a
+        fresh character always starts from whatever is currently
+        persistent (Inspector-edited or otherwise), never a stale value
+        from a previous Play session. CharacterMaxSlopeAngle is baked into
+        the Bullet node at construction (see CharacterController.__init__)
+        and genuinely cannot be updated for an already-spawned character --
+        this method (and therefore a fresh Play) is the only place a
+        changed value ever takes effect, matching the spec's documented
+        "apply on next character creation" limitation."""
+        starter_player = self.services.get("StarterPlayer", {})
+        gravity_magnitude = float(self.services.get("Workspace", {}).get("Gravity", 24.0))
+        walk_speed = float(starter_player.get("CharacterWalkSpeed", character_controller.DEFAULT_WALK_SPEED))
+        use_jump_power = bool(starter_player.get("CharacterUseJumpPower", True))
+        if use_jump_power:
+            jump_speed = float(starter_player.get("CharacterJumpPower", character_controller.DEFAULT_JUMP_SPEED))
+        else:
+            # v = sqrt(2 * g * h) -- standard projectile-launch-velocity
+            # formula for reaching height h under gravity g. g=0 correctly
+            # gives v=0 (floats away at whatever moves it, never NaN/inf).
+            jump_height = float(starter_player.get("CharacterJumpHeight", 2.0))
+            jump_speed = math.sqrt(2.0 * gravity_magnitude * jump_height) if gravity_magnitude > 0.0 else 0.0
+        max_slope = float(starter_player.get("CharacterMaxSlopeAngle", character_controller.DEFAULT_MAX_SLOPE_DEGREES))
+        return {
+            "walk_speed": walk_speed,
+            "jump_speed": jump_speed,
+            "gravity": gravity_magnitude,
+            "max_slope_degrees": max_slope,
+        }
+
     def _start_character(self) -> None:
         """Creates the Play-session CharacterRuntime AND its visual rig --
         called AFTER _start_physics() (needs self._physics_world.
@@ -1633,6 +1756,7 @@ class MultiplayerGame(Entity):
                 self._physics_world.bullet_world,
                 spawn_position,
                 initial_yaw_degrees=self.player_yaw,
+                **self._starter_player_controller_kwargs(),
             )
             self._character_runtime = runtime
             print(f"[CHARACTER] spawned at {spawn_position}")
@@ -1674,6 +1798,11 @@ class MultiplayerGame(Entity):
         # editor's own camera state (restored separately by
         # set_studio_playing()) takes over.
         self.third_person_enabled = False
+        # Stage 3.8: LockFirstPerson is session-local (StarterPlayer's
+        # persistent value is untouched) -- always clear on Stop so a
+        # leftover lock never bleeds into the editor or into the next
+        # Play session before set_studio_playing() re-derives it fresh.
+        self._camera_mode_locked_first_person = False
         camera.parent = self.camera_pitch_pivot
         camera.position = Vec3(0, 0, 0)
         print("[CHARACTER] removed")
@@ -3390,6 +3519,29 @@ class MultiplayerGame(Entity):
         self.network.send(message)
         return True
 
+    def apply_service_property_edit(self, service_name: str, properties: dict[str, Any]) -> bool:
+        """Root-service counterpart to apply_property_edit() -- see
+        protocol.UPDATE_SERVICE_PROPERTY's docstring. Called only from
+        ServicePropertyEditCommand.send_forward()/send_inverse() (editor-
+        time, persistent, undoable edits) -- Lua runtime writes to
+        workspace.Gravity/StarterPlayer.* are a SEPARATE, purely local
+        overlay (see lua_runtime.RuntimeSceneLayer) that never calls this
+        and never reaches the network at all."""
+        if not self.network.connected_event.is_set():
+            if self.studio_adapter is not None:
+                self.studio_adapter.log("warning", "Нет подключения к серверу: изменение не отправлено.")
+            return False
+        self.network.send({
+            "type": protocol.UPDATE_SERVICE_PROPERTY, "id": service_name, "properties": properties,
+        })
+        return True
+
+    def export_services(self) -> dict[str, dict[str, Any]]:
+        """Save Place counterpart to export_world() -- current persistent
+        (editor-time) service properties, ready to hand straight to
+        place_manager.save()/save_as()."""
+        return {name: dict(props) for name, props in self.services.items()}
+
     def delete_instance(self, instance_id: str) -> bool:
         if not self.network.connected_event.is_set():
             return False
@@ -3397,23 +3549,36 @@ class MultiplayerGame(Entity):
         return True
 
     def request_replace_world(
-        self, objects: list[dict[str, Any]], on_result: Callable[[bool, str], None],
+        self,
+        objects: list[dict[str, Any]],
+        on_result: Callable[[bool, str], None],
+        services: dict[str, dict[str, Any]] | None = None,
     ) -> str:
         """Stage 3.2: Create Place from template / Open Place. One atomic
         REPLACE_WORLD request; on_result(success, message) fires once the
         matching REPLACE_WORLD_RESULT arrives (see process_network_
         messages) -- never called synchronously, since the request has not
-        even been sent yet when this method returns."""
+        even been sent yet when this method returns.
+
+        Stage 3.8: `services` rides along in the same request when given
+        (every current caller always provides it -- see place_manager.
+        PlaceOperationResult.services); omitted entirely (not an empty
+        dict) leaves the server's persistent service state untouched, see
+        server.handle_replace_world's own docstring for why that
+        distinction matters."""
         request_id = uuid.uuid4().hex
         if not self.network.connected_event.is_set():
             on_result(False, "Not connected to a server.")
             return request_id
         self._pending_replace_world[request_id] = on_result
-        self.network.send({
+        message: dict[str, Any] = {
             "type": protocol.REPLACE_WORLD,
             "request_id": request_id,
             "objects": objects,
-        })
+        }
+        if services is not None:
+            message["services"] = services
+        self.network.send(message)
         return request_id
 
     def request_set_parent(self, instance_id: str, parent_id: str) -> bool:
@@ -3642,18 +3807,33 @@ class MultiplayerGame(Entity):
             camera.position = Vec3(0, 0, 0)
 
     def _adjust_third_person_distance(self, delta: float) -> None:
-        """Stage 3.7: mouse-wheel zoom while in third-person Play. Clamped
-        to [THIRD_PERSON_MIN_DISTANCE, THIRD_PERSON_MAX_DISTANCE] and only
-        ever re-applies the camera transform (never touches capture state,
-        never modifies/serializes the editor Camera Instance -- this only
-        moves the runtime `camera` Entity, same as _apply_third_person_camera()
-        elsewhere)."""
+        """Stage 3.7/3.8: mouse-wheel zoom while in third-person Play.
+        Clamped to [self._runtime_min_zoom, self._runtime_max_zoom] --
+        session-local values seeded from the persistent StarterPlayer.
+        CameraMin/MaxZoomDistance at Play start (see set_studio_playing()),
+        NOT the fixed THIRD_PERSON_MIN/MAX_DISTANCE module constants
+        (Stage 3.7's original hardcoded 2-10 range, now only a fallback
+        default). Only ever re-applies the camera transform (never touches
+        capture state, never modifies/serializes the editor Camera
+        Instance -- this only moves the runtime `camera` Entity, same as
+        _apply_third_person_camera() elsewhere)."""
         self._third_person_distance = max(
-            THIRD_PERSON_MIN_DISTANCE,
-            min(THIRD_PERSON_MAX_DISTANCE, self._third_person_distance + delta),
+            self._runtime_min_zoom,
+            min(self._runtime_max_zoom, self._third_person_distance + delta),
         )
         if self.studio_playing and self.third_person_enabled:
             self._apply_third_person_camera()
+
+    def _clamp_third_person_distance_to_runtime_limits(self) -> None:
+        """Stage 3.8: called whenever self._runtime_min_zoom/max_zoom
+        change mid-session (a runtime Lua write to StarterPlayer.CameraMin/
+        MaxZoomDistance) -- spec: "current camera distance is clamped
+        immediately if a runtime change makes it invalid"."""
+        clamped = max(self._runtime_min_zoom, min(self._runtime_max_zoom, self._third_person_distance))
+        if clamped != self._third_person_distance:
+            self._third_person_distance = clamped
+            if self.studio_playing and self.third_person_enabled:
+                self._apply_third_person_camera()
 
     def _set_play_capture(self, captured: bool) -> None:
         """Stage 3.7: shared capture-transition helper for set_camera_mode()
@@ -3685,8 +3865,19 @@ class MultiplayerGame(Entity):
         switching to first-person immediately ACQUIRES it (permanent
         capture is mandatory there). This runs for both the rig branch and
         the legacy-avatar branch below, and is a no-op outside of Play (see
-        _set_play_capture())."""
+        _set_play_capture()).
+
+        Stage 3.8: while StarterPlayer.CameraMode == "LockFirstPerson" for
+        this Play session, switching TO third-person is silently refused
+        (V has no error-reporting channel) -- switching to first-person is
+        always allowed regardless (it's a no-op if already there). The Lua
+        Character:SetCameraMode("ThirdPerson") API call checks this same
+        flag itself, BEFORE calling here, so it can raise a proper Lua
+        error instead of silently doing nothing (see
+        lua_gameplay_api.character_set_camera_mode())."""
         third_person = bool(third_person)
+        if third_person and self._camera_mode_locked_first_person:
+            return
         if self._character_visual is not None:
             self.third_person_enabled = third_person
             self._character_visual.set_first_person(not third_person)
@@ -3824,8 +4015,9 @@ class MultiplayerGame(Entity):
                     self.studio_adapter.log("error", error)
             elif message_type == protocol.WORLD_SNAPSHOT:
                 parts = message.get("parts", [])
+                raw_services = message.get("services")
                 if isinstance(parts, list):
-                    self.load_world_snapshot(parts)
+                    self.load_world_snapshot(parts, raw_services if isinstance(raw_services, dict) else None)
             elif message_type == protocol.PART_CREATED:
                 part_data = message.get("part", {})
                 if isinstance(part_data, dict):
@@ -3854,6 +4046,14 @@ class MultiplayerGame(Entity):
                 self.apply_model_transformed(message)
             elif message_type == protocol.TRANSFORM_MODEL_REJECTED:
                 self.apply_model_transform_rejected(message)
+            elif message_type == protocol.SERVICE_PROPERTY_UPDATED:
+                service_name = str(message.get("id", ""))
+                raw_properties = message.get("properties")
+                if service_name and isinstance(raw_properties, dict):
+                    self.services.setdefault(service_name, datamodel_schema.default_properties(service_name))
+                    self.services[service_name].update(raw_properties)
+                    if self.studio_adapter is not None:
+                        self.studio_adapter.on_service_property_updated(service_name, raw_properties)
             elif message_type == protocol.REPLACE_WORLD_RESULT:
                 request_id = str(message.get("request_id", ""))
                 callback = self._pending_replace_world.pop(request_id, None)
@@ -4013,7 +4213,7 @@ class MultiplayerGame(Entity):
                 self._model_drag_awaiting_final = None
                 self._model_drag_suppressed_ids = set()
 
-    def load_world_snapshot(self, parts: list[dict[str, Any]]) -> None:
+    def load_world_snapshot(self, parts: list[dict[str, Any]], raw_services: dict[str, Any] | None = None) -> None:
         # Stage 3.2: spawn_instance()/remove_instance() below call
         # on_instance_created/updated/deleted per object, which would
         # otherwise mark a just-created/just-opened Place dirty from its
@@ -4028,6 +4228,12 @@ class MultiplayerGame(Entity):
             for part_data in parts:
                 if isinstance(part_data, dict):
                     self.spawn_instance(part_data)
+            # Stage 3.8: a full snapshot's "services" (present on every
+            # WORLD_SNAPSHOT the current server sends -- initial connect
+            # AND REPLACE_WORLD's broadcast) always REPLACES the whole
+            # dict wholesale, same as parts above -- this is a brand-new
+            # authoritative world, not a merge.
+            self.services = datamodel_schema.sanitize_services_snapshot(raw_services)
         finally:
             if self.studio_adapter is not None:
                 self.studio_adapter.end_snapshot_reload()
@@ -4433,9 +4639,12 @@ class MultiplayerStudioAdapter:
             self.place_manager.mark_authoritative_edit()
 
     def replace_world(
-        self, objects: list[dict[str, Any]], on_result: Callable[[bool, str], None],
+        self,
+        objects: list[dict[str, Any]],
+        on_result: Callable[[bool, str], None],
+        services: dict[str, dict[str, Any]] | None = None,
     ) -> bool:
-        self.game.request_replace_world(objects, on_result)
+        self.game.request_replace_world(objects, on_result, services)
         return True
 
     def export_world(self) -> list[dict[str, Any]]:
@@ -4460,6 +4669,18 @@ class MultiplayerStudioAdapter:
             }
             for record in self.game.instances.values()
         ]
+
+    def export_services(self) -> dict[str, dict[str, Any]]:
+        return self.game.export_services()
+
+    def on_service_property_updated(self, service_name: str, properties: dict[str, Any]) -> None:
+        """Called from MultiplayerGame.process_network_messages() on every
+        SERVICE_PROPERTY_UPDATED broadcast (including echoes of this
+        client's own edits) -- forwards to the bridge so Inspector/
+        Explorer stay in sync, mirroring update_instance()'s equivalent
+        role for ordinary Instances."""
+        if self.bridge is not None:
+            self.bridge.sync_service_property(service_name, properties)
 
     def attach_bridge(self, bridge: EngineBridge) -> None:
         self.bridge = bridge
@@ -4696,6 +4917,7 @@ class MultiplayerStudioAdapter:
         objects = self._system_objects()
         objects.extend(self.instance_to_scene_object(record) for record in self.game.instances.values())
         self.bridge.sync_scene(objects)
+        self.bridge.sync_services(self.game.services)
 
     def on_instance_created(self, record: "InstanceRecord") -> None:
         if self.bridge is None:
@@ -4792,6 +5014,28 @@ class MultiplayerStudioAdapter:
         # player happens to be facing when Redo is pressed.
         command = editor_history.CreateObjectCommand(
             f"Create {definition.display_name}", object_type, None, resolved_parent, unique_name,
+        )
+        accepted = self.game.history.perform(command, optimistic=False)
+        if accepted:
+            self.pending_create_count += 1
+        return accepted
+
+    def create_starter_character(self) -> bool:
+        """Stage 3.8: creates a Model named EXACTLY "StarterCharacter"
+        under StarterPlayer -- the special-role predicate every
+        authoritative check uses is datamodel_schema.is_starter_character(),
+        never a dedicated ClassName (spec: "StarterCharacter is not a root
+        service and should not be introduced as a fake service class").
+        This client-side pre-check is UX only (an immediate, no-round-trip
+        warning for the common case) -- server.py's _singleton_conflict()
+        remains the actual authority and would silently reject a duplicate
+        even if this check somehow passed a stale local scene."""
+        for record in self.game.instances.values():
+            if datamodel_schema.is_starter_character(record.class_name, record.name, record.parent_id or "Workspace"):
+                self.log("warning", "A StarterCharacter already exists under StarterPlayer.")
+                return False
+        command = editor_history.CreateObjectCommand(
+            "Insert StarterCharacter", "Model", None, "StarterPlayer", datamodel_schema.STARTER_CHARACTER_NAME,
         )
         accepted = self.game.history.perform(command, optimistic=False)
         if accepted:
@@ -4947,6 +5191,25 @@ class MultiplayerStudioAdapter:
             after_name=name,
             before_enabled=record.enabled if enabled is not None else None,
             after_enabled=enabled,
+        )
+        return self.game.history.perform(command, optimistic=True)
+
+    def set_service_property(self, service_name: str, property_path: str, value: Any) -> bool:
+        """Root-service counterpart to set_property() above -- see
+        editor_history.ServicePropertyEditCommand's docstring. Only ever
+        called for "properties.X" paths (EngineBridge.set_property()
+        already validated X through datamodel_schema before reaching
+        here); `record` here is self.game.services[service_name] (the
+        server-confirmed persistent value), not an InstanceRecord."""
+        if not property_path.startswith("properties."):
+            return False
+        key = property_path.split(".", 1)[1]
+        before = self.game.services.get(service_name, {})
+        command = editor_history.ServicePropertyEditCommand(
+            service_name,
+            f"Edit {service_name}.{key}",
+            before_properties={key: before.get(key)},
+            after_properties={key: value},
         )
         return self.game.history.perform(command, optimistic=True)
 

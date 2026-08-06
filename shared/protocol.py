@@ -56,3 +56,16 @@ TRANSFORM_MODEL_REJECTED = "transform_model_rejected"  # сервер -> тол�
 # текущее состояние.
 REPLACE_WORLD = "replace_world"                       # клиент -> сервер
 REPLACE_WORLD_RESULT = "replace_world_result"         # сервер -> только запросившему клиенту
+
+# Stage 3.8: root-service persistent property edits (Workspace.Gravity,
+# StarterPlayer.CharacterWalkSpeed, ...). Root services are not Instances
+# (see shared/object_registry.ROOT_SERVICES) so they cannot go through
+# UPDATE_PROPERTY/PART_UPDATED, which are keyed by instance id and looked
+# up in the server's `world` dict -- this is the same request/broadcast
+# shape as that pair, just keyed by service name against the server's
+# separate `services` dict. No reject path (same reasoning as
+# UPDATE_PROPERTY -- see editor_history.py's module docstring): the
+# server sanitizes via datamodel_schema and always echoes back whatever
+# it actually stored.
+UPDATE_SERVICE_PROPERTY = "update_service_property"           # клиент -> сервер
+SERVICE_PROPERTY_UPDATED = "service_property_updated"         # сервер -> все клиенты
