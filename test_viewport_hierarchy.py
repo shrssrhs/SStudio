@@ -485,6 +485,29 @@ def test_invalid_gravity_edit_preserves_old_value_and_no_dirty() -> None:
     check(not win.bridge.is_dirty, "an invalid Gravity edit never marks the Place dirty")
 
 
+def test_starter_player_zoom_ordering_rejected_via_inspector() -> None:
+    """Stage 3.8 follow-up: CameraMinZoomDistance/CameraMaxZoomDistance
+    must stay ordered -- an immediate Inspector-side pre-check (UX only;
+    server._apply_zoom_ordering_guard is the actual authority, see
+    test_place_manager.py's test_server_zoom_ordering_guard_rejects_inverted_pair,
+    and the Lua runtime write path has its own equivalent check too, see
+    test_lua_gameplay_api.py's test_runtime_zoom_limit_write_forwards_full_overlay)."""
+    bridge = make_bridge()
+    win = m.StudioMainWindow(bridge)
+    win.bridge.select("StarterPlayer")
+    check(not win.bridge.is_dirty, "precondition: bridge starts clean")
+    before_min = win.bridge.get_object("StarterPlayer").properties.get("CameraMinZoomDistance")
+    win.bridge.set_property("StarterPlayer", "properties.CameraMinZoomDistance", 999.0)
+    after_min = win.bridge.get_object("StarterPlayer").properties.get("CameraMinZoomDistance")
+    check(after_min == before_min, f"setting CameraMinZoomDistance above the current CameraMaxZoomDistance is rejected, old value ({before_min}) preserved, got {after_min}")
+    check(not win.bridge.is_dirty, "the rejected zoom-ordering edit never marks the Place dirty")
+
+    win.bridge.set_property("StarterPlayer", "properties.CameraMinZoomDistance", 3.0)
+    win.bridge.set_property("StarterPlayer", "properties.CameraMaxZoomDistance", 15.0)
+    obj = win.bridge.get_object("StarterPlayer")
+    check(obj.properties.get("CameraMinZoomDistance") == 3.0 and obj.properties.get("CameraMaxZoomDistance") == 15.0, "a valid ordered pair, applied one edit at a time, is accepted")
+
+
 def test_selection_switching_does_not_duplicate_inspector_rows() -> None:
     bridge = make_bridge()
     win = m.StudioMainWindow(bridge)
@@ -536,6 +559,7 @@ if __name__ == "__main__":
     test_selecting_common_services_no_blank_inspector()
     test_service_class_name_and_parent_are_read_only()
     test_invalid_gravity_edit_preserves_old_value_and_no_dirty()
+    test_starter_player_zoom_ordering_rejected_via_inspector()
     test_selection_switching_does_not_duplicate_inspector_rows()
     test_part_and_script_inspector_unaffected_by_service_rendering()
 

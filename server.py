@@ -460,14 +460,43 @@ async def handle_update_service_property(
         return
 
     async with state_lock:
-        services.setdefault(service_name, datamodel_schema.default_properties(service_name))
-        services[service_name].update(clean_properties)
+        current = services.setdefault(service_name, datamodel_schema.default_properties(service_name))
+        clean_properties = _apply_zoom_ordering_guard(current, clean_properties)
+        if not clean_properties:
+            return
+        current.update(clean_properties)
 
     await broadcast_to_all({
         "type": protocol.SERVICE_PROPERTY_UPDATED,
         "id": service_name,
         "properties": clean_properties,
     })
+
+
+def _apply_zoom_ordering_guard(current: dict[str, Any], clean_properties: dict[str, Any]) -> dict[str, Any]:
+    """Stage 3.8 fix: CameraMinZoomDistance/CameraMaxZoomDistance are each
+    individually valid floats by the time this runs (sanitize_persistent_
+    properties already checked that), but the pair must also stay ORDERED
+    -- datamodel_schema.validate_starter_player_zoom() is the one shared
+    cross-field rule for that; it was defined but never actually called
+    from any write path. Resolves the effective pair (this update's new
+    value if present, else whatever is currently persisted in `current`)
+    and drops BOTH zoom keys from the update if the resulting pair would
+    be invalid -- same "malformed input is dropped, never fatal" contract
+    as every other property here. Pure/sync so it's directly unit-testable
+    like every other server-side validation helper (_singleton_conflict,
+    _hierarchy_is_valid, ...)."""
+    if "CameraMinZoomDistance" not in clean_properties and "CameraMaxZoomDistance" not in clean_properties:
+        return clean_properties
+    effective_min = clean_properties.get("CameraMinZoomDistance", current.get("CameraMinZoomDistance", 2.0))
+    effective_max = clean_properties.get("CameraMaxZoomDistance", current.get("CameraMaxZoomDistance", 10.0))
+    zoom_result = datamodel_schema.validate_starter_player_zoom(effective_min, effective_max)
+    if zoom_result.ok:
+        return clean_properties
+    clean_properties = dict(clean_properties)
+    clean_properties.pop("CameraMinZoomDistance", None)
+    clean_properties.pop("CameraMaxZoomDistance", None)
+    return clean_properties
 
 
 async def handle_delete_part(

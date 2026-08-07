@@ -639,6 +639,111 @@ def test_first_person_switch_acquires_capture_third_person_releases() -> None:
     check("self.release_play_input_capture()" in source, "_set_play_capture(captured=False) (switching to third-person mid-Play) always releases capture -- RMB-hold is the only way back in")
 
 
+def test_set_camera_mode_blocks_v_key_when_locked_first_person() -> None:
+    """Stage 3.8 follow-up: StarterPlayer.CameraMode == "LockFirstPerson"
+    must block BOTH the V-key path (set_camera_mode, no error channel --
+    silent no-op) AND the Lua Character:SetCameraMode("ThirdPerson") path
+    (lua_gameplay_api.character_set_camera_mode, a catchable error) --
+    see test_lua_gameplay_api.py for the Lua half."""
+    source = inspect.getsource(cs.MultiplayerGame.set_camera_mode)
+    guard_line = source.split("third_person = bool(third_person)", 1)[1].split("\n")[1]
+    check(
+        "if third_person and self._camera_mode_locked_first_person:" in guard_line
+        and "return" in source.split(guard_line, 1)[1].split("\n")[1],
+        "set_camera_mode() refuses to switch to third-person while _camera_mode_locked_first_person is set, before touching the rig or legacy-avatar branches",
+    )
+
+
+def test_runtime_zoom_limits_used_not_hardcoded_constants() -> None:
+    """Stage 3.8: wheel zoom must clamp to the session-local runtime limits
+    seeded from StarterPlayer.CameraMin/MaxZoomDistance, not the fixed
+    THIRD_PERSON_MIN/MAX_DISTANCE module constants -- use limits clearly
+    different from the module defaults to prove it's not coincidence."""
+    custom_min, custom_max = 25.0, 40.0
+    check(custom_min != cs.THIRD_PERSON_MIN_DISTANCE and custom_max != cs.THIRD_PERSON_MAX_DISTANCE, "test setup: custom limits genuinely differ from the module constants")
+    standin = _ZoomStandIn(30.0, studio_playing=True, third_person_enabled=True)
+    standin._runtime_min_zoom = custom_min
+    standin._runtime_max_zoom = custom_max
+    standin._adjust_third_person_distance(-999.0)
+    check(standin._third_person_distance == custom_min, "zooming in past the custom minimum clamps to the runtime limit, not THIRD_PERSON_MIN_DISTANCE")
+    standin._adjust_third_person_distance(999.0)
+    check(standin._third_person_distance == custom_max, "zooming out past the custom maximum clamps to the runtime limit, not THIRD_PERSON_MAX_DISTANCE")
+
+
+def test_clamp_third_person_distance_to_runtime_limits_reclamps_on_change() -> None:
+    """Stage 3.8: a runtime Lua write that shrinks CameraMax/MinZoomDistance
+    mid-session must immediately reclamp the CURRENT camera distance, not
+    just future zoom deltas -- see client_studio.py's
+    _clamp_third_person_distance_to_runtime_limits(), called from
+    MultiplayerGame.apply_runtime_service_write()."""
+    standin = _ZoomStandIn(30.0, studio_playing=True, third_person_enabled=True)
+    standin._clamp_third_person_distance_to_runtime_limits = (
+        cs.MultiplayerGame._clamp_third_person_distance_to_runtime_limits.__get__(standin)
+    )
+    standin._runtime_min_zoom = 5.0
+    standin._runtime_max_zoom = 10.0
+    standin._clamp_third_person_distance_to_runtime_limits()
+    check(standin._third_person_distance == 10.0, "shrinking the runtime max below the current distance immediately reclamps it down")
+    check(standin.camera_apply_calls == 1, "the reclamp re-applies the camera transform exactly once")
+
+    standin2 = _ZoomStandIn(7.0, studio_playing=True, third_person_enabled=True)
+    standin2._clamp_third_person_distance_to_runtime_limits = (
+        cs.MultiplayerGame._clamp_third_person_distance_to_runtime_limits.__get__(standin2)
+    )
+    standin2._runtime_min_zoom = 5.0
+    standin2._runtime_max_zoom = 10.0
+    standin2._clamp_third_person_distance_to_runtime_limits()
+    check(standin2._third_person_distance == 7.0, "a distance already inside the (possibly new) limits is left untouched")
+    check(standin2.camera_apply_calls == 0, "no camera re-apply when nothing actually changed")
+
+
+class _ControllerKwargsStandIn:
+    """Duck-typed stand-in for _starter_player_controller_kwargs()'s `self`
+    -- only reads self.services, exactly like the real method."""
+
+    _starter_player_controller_kwargs = cs.MultiplayerGame._starter_player_controller_kwargs
+
+    def __init__(self, services: dict) -> None:
+        self.services = services
+
+
+def test_jump_height_mode_computes_launch_velocity_from_gravity() -> None:
+    standin = _ControllerKwargsStandIn({
+        "Workspace": {"Gravity": 24.0},
+        "StarterPlayer": {"CharacterUseJumpPower": False, "CharacterJumpHeight": 4.0},
+    })
+    kwargs = standin._starter_player_controller_kwargs()
+    expected = (2.0 * 24.0 * 4.0) ** 0.5
+    check(abs(kwargs["jump_speed"] - expected) < 1e-9, "CharacterUseJumpPower=False computes launch velocity as sqrt(2 * gravity * jump_height)")
+
+    standin2 = _ControllerKwargsStandIn({
+        "Workspace": {"Gravity": 24.0},
+        "StarterPlayer": {"CharacterUseJumpPower": False, "CharacterJumpHeight": 9.0},
+    })
+    kwargs2 = standin2._starter_player_controller_kwargs()
+    check(kwargs2["jump_speed"] > kwargs["jump_speed"], "a taller CharacterJumpHeight produces a visibly larger launch velocity")
+
+
+def test_jump_height_mode_zero_gravity_no_nan_or_crash() -> None:
+    """Stage 3.8 spec: "zero gravity handled safely with no NaN/div-by-zero"."""
+    standin = _ControllerKwargsStandIn({
+        "Workspace": {"Gravity": 0.0},
+        "StarterPlayer": {"CharacterUseJumpPower": False, "CharacterJumpHeight": 5.0},
+    })
+    kwargs = standin._starter_player_controller_kwargs()
+    check(kwargs["jump_speed"] == 0.0, "zero gravity in jump-height mode yields jump_speed == 0.0, not NaN/inf/an exception")
+    check(kwargs["gravity"] == 0.0, "the gravity magnitude itself is passed through unchanged")
+
+
+def test_jump_power_mode_uses_configured_value_directly() -> None:
+    standin = _ControllerKwargsStandIn({
+        "Workspace": {"Gravity": 24.0},
+        "StarterPlayer": {"CharacterUseJumpPower": True, "CharacterJumpPower": 12.5},
+    })
+    kwargs = standin._starter_player_controller_kwargs()
+    check(kwargs["jump_speed"] == 12.5, "CharacterUseJumpPower=True uses CharacterJumpPower as the launch velocity directly, ignoring gravity")
+
+
 if __name__ == "__main__":
     test_movement_axes()
     test_diagonal_movement_not_faster_than_straight()
@@ -687,6 +792,12 @@ if __name__ == "__main__":
     test_set_camera_mode_transitions_capture_during_play()
     test_set_play_capture_is_a_play_only_noop_outside_play()
     test_first_person_switch_acquires_capture_third_person_releases()
+    test_set_camera_mode_blocks_v_key_when_locked_first_person()
+    test_runtime_zoom_limits_used_not_hardcoded_constants()
+    test_clamp_third_person_distance_to_runtime_limits_reclamps_on_change()
+    test_jump_height_mode_computes_launch_velocity_from_gravity()
+    test_jump_height_mode_zero_gravity_no_nan_or_crash()
+    test_jump_power_mode_uses_configured_value_directly()
 
     print()
     if FAILURES:

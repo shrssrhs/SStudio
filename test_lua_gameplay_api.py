@@ -18,6 +18,7 @@ character_controller.CharacterRuntime and character_rig.CharacterVisualRig
 underneath -- Stage 3.5's whole point is exposing those two real,
 already-accepted systems to Lua, so faking them out would test nothing.
 """
+import inspect
 import os
 import sys
 
@@ -1164,6 +1165,116 @@ def test_second_play_creates_fresh_execution_plan_and_old_callbacks_are_silent()
         game.teardown()
 
 
+def test_localscript_under_starterplayerscripts_container_runs() -> None:
+    """Stage 3.8 follow-up: a LocalScript nested INSIDE the real
+    StarterPlayerScripts container (not directly under StarterPlayer) must
+    still be discovered and run exactly once -- see lua_runtime.py's
+    updated _EXECUTION_ROOTS comment for why the BFS walk already covers
+    this without any StarterPlayerScripts-specific code."""
+    game = _FakeGame()
+    game.instances["container1"] = cs.InstanceRecord("container1", "StarterPlayerScripts", "StarterPlayerScripts", "StarterPlayer", {})
+    add_script(game, "print('under-container-ran')", class_name="LocalScript", script_id="s1", parent_id="container1")
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(any("under-container-ran" in m for m in messages), "a LocalScript parented under the StarterPlayerScripts container instance is auto-discovered and runs")
+        errors = [d for d in manager.diagnostics if d.severity == "error"]
+        check(errors == [], f"no errors starting a LocalScript nested under StarterPlayerScripts: {[e.message for e in errors]}")
+        entries = [(e.instance_id, e.root_service) for e in manager._execution_plan]
+        check(("s1", "StarterPlayer") in entries, "the execution plan records this script's root as StarterPlayer, same as one parented directly under StarterPlayer")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_modulescript_required_from_starterplayerscripts_container() -> None:
+    """A ModuleScript nested under StarterPlayerScripts (alongside a
+    LocalScript sibling that requires it) must never auto-run on its own
+    but must be require()-able, exactly like a ReplicatedStorage one."""
+    game = _FakeGame()
+    game.instances["container1"] = cs.InstanceRecord("container1", "StarterPlayerScripts", "StarterPlayerScripts", "StarterPlayer", {})
+    game.instances["mod1"] = cs.InstanceRecord("mod1", "ModuleScript", "Helper", "container1", {"Source": "return 'from-helper'"})
+    source = (
+        "local sps = script.Parent\n"
+        "local mod = sps:FindFirstChild('Helper')\n"
+        "local value = require(mod)\n"
+        "print('required', value)\n"
+    )
+    add_script(game, source, class_name="LocalScript", script_id="s1", parent_id="container1")
+    manager, ctx = make_context(game)
+    try:
+        run_frame(manager, ctx)
+        errors = [d for d in manager.diagnostics if d.severity == "error"]
+        check(errors == [], f"require() of a ModuleScript sibling inside StarterPlayerScripts works with no errors: {[e.message for e in errors]}")
+        messages = [d.message for d in manager.diagnostics]
+        check(any("required\tfrom-helper" in m for m in messages), f"the ModuleScript's return value comes back correctly: {messages}")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_starter_player_lock_first_person_blocks_lua_third_person() -> None:
+    """Stage 3.8 follow-up: while StarterPlayer.CameraMode is
+    LockFirstPerson for the session, Character:SetCameraMode("ThirdPerson")
+    must produce a readable, attributed, catchable Lua error -- see
+    test_character_controller.py's
+    test_set_camera_mode_blocks_v_key_when_locked_first_person for the V-key
+    half of this same rule."""
+    game = _FakeGame()
+    game._camera_mode_locked_first_person = True
+    manager, ctx = make_context(game)
+    try:
+        source = (
+            "local character = game:GetService('Players').LocalPlayer.Character\n"
+            "local ok, err = pcall(function() character:SetCameraMode('ThirdPerson') end)\n"
+            "print('lock-blocked', ok, err)\n"
+        )
+        add_script(game, source, script_id="s1")
+        manager._start_script("s1")
+        run_frame(manager, ctx)
+        check(game.third_person_enabled is False, "the blocked SetCameraMode('ThirdPerson') call never actually flips third_person_enabled")
+        messages = [d.message for d in manager.diagnostics]
+        check(any("lock-blocked\tfalse" in m and "LockFirstPerson" in m for m in messages), f"a readable, attributed error names LockFirstPerson as the reason the switch was refused: {messages}")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_runtime_zoom_limit_write_forwards_full_overlay() -> None:
+    """Stage 3.8 follow-up: a runtime Lua write to StarterPlayer.CameraMin/
+    MaxZoomDistance must validate (min <= max, per validate_starter_player_zoom)
+    and reach apply_runtime_service_write() with the full current overlay --
+    that hook is what client_studio.py's real MultiplayerGame uses to update
+    self._runtime_min_zoom/_max_zoom and immediately reclamp the current
+    camera distance (see test_character_controller.py's
+    test_clamp_third_person_distance_to_runtime_limits_reclamps_on_change,
+    which exercises that clamp itself against a real MultiplayerGame
+    method)."""
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        source = (
+            "local sp = game:GetService('StarterPlayer')\n"
+            "sp.CameraMinZoomDistance = 3\n"
+            "sp.CameraMaxZoomDistance = 15\n"
+            "print(sp.CameraMinZoomDistance, sp.CameraMaxZoomDistance)\n"
+        )
+        add_script(game, source, script_id="s1")
+        manager._start_script("s1")
+        run_frame(manager, ctx)
+        messages = [d.message for d in manager.diagnostics]
+        check(any("3.0\t15.0" in m for m in messages), f"both zoom-limit reads reflect the runtime writes: {messages}")
+        writes = [props for name, props in game.applied_service_writes if name == "StarterPlayer"]
+        check(any(p.get("CameraMinZoomDistance") == 3.0 and p.get("CameraMaxZoomDistance") == 15.0 for p in writes), f"the final overlay forwarded to apply_runtime_service_write() carries both updated zoom limits together: {writes}")
+
+        source2 = "local ok, err = pcall(function() game:GetService('StarterPlayer').CameraMinZoomDistance = 999 end)\nprint('bad-min', ok, err)"
+        add_script(game, source2, script_id="s2")
+        manager._start_script("s2")
+        run_frame(manager, ctx)
+        messages2 = [d.message for d in manager.diagnostics]
+        check(any("bad-min\tfalse" in m for m in messages2), f"setting CameraMinZoomDistance above the current CameraMaxZoomDistance is rejected: {messages2}")
+    finally:
+        teardown(game, manager, ctx)
+
+
 def test_build_script_execution_plan_never_touches_history_or_dirty_state() -> None:
     """Structural check, same technique as
     test_character_appearance_never_dirties_or_serializes: script
@@ -1349,6 +1460,73 @@ def test_stale_service_overlay_after_stop() -> None:
 
 
 # ============================================================
+# Stage 3.8 follow-up: client-visible duplicate StarterPlayerScripts
+# warning (matching the quality of create_starter_character()'s own
+# pre-check) -- MultiplayerStudioAdapter.create_part() is the generic
+# Insert Object path StarterPlayerScripts goes through (unlike
+# StarterCharacter, which has its own dedicated method).
+# ============================================================
+
+class _CreatePartStandIn:
+    """Duck-typed stand-in for MultiplayerStudioAdapter.create_part()'s
+    `self` -- only exercises the REJECTED (duplicate) branch, which reads
+    self.game.instances and calls self.log() and returns before touching
+    self._unique_sibling_name/self.game.history/self.pending_create_count
+    at all -- see the "no history command, no dirty" assertions below,
+    which rely on this stand-in NOT providing those attributes (an
+    AttributeError would mean the rejection path fell through further
+    than it should)."""
+
+    create_part = cs.MultiplayerStudioAdapter.create_part
+
+    def __init__(self, instances: dict) -> None:
+        self.game = _SimpleGame(instances)
+        self.log_calls: list[tuple[str, str]] = []
+
+    def log(self, level: str, message: str) -> None:
+        self.log_calls.append((level, message))
+
+
+class _SimpleGame:
+    def __init__(self, instances: dict) -> None:
+        self.instances = instances
+
+
+def test_duplicate_starterplayerscripts_shows_client_warning_and_no_history() -> None:
+    existing = {
+        "sps1": cs.InstanceRecord("sps1", "StarterPlayerScripts", "StarterPlayerScripts", "StarterPlayer", {}),
+    }
+    standin = _CreatePartStandIn(existing)
+    result = standin.create_part("StarterPlayerScripts")
+    check(result is False, "attempting to insert a second StarterPlayerScripts is rejected client-side")
+    check(len(standin.log_calls) == 1 and standin.log_calls[0][0] == "warning", f"exactly one warning-level log call, matching the quality of create_starter_character()'s duplicate warning: {standin.log_calls}")
+    check("Only one StarterPlayerScripts" in standin.log_calls[0][1], f"the warning names the actual rule that was violated: {standin.log_calls}")
+
+
+def test_first_starterplayerscripts_is_not_blocked_by_the_warning_check() -> None:
+    """The duplicate-warning pre-check itself must not misfire on the
+    first (legitimate) StarterPlayerScripts -- checked structurally (the
+    guard clause returns False only from inside its own `if` block, never
+    unconditionally) since a real create requires the full CreateObjectCommand/
+    editor_history/bridge machinery this stand-in deliberately doesn't provide."""
+    source = inspect.getsource(cs.MultiplayerStudioAdapter.create_part)
+    guard = source.split('if object_type == "StarterPlayerScripts":', 1)[1].split("resolved_parent = parent_id", 1)[0]
+    check("for record in self.game.instances.values():" in guard, "the duplicate check iterates existing instances")
+    check(guard.count("return False") == 1, "the duplicate check's own return False is scoped inside the loop/if -- it can never fire when no StarterPlayerScripts already exists")
+
+
+def test_duplicate_starterplayerscripts_rejection_happens_before_any_command_construction() -> None:
+    """Spec: "rejected insertion must create no history command and must
+    not dirty the Place" -- structural proof that the duplicate check runs
+    and returns BEFORE editor_history.CreateObjectCommand is ever
+    constructed, complementing the behavioral no-history-mutation proof
+    above (the stand-in has no .history attribute at all, so reaching that
+    line would raise AttributeError, not silently succeed)."""
+    source = inspect.getsource(cs.MultiplayerStudioAdapter.create_part)
+    check(source.index('if object_type == "StarterPlayerScripts":') < source.index("CreateObjectCommand"), "the StarterPlayerScripts duplicate check appears (and therefore can return) before CreateObjectCommand is ever constructed")
+
+
+# ============================================================
 # run everything
 # ============================================================
 
@@ -1406,6 +1584,8 @@ test_modulescript_required_from_replicatedstorage_via_getservice()
 test_modulescript_cache_is_once_per_session()
 test_diagnostics_preserve_correct_id_and_line_for_starterplayer_script()
 test_second_play_creates_fresh_execution_plan_and_old_callbacks_are_silent()
+test_localscript_under_starterplayerscripts_container_runs()
+test_modulescript_required_from_starterplayerscripts_container()
 test_build_script_execution_plan_never_touches_history_or_dirty_state()
 
 test_workspace_gravity_read_default()
@@ -1417,6 +1597,12 @@ test_starter_player_camera_mode_enum_error_diagnostic()
 test_workspace_read_only_write_diagnostic()
 test_no_service_property_write_dirties_or_creates_history()
 test_stale_service_overlay_after_stop()
+test_starter_player_lock_first_person_blocks_lua_third_person()
+test_runtime_zoom_limit_write_forwards_full_overlay()
+
+test_duplicate_starterplayerscripts_shows_client_warning_and_no_history()
+test_first_starterplayerscripts_is_not_blocked_by_the_warning_check()
+test_duplicate_starterplayerscripts_rejection_happens_before_any_command_construction()
 
 print()
 if FAILURES:

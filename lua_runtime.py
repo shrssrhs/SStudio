@@ -842,6 +842,24 @@ class RuntimeSceneLayer:
         result = datamodel_schema.validate_property_value(service_name, key, value)
         if not result.ok:
             return False, result.error
+        # Stage 3.8 fix: min<=max ordering for StarterPlayer's zoom-limit
+        # pair is a CROSS-field rule (datamodel_schema.
+        # validate_starter_player_zoom) that plain per-property
+        # validate_property_value() above can't see -- check it here too,
+        # against whatever the OTHER bound currently is in this session's
+        # overlay (or its persistent default if never overlaid), so a Lua
+        # write can never leave the pair inverted, same guarantee the
+        # editor/server path enforces (see server.handle_update_service_property).
+        if key in ("CameraMinZoomDistance", "CameraMaxZoomDistance"):
+            overlay = self._service_overlay.get(service_name, {})
+            other_key = "CameraMaxZoomDistance" if key == "CameraMinZoomDistance" else "CameraMinZoomDistance"
+            other_default = datamodel_schema.get_property_descriptor(service_name, other_key)
+            other_value = overlay.get(other_key, other_default.default if other_default is not None else None)
+            min_value = result.value if key == "CameraMinZoomDistance" else other_value
+            max_value = result.value if key == "CameraMaxZoomDistance" else other_value
+            zoom_result = datamodel_schema.validate_starter_player_zoom(min_value, max_value)
+            if not zoom_result.ok:
+                return False, zoom_result.error
         self._service_overlay.setdefault(service_name, {})[key] = result.value
         self.game.apply_runtime_service_write(service_name, dict(self._service_overlay[service_name]))
         return True, None
@@ -1383,18 +1401,19 @@ class LuaTaskScheduler:
 #   LocalScript auto-runs from Workspace, StarterPlayer.
 #   ModuleScript NEVER auto-runs (require()-only, unchanged from Stage 3.0).
 #
-# StarterPlayerScripts is intentionally NOT introduced here: it does not
-# exist anywhere in shared/object_registry.py's ROOT_SERVICES, in any of
-# the 12 templates, or in any allowed_parent_types list today. Inventing a
-# new pseudo-container purely for this stage would be schema surface with
-# no editor-side support (Insert Object, default_parent, drag-reparent
-# validation) behind it. StarterPlayer itself already covers the "a
-# LocalScript conventionally lives under StarterPlayer" case end-to-end
-# (it's already LocalScript's schema default_parent). A dedicated
-# StarterPlayerScripts container is a clean future extension: add it to
-# ROOT_SERVICES + LocalScript.allowed_parent_types, then add its literal
-# string to _LOCALSCRIPT_ROOTS below -- nothing else in this module would
-# need to change.
+# StarterPlayerScripts (Stage 3.8: a real, serialized, singleton Instance
+# under StarterPlayer -- see shared/object_registry.py's ObjectTypeDefinition
+# and datamodel_schema.py's ClassDescriptor) does NOT need its own entry in
+# _LOCALSCRIPT_ROOTS below. The BFS walk below starts from each literal
+# root string in _EXECUTION_ROOTS and then extends the frontier with
+# children_by_parent.get(current_id, []) for EVERY discovered node
+# regardless of class -- so it already walks straight through a
+# StarterPlayerScripts container (and anything else) nested under
+# StarterPlayer, with `root` staying fixed to "StarterPlayer" for the whole
+# subtree. A LocalScript inside StarterPlayerScripts is therefore already
+# discovered and started exactly like one parented directly under
+# StarterPlayer -- see test_lua_gameplay_api.py's
+# test_localscript_under_starterplayerscripts_container_runs.
 #
 # Still no true server/client VM split: Script and LocalScript both run in
 # the SAME local Play VM, same sandbox, same scheduler budget -- only

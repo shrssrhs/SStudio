@@ -136,12 +136,30 @@ class PhysicsWorld:
 
     def set_gravity(self, gravity: float) -> None:
         """Runtime Lua `workspace.Gravity = X` write -- takes effect
-        immediately for both Bullet's own dynamic bodies (setGravity, the
-        engine's built-in per-step integration) and the manual ghost-body
-        integration in step() below, which does NOT go through Bullet's
-        gravity at all (see class docstring's "ghost" category)."""
+        immediately for both Bullet's own dynamic bodies and the manual
+        ghost-body integration in step() below, which does NOT go through
+        Bullet's gravity at all (see class docstring's "ghost" category).
+
+        BulletWorld.setGravity() alone is NOT enough for a body that has
+        been sitting motionless long enough for Bullet's deactivation
+        timer to put it to sleep (setDeactivationEnabled(True) in
+        add_part() -- confirmed empirically: after ~2s of zero gravity a
+        dynamic body's isActive() goes False, and neither
+        world.setGravity() nor even the body's own setGravity() wakes it
+        again on their own; it stays frozen at its old position forever,
+        even though the world's gravity constant genuinely changed. Every
+        existing dynamic body must be explicitly re-set AND force-woken
+        (same setActive(True, True) call wake_all_dynamic() already uses
+        for the "support was deleted" case), or a runtime workspace.
+        Gravity change silently has no effect on any Part that had
+        already gone to sleep in this Play session."""
         self._gravity_y = float(gravity)
-        self.bullet_world.setGravity(PVec3(0, self._gravity_y, 0))
+        gravity_vec = PVec3(0, self._gravity_y, 0)
+        self.bullet_world.setGravity(gravity_vec)
+        for body in self._bodies.values():
+            if body.kind == "dynamic" and body.node is not None:
+                body.node.setGravity(gravity_vec)
+                body.node.setActive(True, True)
 
     def add_part(
         self,

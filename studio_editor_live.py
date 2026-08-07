@@ -936,6 +936,22 @@ class EngineBridge(QObject):
                 self.log("warning", f"{object_id}.{key}: {result.error}")
                 return
             value = result.value
+            # Stage 3.8 fix: CameraMinZoomDistance/CameraMaxZoomDistance
+            # must stay ordered -- a cross-field rule plain
+            # validate_property_value() above can't see. Immediate UX-only
+            # pre-check against the OTHER bound's currently-known value
+            # (obj.properties, kept in sync via sync_service_property());
+            # the server remains the actual authority (see
+            # server.handle_update_service_property).
+            if key in ("CameraMinZoomDistance", "CameraMaxZoomDistance"):
+                other_key = "CameraMaxZoomDistance" if key == "CameraMinZoomDistance" else "CameraMinZoomDistance"
+                other_value = obj.properties.get(other_key)
+                min_value = value if key == "CameraMinZoomDistance" else other_value
+                max_value = value if key == "CameraMaxZoomDistance" else other_value
+                zoom_result = datamodel_schema.validate_starter_player_zoom(min_value, max_value)
+                if not zoom_result.ok:
+                    self.log("warning", f"{object_id}.{key}: {zoom_result.error}")
+                    return
 
         old_value = self._read_property(obj, property_path)
         if not self._write_property(obj, property_path, value):

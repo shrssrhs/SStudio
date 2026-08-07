@@ -628,6 +628,32 @@ def test_server_replace_world_rejects_multiple_starter_player_scripts() -> None:
     check(conflict is not None, "REPLACE_WORLD data with two StarterPlayerScripts is rejected")
 
 
+def test_server_zoom_ordering_guard_rejects_inverted_pair() -> None:
+    """Stage 3.8 follow-up: CameraMinZoomDistance/CameraMaxZoomDistance
+    must stay ordered even though each is independently a valid float --
+    server._apply_zoom_ordering_guard() is the authoritative cross-field
+    check (mirrored client-side in the Inspector pre-check and separately
+    in the Lua runtime write path -- see test_lua_gameplay_api.py's
+    test_runtime_zoom_limit_write_forwards_full_overlay)."""
+    import server
+
+    current = {"CameraMinZoomDistance": 2.0, "CameraMaxZoomDistance": 10.0}
+    result = server._apply_zoom_ordering_guard(current, {"CameraMinZoomDistance": 999.0})
+    check("CameraMinZoomDistance" not in result, "a new min above the CURRENT persisted max is dropped")
+
+    result2 = server._apply_zoom_ordering_guard(current, {"CameraMaxZoomDistance": 0.5})
+    check("CameraMaxZoomDistance" not in result2, "a new max below the CURRENT persisted min is dropped")
+
+    result3 = server._apply_zoom_ordering_guard(current, {"CameraMinZoomDistance": 3.0, "CameraMaxZoomDistance": 15.0})
+    check(result3 == {"CameraMinZoomDistance": 3.0, "CameraMaxZoomDistance": 15.0}, "a valid ordered pair submitted together is accepted unchanged")
+
+    result4 = server._apply_zoom_ordering_guard(current, {"CameraMinZoomDistance": 999.0, "CameraMaxZoomDistance": 1000.0})
+    check(result4 == {"CameraMinZoomDistance": 999.0, "CameraMaxZoomDistance": 1000.0}, "a valid pair submitted together is accepted even if it moves both bounds far from their current values")
+
+    unrelated = server._apply_zoom_ordering_guard(current, {"CharacterWalkSpeed": 15.0})
+    check(unrelated == {"CharacterWalkSpeed": 15.0}, "a property update with no zoom keys at all passes through untouched")
+
+
 def test_server_replace_world_rejects_non_local_connection() -> None:
     """Spec section 9: the server never accepts REPLACE_WORLD from a
     non-local connection. _is_local_connection() is the entire enforcement
@@ -678,6 +704,7 @@ if __name__ == "__main__":
     test_server_singleton_conflict_starter_character()
     test_server_replace_world_rejects_multiple_starter_characters()
     test_server_replace_world_rejects_multiple_starter_player_scripts()
+    test_server_zoom_ordering_guard_rejects_inverted_pair()
     test_server_replace_world_rejects_non_local_connection()
 
     print()

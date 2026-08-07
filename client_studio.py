@@ -5002,6 +5002,19 @@ class MultiplayerStudioAdapter:
             self.log("warning", f"Unknown or non-creatable object type '{object_type}'.")
             return False
 
+        # Stage 3.8 fix: StarterPlayerScripts is inserted through this
+        # generic Insert Object path (unlike StarterCharacter, which has
+        # its own dedicated create_starter_character() above) -- mirror
+        # server._singleton_conflict()'s "at most one anywhere" rule here
+        # too, purely as an immediate, no-round-trip warning. The server
+        # remains the actual authority and still rejects a duplicate even
+        # if this check somehow passed a stale local scene.
+        if object_type == "StarterPlayerScripts":
+            for record in self.game.instances.values():
+                if record.class_name == "StarterPlayerScripts":
+                    self.log("warning", "Only one StarterPlayerScripts is allowed.")
+                    return False
+
         resolved_parent = parent_id or definition.default_parent
         unique_name = self._unique_sibling_name(definition.display_name, resolved_parent)
 

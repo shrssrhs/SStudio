@@ -152,5 +152,35 @@ world6.step(1 / 60)  # must not raise, and must not move ghost6 further
 print("Scenario F3 (deleting a ghost body removes its manual-gravity state) PASSED\n")
 world6.destroy()
 
+# --- Scenario G (Stage 3.8 bug fix): a runtime workspace.Gravity change
+# (PhysicsWorld.set_gravity()) must affect bodies that were ALREADY added
+# to the world under the OLD gravity, not just newly-added ones.
+# BulletRigidBodyNode caches its own per-body gravity at attach time --
+# world.setGravity() alone does not retroactively update existing bodies
+# (confirmed empirically via a real Play session before this fix: a Part
+# added under gravity=0 stayed frozen forever after a runtime write set
+# gravity to 24, with zero net force). set_gravity() must also explicitly
+# re-set gravity on every existing dynamic body's own Bullet node. ---
+world7 = physics.PhysicsWorld(gravity=0.0)
+floor7 = Entity(position=Vec3(0, 0, 0), scale=Vec3(20, 1, 20), rotation=Vec3(0, 0, 0))
+world7.add_part("floor7", floor7, [0, 0, 0], [0, 0, 0], [20, 1, 20], anchored=True, can_collide=True)
+cube7 = Entity(position=Vec3(0, 10, 0), scale=Vec3(2, 2, 2), rotation=Vec3(0, 0, 0))
+world7.add_part("cube7", cube7, [0, 10, 0], [0, 0, 0], [2, 2, 2], anchored=False, can_collide=True)
+
+for _ in range(240):
+    world7.step(1 / 60)
+frozen_y = cube7.y
+print("cube7 position after 1s under zero gravity:", cube7.position)
+assert close(frozen_y, 10.0, 0.01), f"cube7 must not move at all under zero gravity, got {frozen_y}"
+
+world7.set_gravity(-24.0)
+assert close(world7.gravity, -24.0), f"PhysicsWorld.gravity reflects the new value immediately, got {world7.gravity}"
+for _ in range(120):
+    world7.step(1 / 60)
+print("cube7 position 1s after runtime gravity change to 24:", cube7.position)
+assert cube7.y < frozen_y - 0.5, f"cube7 (added to the world BEFORE the gravity change) must start falling once set_gravity() is called, was {frozen_y}, now {cube7.y}"
+print("Scenario G (runtime set_gravity() affects already-existing dynamic bodies) PASSED\n")
+world7.destroy()
+
 print("ALL PHYSICS MODULE TESTS PASSED")
 app.destroy()
