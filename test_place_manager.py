@@ -434,6 +434,49 @@ def test_save_as_then_save_round_trip_and_dirty_tracking() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_canonical_format_version_round_trips_and_future_versions_fail_cleanly() -> None:
+    """Stage 3.9 final-verification pass: locks down the literal invariant
+    the acceptance criteria ask for -- the canonical saver writes
+    pm.SCENE_FORMAT_VERSION (not some other hardcoded number), the
+    canonical loader accepts exactly that version back, and a version one
+    past the current one is still rejected cleanly. pm.SCENE_FORMAT_VERSION
+    is the ONE authoritative version counter for this module's Place
+    format -- studio_editor_live.SCENE_FORMAT_VERSION is a separate,
+    unrelated counter for the disconnected offline-demo path (see
+    place_manager.py's own SCENE_FORMAT_VERSION comment)."""
+    tmp = make_temp_dir()
+    try:
+        manager = pm.PlaceManager(projects_root=tmp)
+        manager.recents = isolated_recents_store(tmp)
+
+        objects = [{
+            "id": "abc123", "class_name": "Part", "name": "P", "parent_id": None,
+            "properties": {"Position": [0, 0, 0]}, "tags": [], "attributes": {}, "enabled": True,
+        }]
+        dest = tmp / "VersionCheck.nebula.json"
+        result = manager.save_as(dest, objects)
+        check(result.success, "save_as() succeeds")
+
+        on_disk = json.loads(dest.read_text(encoding="utf-8"))
+        check(
+            on_disk["version"] == pm.SCENE_FORMAT_VERSION,
+            f"canonical saver writes the current pm.SCENE_FORMAT_VERSION ({pm.SCENE_FORMAT_VERSION}), got {on_disk.get('version')!r}",
+        )
+
+        reopened = manager.open(dest)
+        check(reopened.success, "canonical loader successfully re-opens a file the canonical saver just wrote")
+
+        future_path = tmp / "OneVersionAhead.nebula.json"
+        future_path.write_text(
+            json.dumps({"format": "nebula-scene", "version": pm.SCENE_FORMAT_VERSION + 1, "objects": []}),
+            encoding="utf-8",
+        )
+        future_result = manager.open(future_path)
+        check(not future_result.success, "a version one past the current SCENE_FORMAT_VERSION is still rejected cleanly")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_reset_to_untitled() -> None:
     tmp = make_temp_dir()
     try:
@@ -694,6 +737,7 @@ if __name__ == "__main__":
     test_create_from_template_produces_default_services()
     test_save_requires_current_path()
     test_save_as_then_save_round_trip_and_dirty_tracking()
+    test_canonical_format_version_round_trips_and_future_versions_fail_cleanly()
     test_reset_to_untitled()
     test_recent_places_store()
     test_recent_places_store_survives_malformed_settings()

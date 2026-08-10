@@ -564,18 +564,33 @@ def is_starter_character(class_name: str, name: str, parent_key: Optional[str]) 
 # LEGACY-COMPATIBLE CLASSES (thin stubs -- see module docstring)
 # ============================================================
 
-for _legacy_name, _legacy_parents in (
-    ("Model", ()),
-    ("Folder", ()),
-    ("Part", ()),
-    ("Script", ()),
-    ("LocalScript", ()),
-    ("ModuleScript", ()),
-    ("SpawnPoint", ()),
+for _legacy_name, _legacy_base in (
+    ("Model", "Instance"),
+    ("Folder", "Instance"),
+    ("Part", "Instance"),
+    ("Script", "Instance"),
+    ("LocalScript", "Instance"),
+    ("ModuleScript", "Instance"),
+    # Stage 3.9: SpawnPoint is genuinely Part-like (same has_3d_entity
+    # transform/physics presence, see shared/object_registry.py) -- basing
+    # it on "Part" instead of "Instance" here lets datamodel_schema.is_a()
+    # answer IsA("Part")/IsA("SpawnPoint") correctly via real inheritance,
+    # replacing the single hand-rolled special case that used to live in
+    # lua_runtime.py's RuntimeSceneLayer.is_a() (see its Stage 3.9 update).
+    ("SpawnPoint", "Part"),
+    # Stage 3.9: gameplay-state primitives (see shared/object_registry.py
+    # registration) -- registered here too, purely so IsA("Instance") and
+    # class_chain() resolve correctly for them; their actual properties are
+    # driven entirely by RuntimeSceneLayer's generic property_schema
+    # fallback, not by anything in this module.
+    ("BoolValue", "Instance"),
+    ("IntValue", "Instance"),
+    ("NumberValue", "Instance"),
+    ("StringValue", "Instance"),
 ):
     register_class(ClassDescriptor(
         class_name=_legacy_name,
-        base_class="Instance",
+        base_class=_legacy_base,
         display_name=_legacy_name,
         category="Legacy",
         creatable=True,

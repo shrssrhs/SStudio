@@ -863,20 +863,23 @@ def test_escape_release_clears_held_keys() -> None:
         teardown(game, manager, ctx)
 
 
-def test_on_key_event_ignores_mouse_and_scroll_keys() -> None:
-    """Stage 3.7: input() now forwards "right mouse down"/"right mouse
-    up"/"scroll up"/"scroll down" (and "left mouse down" is now also
-    reachable while third-person, uncaptured) to on_key_event() every Play
-    frame those fire, alongside every other key -- on_key_event() itself
-    needed no Stage 3.7 changes because TRACKED_KEYS never included any of
-    these, so this just confirms that stays true (spec: "RMB camera
-    movement must not generate excessive mouse-move Lua events")."""
+def test_on_key_event_ignores_scroll_but_tracks_mouse_buttons() -> None:
+    """Stage 3.7: input() forwards "right mouse down"/"right mouse up"/
+    "scroll up"/"scroll down" (and "left mouse down" is now also reachable
+    while third-person, uncaptured) to on_key_event() every Play frame
+    those fire, alongside every other key. Stage 3.9 update: left/right
+    mouse buttons are now DELIBERATELY tracked (TRACKED_MOUSE_BUTTONS,
+    spec section 7: "basic mouse buttons where supported") and reach
+    UserInputService as MouseButton1/MouseButton2 -- only "scroll up"/
+    "scroll down" remain untracked (no TRACKED_KEYS/TRACKED_MOUSE_BUTTONS
+    entry exists for either, and there is no sensible held/released state
+    for a scroll event anyway)."""
     game = _FakeGame()
     manager, ctx = make_context(game)
     try:
         for key in ("right mouse down", "right mouse up", "left mouse down", "scroll up", "scroll down"):
             ctx.on_key_event(key)
-        check(not ctx._held_keys, "mouse/scroll key strings are never added to held-key state")
+        check(ctx._held_keys == {"MouseButton1"}, f"mouse buttons ARE tracked (round-tripped RMB gone, LMB still held); scroll keys are never added to held-key state, got {ctx._held_keys}")
     finally:
         teardown(game, manager, ctx)
 
@@ -1566,7 +1569,7 @@ test_jump_request_fires_on_space()
 test_is_key_down()
 test_is_input_captured_reflects_game_state()
 test_escape_release_clears_held_keys()
-test_on_key_event_ignores_mouse_and_scroll_keys()
+test_on_key_event_ignores_scroll_but_tracks_mouse_buttons()
 test_stop_clears_held_key_state()
 test_no_input_events_outside_play()
 

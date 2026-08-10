@@ -84,15 +84,37 @@ ACCESSORY_SLOT_TO_PART = {
 
 CAMERA_MODES = ("FirstPerson", "ThirdPerson")
 
-# Stage 3.5 spec's stable string enums.
+# Stage 3.5/3.9 spec's stable string enums.
 TRACKED_KEYS = {
     "w": "W", "a": "A", "s": "S", "d": "D", "space": "Space",
     "v": "V", "escape": "Escape",
+    # Stage 3.9: common gameplay action keys (interact/use, secondary
+    # action, sprint) -- "left shift"'s own " up" release event
+    # ("left shift up") already fits the generic suffix-stripping
+    # convention below unchanged, unlike the mouse buttons (see
+    # TRACKED_MOUSE_BUTTONS).
+    "e": "E", "f": "F", "left shift": "LeftShift",
 }
 # Movement/jump keys are already consumed by the character controller
 # (see update_character() in client_studio.py) -- Stage 3.5 spec: "gameplay
 # movement input is marked processed=true where appropriate".
 _PROCESSED_KEYS = {"W", "A", "S", "D", "Space"}
+
+# Stage 3.9: Ursina reports mouse buttons as two entirely distinct strings
+# ("left mouse down" / "left mouse up"), NOT a base key name plus an " up"
+# suffix the way keyboard keys are -- confirmed by inspection of
+# client_studio.py's existing input() dispatch for 'left mouse down'/
+# 'right mouse down'. An exact-match table, checked BEFORE the generic
+# suffix-stripping path in on_key_event() below, rather than bolting a
+# second naming convention onto TRACKED_KEYS. Maps directly to
+# (KeyCode, is_up) -- Roblox's own InputObject.UserInputType convention
+# for mouse buttons ("MouseButton1"/"MouseButton2"), not "Keyboard".
+TRACKED_MOUSE_BUTTONS: dict[str, tuple[str, bool]] = {
+    "left mouse down": ("MouseButton1", False),
+    "left mouse up": ("MouseButton1", True),
+    "right mouse down": ("MouseButton2", False),
+    "right mouse up": ("MouseButton2", True),
+}
 
 
 # ============================================================
@@ -102,145 +124,15 @@ _PROCESSED_KEYS = {"W", "A", "S", "D", "Space"}
 # ============================================================
 
 GAMEPLAY_PRELUDE = r"""
--- ---------------- Signal / Connection ----------------
-local SignalMeta = {}
-SignalMeta.__index = SignalMeta
-SignalMeta.__metatable = "locked"
-SignalMeta.__tostring = function(self) return "Signal" end
-
-local ConnectionMeta = {}
-ConnectionMeta.__index = ConnectionMeta
-ConnectionMeta.__metatable = "locked"
-ConnectionMeta.__tostring = function(self)
-    if rawget(self, "__connected") then return "Connection (connected)" end
-    return "Connection (disconnected)"
-end
-
-local signal_registry = {}
-local next_signal_id = 0
-
-local function new_signal()
-    next_signal_id = next_signal_id + 1
-    signal_registry[next_signal_id] = {listeners = {}, next_conn_id = 0}
-    return next_signal_id
-end
-_G.__gameplay_new_signal = new_signal
-
-local signal_proxy_cache = setmetatable({}, {__mode = "v"})
-local function make_signal_proxy(signal_id)
-    if signal_id == nil then return nil end
-    local cached = signal_proxy_cache[signal_id]
-    if cached ~= nil then return cached end
-    local proxy = setmetatable({__signal_id = signal_id}, SignalMeta)
-    signal_proxy_cache[signal_id] = proxy
-    return proxy
-end
-_G.__gameplay_make_signal_proxy = make_signal_proxy
-
-function SignalMeta:Connect(fn)
-    if type(fn) ~= "function" then error("Signal:Connect expects a function", 2) end
-    local signal_id = rawget(self, "__signal_id")
-    local record = signal_registry[signal_id]
-    if record == nil then error("Signal is no longer available", 2) end
-    record.next_conn_id = record.next_conn_id + 1
-    local conn_id = record.next_conn_id
-    -- `cancelled` is a SEPARATE flag from "still present in
-    -- record.listeners" -- see __gameplay_fire_signal's docstring for why
-    -- both are needed: a `once` listener is proactively removed from
-    -- record.listeners the moment IT gets dispatched (so a re-entrant
-    -- firing of the same signal can never double-invoke it), which would
-    -- otherwise be indistinguishable from "disconnected by something
-    -- else" if presence-in-the-table were the only signal checked at
-    -- actual run time.
-    record.listeners[conn_id] = {fn = fn, once = false, owner = __bridge_current_script_id(), cancelled = false}
-    return setmetatable({__signal_id = signal_id, __conn_id = conn_id, __connected = true}, ConnectionMeta)
-end
-
-function SignalMeta:Once(fn)
-    local conn = self:Connect(fn)
-    local record = signal_registry[rawget(self, "__signal_id")]
-    if record ~= nil then
-        local entry = record.listeners[rawget(conn, "__conn_id")]
-        if entry ~= nil then entry.once = true end
-    end
-    return conn
-end
-
-function SignalMeta:Wait()
-    local signal_id = rawget(self, "__signal_id")
-    return coroutine.yield({kind = "signal_wait", signal_id = signal_id})
-end
-
-function ConnectionMeta:Disconnect()
-    if not rawget(self, "__connected") then return end
-    rawset(self, "__connected", false)
-    local record = signal_registry[rawget(self, "__signal_id")]
-    if record ~= nil then
-        local conn_id = rawget(self, "__conn_id")
-        local entry = record.listeners[conn_id]
-        -- Mark the entry cancelled BEFORE removing it from the live
-        -- table: a listener already snapshotted (and already turned into
-        -- a coroutine) by an in-progress __gameplay_fire_signal call for
-        -- THIS SAME firing still holds a direct reference to this exact
-        -- `entry` table via its wrapper closure below -- removing it from
-        -- record.listeners alone would be invisible to that closure,
-        -- since it never re-reads record.listeners itself. `cancelled`
-        -- travels with the entry object regardless of table membership,
-        -- which is exactly what lets a listener disconnected by an
-        -- EARLIER listener in the same dispatch correctly never run.
-        if entry ~= nil then entry.cancelled = true end
-        record.listeners[conn_id] = nil
-    end
-end
-
--- Fire: snapshot listeners into a separate array BEFORE dispatching any of
--- them (safe against Connect()/Disconnect() happening mid-dispatch from
--- inside a listener -- a live `pairs(record.listeners)` iteration would be
--- undefined behavior if the table it's iterating gets a key added or
--- removed during the loop; iterating a frozen snapshot array instead
--- sidesteps that entirely). `once` listeners are removed from the live
--- table before dispatch, not after, so re-entrant firing (a listener that
--- fires the same signal again) can never invoke them twice. Each
--- dispatched listener is wrapped in a small closure that re-checks
--- entry.cancelled AT ACTUAL RUN TIME (not just here, at snapshot/creation
--- time) -- necessary because every listener's coroutine is CREATED
--- up-front, in this one synchronous loop, before ANY of them have
--- actually RUN yet (see module docstring: dispatch/resume always happens
--- back in Python, through the scheduler); a listener that disconnects a
--- LATER listener in the same firing (e.g. "A disconnects B" where B's
--- coroutine was already created before A ever ran) would otherwise still
--- fire B, since B's snapshot/creation-time liveness check happened before
--- A got a chance to run at all.
-_G.__gameplay_fire_signal = function(signal_id, args)
-    local record = signal_registry[signal_id]
-    if record == nil then return {} end
-    local snapshot = {}
-    for conn_id, entry in pairs(record.listeners) do
-        snapshot[#snapshot + 1] = {conn_id = conn_id, entry = entry}
-    end
-    local dispatch = {}
-    for i = 1, #snapshot do
-        local conn_id = snapshot[i].conn_id
-        local entry = snapshot[i].entry
-        if not entry.cancelled then
-            if entry.once then record.listeners[conn_id] = nil end
-            local real_fn = entry.fn
-            local wrapped_fn = function(...)
-                if entry.cancelled then return end
-                return real_fn(...)
-            end
-            local co_id = __registry_create(wrapped_fn)
-            dispatch[#dispatch + 1] = {co_id = co_id, owner = entry.owner}
-        end
-    end
-    return dispatch
-end
-
-_G.__gameplay_clear_signals = function()
-    signal_registry = {}
-    next_signal_id = 0
-    signal_proxy_cache = setmetatable({}, {__mode = "v"})
-end
+-- Stage 3.9: the generic Signal/Connection engine (Connect/Once/Wait/
+-- Disconnect) that used to be defined HERE, under a __gameplay_ prefix,
+-- now lives in lua_runtime.py's own core prelude as __signal_new/
+-- __signal_make_proxy/__signal_fire/__signal_clear_all -- Touched (a
+-- non-gameplay-layer, purely physics-driven signal) needed the exact same
+-- machinery, so it was promoted to core rather than duplicated. This
+-- fragment just calls the relocated functions by their new names; nothing
+-- about signal BEHAVIOR changed.
+local make_signal_proxy = __signal_make_proxy
 
 -- ---------------- Character ----------------
 local CharacterMeta = {}
@@ -409,7 +301,7 @@ class LuaGameplayContext:
         self._register_bridge_functions()
 
         self._signal_ids = {
-            name: lua.globals()["__gameplay_new_signal"]()
+            name: lua.globals()["__signal_new"]()
             for name in ("PlayerAdded", "PlayerRemoving", "CharacterAdded", "CharacterRemoving", "InputBegan", "InputEnded", "JumpRequest")
         }
         lua.globals()["__gameplay_signal_ids"] = lua.table_from(dict(self._signal_ids))
@@ -480,7 +372,7 @@ class LuaGameplayContext:
         self._character_added_pending = False
         self._held_keys.clear()
         try:
-            self.lua_manager.lua.globals()["__gameplay_clear_signals"]()
+            self.lua_manager.lua.globals()["__signal_clear_all"]()
         except Exception:
             pass
         self.lua_manager.gameplay = None
@@ -489,32 +381,17 @@ class LuaGameplayContext:
     # ---------------- signal firing ----------------
 
     def _fire(self, signal_name: str, args: tuple) -> None:
-        """Fires a named built-in signal: creates one fresh coroutine per
-        currently-connected listener (done entirely in Lua, see
-        __gameplay_fire_signal's docstring), then resumes each one through
-        the normal scheduler path so budget/error-isolation apply
-        uniformly. Also unblocks any :Wait() callers via
-        mark_signal_fired() -- both mechanisms share the same signal_id."""
+        """Fires a named built-in signal via the shared
+        LuaRuntimeManager.fire_signal() dispatcher (see lua_runtime.py) --
+        Stage 3.9 moved the actual Connect/fire/dispatch plumbing there so
+        Touched and Player/Character/UserInputService signals share ONE
+        implementation instead of each keeping a private copy."""
         if not self._active:
             return
         signal_id = self._signal_ids.get(signal_name)
         if signal_id is None:
             return
-        lua = self.lua_manager.lua
-        lua_args = lua.table_from(list(args)) if args else lua.table_from([])
-        self.lua_manager.scheduler.mark_signal_fired(signal_id, args)
-        dispatch = lua.globals()["__gameplay_fire_signal"](signal_id, lua_args)
-        if dispatch is None:
-            return
-        try:
-            items = list(dispatch.values())
-        except AttributeError:
-            items = list(dispatch)
-        for item in items:
-            co_id = item["co_id"]
-            owner = item["owner"]
-            owner_script_id = str(owner) if owner is not None else "<engine>"
-            self.lua_manager.scheduler.schedule_immediate_external(owner_script_id, co_id, args)
+        self.lua_manager.fire_signal(signal_id, args)
 
     # ---------------- input ----------------
 
@@ -523,25 +400,38 @@ class LuaGameplayContext:
         event, regardless of whether that key is also separately handled
         (mouse-look capture, V toggle, Escape release, ...) -- this is a
         purely additive observer, never a replacement for that existing
-        dispatch. Only forwards TRACKED_KEYS; anything else (arbitrary
-        keys Ursina reports) is ignored so this can never flood Lua."""
+        dispatch. Only forwards TRACKED_KEYS/TRACKED_MOUSE_BUTTONS;
+        anything else (arbitrary keys Ursina reports) is ignored so this
+        can never flood Lua."""
         if not self._active:
+            return
+        mouse_entry = TRACKED_MOUSE_BUTTONS.get(ursina_key)
+        if mouse_entry is not None:
+            key_code, is_up = mouse_entry
+            # Roblox convention: a mouse button's UserInputType IS its own
+            # enum name (MouseButton1/MouseButton2), unlike keyboard keys
+            # where UserInputType is the constant "Keyboard" and KeyCode
+            # varies.
+            self._handle_tracked_input(key_code, is_up, key_code)
             return
         is_up = ursina_key.endswith(" up")
         base = ursina_key[:-3] if is_up else ursina_key
         key_code = TRACKED_KEYS.get(base)
         if key_code is None:
             return
+        self._handle_tracked_input(key_code, is_up, "Keyboard")
+
+    def _handle_tracked_input(self, key_code: str, is_up: bool, user_input_type: str) -> None:
         if is_up:
             if key_code not in self._held_keys:
                 return
             self._held_keys.discard(key_code)
-            self._dispatch_input(key_code, "End")
+            self._dispatch_input(key_code, "End", user_input_type)
         else:
             if key_code in self._held_keys:
                 return  # key-repeat guard -- one InputBegan per physical press, not per frame held
             self._held_keys.add(key_code)
-            self._dispatch_input(key_code, "Begin")
+            self._dispatch_input(key_code, "Begin", user_input_type)
             if key_code == "Space":
                 self._fire("JumpRequest", ())
 
@@ -559,11 +449,11 @@ class LuaGameplayContext:
             self._dispatch_input(key_code, "End")
         self._held_keys.clear()
 
-    def _dispatch_input(self, key_code: str, state: str) -> None:
+    def _dispatch_input(self, key_code: str, state: str, user_input_type: str = "Keyboard") -> None:
         lua = self.lua_manager.lua
         input_object = lua.table_from({
             "KeyCode": key_code,
-            "UserInputType": "Keyboard",
+            "UserInputType": user_input_type,
             "State": state,
         })
         processed = key_code in _PROCESSED_KEYS
@@ -727,6 +617,12 @@ class LuaGameplayContext:
         visual = self.game._character_visual
         controller = runtime.controller
 
+        if key == "Name":
+            # Stage 3.9: lets a script that receives the character proxy as
+            # Touched's `otherPart` (see lua_runtime.py's _fire_touched())
+            # print/compare a sensible name, mirroring Roblox's convention
+            # that a Character model is named after its player.
+            return "string", LOCAL_PLAYER_NAME
         if key == "Position":
             return "vector3", list(controller.get_position())
         if key == "HorizontalVelocity":

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from panda3d.bullet import BulletBoxShape, BulletRigidBodyNode, BulletWorld
+from panda3d.bullet import BulletBoxShape, BulletGhostNode, BulletRigidBodyNode, BulletWorld
 from panda3d.core import NodePath, Quat
 from panda3d.core import Vec3 as PVec3
 from ursina import Entity, Vec3
@@ -124,6 +124,23 @@ class PhysicsWorld:
         self._rotation = _RotationScratch()
         self._bodies: dict[str, _PhysicsBody] = {}
         self._frame_count = 0
+        # Stage 3.9 (Touched support): reverse lookup from a Bullet node
+        # (BulletRigidBodyNode for static/dynamic, BulletGhostNode for
+        # ghost/none -- see add_part() below) back to the instance_id it
+        # belongs to, PLUS any node registered via register_external_node()
+        # (the player character's BulletCharacterControllerNode -- owned by
+        # character_controller.py, not by a _PhysicsBody here, since its
+        # own lifecycle is managed entirely by client_studio.py). Node
+        # objects hash/compare by their underlying C++ pointer (confirmed
+        # empirically), so a node handed back later by getManifolds()/
+        # getOverlappingNodes() -- a different Python wrapper instance --
+        # still resolves correctly against this dict.
+        self._node_to_id: dict[Any, str] = {}
+        # Frame-to-frame diff set for poll_new_contacts() -- holds pairs
+        # that were ALREADY touching last poll, so only NEWLY-begun contact
+        # is reported (avoids uncontrolled per-frame Touched spam for
+        # sustained contact, per the Stage 3.9 spec).
+        self._touching_pairs: set[frozenset[str]] = set()
         if DEBUG_PHYSICS:
             print(f"[PHYSICS] backend initialized: Bullet, gravity=(0,{self._gravity_y},0)")
 
@@ -182,10 +199,23 @@ class PhysicsWorld:
         if anchored:
             if not can_collide:
                 # Anchored + non-collidable: never moves (Anchored) and
-                # nothing can collide with it (CanCollide=False) -- no
-                # physics presence needed at all.
-                body = _PhysicsBody(instance_id, entity, "none", None, None)
+                # produces no COLLISION RESPONSE (CanCollide=False) -- but
+                # Stage 3.9's Touched needs overlap detection to still work
+                # for exactly this kind (a fixed, walk-through trigger
+                # volume: checkpoint/goal-zone/button), so it still gets a
+                # real BulletGhostNode (never a BulletRigidBodyNode --
+                # ghost objects report overlaps without ever pushing
+                # anything, confirmed empirically against both a dynamic
+                # rigid body and BulletCharacterControllerNode).
+                node = BulletGhostNode(f"none:{instance_id}")
+                node.addShape(BulletBoxShape(half_extent))
+                np = NodePath(node)
+                np.setPos(pos)
+                np.setQuat(quat)
+                self.bullet_world.attachGhost(node)
+                body = _PhysicsBody(instance_id, entity, "none", node, np)
                 self._bodies[instance_id] = body
+                self._node_to_id[node] = instance_id
                 if DEBUG_PHYSICS:
                     print(
                         f"[PHYSICS] body id={instance_id} kind=none anchored=True "
@@ -203,6 +233,7 @@ class PhysicsWorld:
             self.bullet_world.attachRigidBody(node)
             body = _PhysicsBody(instance_id, entity, "static", node, np)
             self._bodies[instance_id] = body
+            self._node_to_id[node] = instance_id
             if DEBUG_PHYSICS:
                 print(
                     f"[PHYSICS] body id={instance_id} kind=static anchored=True "
@@ -211,11 +242,20 @@ class PhysicsWorld:
             return
 
         if not can_collide:
-            # Ghost: deliberately NOT attached to the Bullet world at all
-            # (see module docstring) -- falls via manual integration,
-            # cannot collide with anything by construction.
-            body = _PhysicsBody(instance_id, entity, "ghost", None, None)
+            # Ghost: no collision RESPONSE (falls via manual integration,
+            # see module docstring -- unaffected by Bullet's own dynamics),
+            # but still gets a BulletGhostNode purely for Touched overlap
+            # detection, kept in sync with the manually-integrated position
+            # every step() (see below).
+            node = BulletGhostNode(f"ghost:{instance_id}")
+            node.addShape(BulletBoxShape(half_extent))
+            np = NodePath(node)
+            np.setPos(pos)
+            np.setQuat(quat)
+            self.bullet_world.attachGhost(node)
+            body = _PhysicsBody(instance_id, entity, "ghost", node, np)
             self._bodies[instance_id] = body
+            self._node_to_id[node] = instance_id
             if DEBUG_PHYSICS:
                 print(
                     f"[PHYSICS] body id={instance_id} kind=ghost anchored=False "
@@ -236,11 +276,27 @@ class PhysicsWorld:
         self.bullet_world.attachRigidBody(node)
         body = _PhysicsBody(instance_id, entity, "dynamic", node, np)
         self._bodies[instance_id] = body
+        self._node_to_id[node] = instance_id
         if DEBUG_PHYSICS:
             print(
                 f"[PHYSICS] body id={instance_id} kind=dynamic anchored=False "
                 f"can_collide=True mass={volume:.3f} pos={position} rot={rotation} size={size}"
             )
+
+    def register_external_node(self, instance_id: str, node: Any) -> None:
+        """Lets a node this PhysicsWorld did not create (currently: the
+        player character's BulletCharacterControllerNode, already attached
+        to this same bullet_world by character_controller.py -- see its
+        "do not introduce a second Bullet world" constraint) participate in
+        poll_new_contacts()'s reverse lookup, WITHOUT creating a
+        _PhysicsBody for it (its position/lifecycle stays entirely owned by
+        its real owner). `instance_id` need not be a real RuntimeSceneLayer
+        instance id -- the caller (LuaRuntimeManager._fire_touched) is
+        expected to special-case whatever sentinel string is used here."""
+        self._node_to_id[node] = instance_id
+
+    def unregister_external_node(self, node: Any) -> None:
+        self._node_to_id.pop(node, None)
 
     def body_count(self) -> int:
         return len(self._bodies)
@@ -274,7 +330,11 @@ class PhysicsWorld:
 
         before = len(self._bodies) + 1
         if body.node is not None:
-            self.bullet_world.removeRigidBody(body.node)
+            if body.kind in ("static", "dynamic"):
+                self.bullet_world.removeRigidBody(body.node)
+            elif body.kind in ("ghost", "none"):
+                self.bullet_world.removeGhost(body.node)
+            self._node_to_id.pop(body.node, None)
         after = len(self._bodies)
         if DEBUG_PHYSICS:
             print(
@@ -332,6 +392,15 @@ class PhysicsWorld:
             elif body.kind == "ghost":
                 body.velocity_y += self._gravity_y * dt
                 body.entity.y += body.velocity_y * dt
+                if body.np is not None:
+                    # Keeps the BulletGhostNode's overlap-test position in
+                    # sync with this kind's own manual gravity integration
+                    # (Touched support) -- one frame of lag vs. this same
+                    # frame's doPhysics() call above is fine (see Stage 3.9
+                    # report), same as every other overlap/manifold result
+                    # already reflects last frame's transforms.
+                    ep = body.entity.position
+                    body.np.setPos(PVec3(ep.x, ep.y, ep.z))
                 if verbose:
                     print(
                         f"[PHYSICS] frame={frame_no} dt={dt:.5f} id={body.instance_id} "
@@ -345,11 +414,61 @@ class PhysicsWorld:
         if verbose:
             print(f"[PHYSICS] frame={frame_no} world stepped=True accumulated_steps={frame_no} bodies={len(self._bodies)}")
 
+    def poll_new_contacts(self) -> list[tuple[str, str]]:
+        """Stage 3.9 Touched support. Returns only pairs whose contact
+        began SINCE THE LAST CALL (frame-to-frame diff against
+        self._touching_pairs) -- sustained contact is deliberately not
+        re-reported every frame, per the spec's "avoid uncontrolled
+        per-frame callback spam" requirement. Two independent detection
+        paths, because they cover genuinely different body kinds:
+
+        1. Real Bullet contact manifolds (bullet_world.getManifolds()) --
+           covers CanCollide=True static/dynamic bodies AND the player
+           character (BulletCharacterControllerNode DOES generate real
+           manifold points against static/dynamic geometry it rests
+           against or bumps into -- confirmed empirically, not assumed).
+        2. BulletGhostNode.getOverlappingNodes() for each "ghost"/"none"
+           (CanCollide=False) body -- confirmed empirically to also detect
+           overlap with a dynamic rigid body AND the character controller
+           node, which manifolds alone would NOT give us for a
+           non-collidable trigger volume (Bullet never generates collision
+           response/manifold points for a ghost object).
+
+        Returns raw (id, id) pairs -- caller (LuaRuntimeManager) decides
+        how to map ids to Lua values, including the "__character__"
+        sentinel id used by register_external_node()."""
+        current_pairs: set[frozenset[str]] = set()
+
+        for manifold in self.bullet_world.getManifolds():
+            if manifold.getNumManifoldPoints() <= 0:
+                continue
+            id0 = self._node_to_id.get(manifold.getNode0())
+            id1 = self._node_to_id.get(manifold.getNode1())
+            if id0 is not None and id1 is not None and id0 != id1:
+                current_pairs.add(frozenset((id0, id1)))
+
+        for body in self._bodies.values():
+            if body.kind not in ("ghost", "none") or body.node is None:
+                continue
+            for other_node in body.node.getOverlappingNodes():
+                other_id = self._node_to_id.get(other_node)
+                if other_id is not None and other_id != body.instance_id:
+                    current_pairs.add(frozenset((body.instance_id, other_id)))
+
+        new_pairs = current_pairs - self._touching_pairs
+        self._touching_pairs = current_pairs
+        return [tuple(pair) for pair in new_pairs]
+
     def destroy(self) -> None:
         removed = len(self._bodies)
         for body in self._bodies.values():
             if body.node is not None:
-                self.bullet_world.removeRigidBody(body.node)
+                if body.kind in ("static", "dynamic"):
+                    self.bullet_world.removeRigidBody(body.node)
+                elif body.kind in ("ghost", "none"):
+                    self.bullet_world.removeGhost(body.node)
         self._bodies.clear()
+        self._node_to_id.clear()
+        self._touching_pairs.clear()
         if DEBUG_PHYSICS:
             print(f"[PHYSICS] destroyed: {removed} bodies removed, world torn down")

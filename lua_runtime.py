@@ -285,6 +285,217 @@ end
 
 _G.Color3 = locked_proxy(Color3Meta)
 
+-- ---------------- Signal / Connection ----------------
+-- Stage 3.9: relocated here from lua_gameplay_api.py's GAMEPLAY_PRELUDE
+-- (Stage 3.5 originally introduced it as "gameplay-only" plumbing, prefixed
+-- __gameplay_*) -- Touched (this module) and Players/Character/
+-- UserInputService (lua_gameplay_api.py) now both need the exact same
+-- generic Connect/Once/Wait/Disconnect machinery, so it lives at the core
+-- level, named __signal_* (no "gameplay" in the name -- it isn't
+-- gameplay-specific), and both callers share ONE implementation. Nothing
+-- about the mechanism itself changed from Stage 3.5's version.
+local SignalMeta = {}
+SignalMeta.__index = SignalMeta
+SignalMeta.__metatable = "locked"
+SignalMeta.__tostring = function(self) return "Signal" end
+
+local ConnectionMeta = {}
+ConnectionMeta.__index = ConnectionMeta
+ConnectionMeta.__metatable = "locked"
+ConnectionMeta.__tostring = function(self)
+    if rawget(self, "__connected") then return "Connection (connected)" end
+    return "Connection (disconnected)"
+end
+
+local signal_registry = {}
+local next_signal_id = 0
+
+local function new_signal()
+    next_signal_id = next_signal_id + 1
+    signal_registry[next_signal_id] = {listeners = {}, next_conn_id = 0}
+    return next_signal_id
+end
+_G.__signal_new = new_signal
+
+local signal_proxy_cache = setmetatable({}, {__mode = "v"})
+local function make_signal_proxy(signal_id)
+    if signal_id == nil then return nil end
+    local cached = signal_proxy_cache[signal_id]
+    if cached ~= nil then return cached end
+    local proxy = setmetatable({__signal_id = signal_id}, SignalMeta)
+    signal_proxy_cache[signal_id] = proxy
+    return proxy
+end
+_G.__signal_make_proxy = make_signal_proxy
+
+function SignalMeta:Connect(fn)
+    if type(fn) ~= "function" then error("Signal:Connect expects a function", 2) end
+    local signal_id = rawget(self, "__signal_id")
+    local record = signal_registry[signal_id]
+    if record == nil then error("Signal is no longer available", 2) end
+    record.next_conn_id = record.next_conn_id + 1
+    local conn_id = record.next_conn_id
+    -- `cancelled` is a SEPARATE flag from "still present in
+    -- record.listeners" -- see __signal_fire's docstring for why
+    -- both are needed: a `once` listener is proactively removed from
+    -- record.listeners the moment IT gets dispatched (so a re-entrant
+    -- firing of the same signal can never double-invoke it), which would
+    -- otherwise be indistinguishable from "disconnected by something
+    -- else" if presence-in-the-table were the only signal checked at
+    -- actual run time.
+    record.listeners[conn_id] = {fn = fn, once = false, owner = __bridge_current_script_id(), cancelled = false}
+    return setmetatable({__signal_id = signal_id, __conn_id = conn_id, __connected = true}, ConnectionMeta)
+end
+
+function SignalMeta:Once(fn)
+    local conn = self:Connect(fn)
+    local record = signal_registry[rawget(self, "__signal_id")]
+    if record ~= nil then
+        local entry = record.listeners[rawget(conn, "__conn_id")]
+        if entry ~= nil then entry.once = true end
+    end
+    return conn
+end
+
+function SignalMeta:Wait()
+    local signal_id = rawget(self, "__signal_id")
+    return coroutine.yield({kind = "signal_wait", signal_id = signal_id})
+end
+
+function ConnectionMeta:Disconnect()
+    if not rawget(self, "__connected") then return end
+    rawset(self, "__connected", false)
+    local record = signal_registry[rawget(self, "__signal_id")]
+    if record ~= nil then
+        local conn_id = rawget(self, "__conn_id")
+        local entry = record.listeners[conn_id]
+        -- Mark the entry cancelled BEFORE removing it from the live
+        -- table: a listener already snapshotted (and already turned into
+        -- a coroutine) by an in-progress __signal_fire call for
+        -- THIS SAME firing still holds a direct reference to this exact
+        -- `entry` table via its wrapper closure below -- removing it from
+        -- record.listeners alone would be invisible to that closure,
+        -- since it never re-reads record.listeners itself. `cancelled`
+        -- travels with the entry object regardless of table membership,
+        -- which is exactly what lets a listener disconnected by an
+        -- EARLIER listener in the same dispatch correctly never run.
+        if entry ~= nil then entry.cancelled = true end
+        record.listeners[conn_id] = nil
+    end
+end
+
+-- Fire: snapshot listeners into a separate array BEFORE dispatching any of
+-- them (safe against Connect()/Disconnect() happening mid-dispatch from
+-- inside a listener -- a live `pairs(record.listeners)` iteration would be
+-- undefined behavior if the table it's iterating gets a key added or
+-- removed during the loop; iterating a frozen snapshot array instead
+-- sidesteps that entirely). `once` listeners are removed from the live
+-- table before dispatch, not after, so re-entrant firing (a listener that
+-- fires the same signal again) can never invoke them twice. Each
+-- dispatched listener is wrapped in a small closure that re-checks
+-- entry.cancelled AT ACTUAL RUN TIME (not just here, at snapshot/creation
+-- time) -- necessary because every listener's coroutine is CREATED
+-- up-front, in this one synchronous loop, before ANY of them have
+-- actually RUN yet (see module docstring: dispatch/resume always happens
+-- back in Python, through the scheduler); a listener that disconnects a
+-- LATER listener in the same firing (e.g. "A disconnects B" where B's
+-- coroutine was already created before A ever ran) would otherwise still
+-- fire B, since B's snapshot/creation-time liveness check happened before
+-- A got a chance to run at all.
+_G.__signal_fire = function(signal_id, args)
+    local record = signal_registry[signal_id]
+    if record == nil then return {} end
+    local snapshot = {}
+    for conn_id, entry in pairs(record.listeners) do
+        snapshot[#snapshot + 1] = {conn_id = conn_id, entry = entry}
+    end
+    local dispatch = {}
+    for i = 1, #snapshot do
+        local conn_id = snapshot[i].conn_id
+        local entry = snapshot[i].entry
+        if not entry.cancelled then
+            if entry.once then record.listeners[conn_id] = nil end
+            local real_fn = entry.fn
+            local wrapped_fn = function(...)
+                if entry.cancelled then return end
+                return real_fn(...)
+            end
+            local co_id = __registry_create(wrapped_fn)
+            dispatch[#dispatch + 1] = {co_id = co_id, owner = entry.owner}
+        end
+    end
+    return dispatch
+end
+
+_G.__signal_clear_all = function()
+    signal_registry = {}
+    next_signal_id = 0
+    signal_proxy_cache = setmetatable({}, {__mode = "v"})
+end
+
+-- Stage 3.9 lifecycle fix: per-item cleanup, not just the wholesale
+-- __signal_clear_all() above (only ever called on Stop). Called from
+-- bridge_destroy() (Python) whenever an Instance owning this signal (see
+-- RuntimeSceneLayer._instance_signals) is Destroy()'d -- drops the WHOLE
+-- record (its listeners table and every listener closure with it) so
+-- nothing keeps them reachable/alive for the rest of the session just
+-- because the destroyed instance's signal_id happened to still be a key
+-- in this table.
+_G.__signal_destroy = function(signal_id)
+    signal_registry[signal_id] = nil
+    signal_proxy_cache[signal_id] = nil
+end
+
+-- Stage 3.9 lifecycle fix: the counterpart for the CONNECTING side --
+-- when a Script/LocalScript itself is Destroy()'d (directly or via
+-- cascade), any :Connect()/:Once() listener IT registered on some OTHER
+-- (still-alive) Instance's signal must not keep running forever just
+-- because nothing else ever calls Disconnect() on it. Walks every live
+-- signal's listeners (Play sessions have a bounded, small number of
+-- concurrently-live signals -- this is a Destroy()-time cleanup call, not
+-- a per-frame hot path, so an O(signals * listeners) walk is fine here).
+_G.__signal_disconnect_owner = function(owner_script_id)
+    for _, record in pairs(signal_registry) do
+        for conn_id, entry in pairs(record.listeners) do
+            if entry.owner == owner_script_id then
+                entry.cancelled = true
+                record.listeners[conn_id] = nil
+            end
+        end
+    end
+end
+
+-- Stage 3.9 lifecycle fix: read-only diagnostic/test introspection --
+-- see __registry_count()'s docstring for why a real pairs() count is
+-- used rather than the unreliable `#` operator. Returns (signal_count,
+-- total_listener_count) so a test can assert BOTH "the signal itself was
+-- pruned" and "no orphaned listener survived attached to some other
+-- still-alive signal".
+_G.__signal_registry_count = function()
+    local signal_count = 0
+    local listener_count = 0
+    for _, record in pairs(signal_registry) do
+        signal_count = signal_count + 1
+        for _ in pairs(record.listeners) do
+            listener_count = listener_count + 1
+        end
+    end
+    return signal_count, listener_count
+end
+
+-- Stage 3.9 lifecycle fix: per-signal listener count, for a test to
+-- distinguish "this specific signal's listener was pruned" from "some
+-- OTHER signal's listener happened to be pruned too" -- the aggregate
+-- __signal_registry_count() above can't tell those apart. Returns 0 for
+-- an unknown/already-destroyed signal_id rather than erroring.
+_G.__signal_listener_count = function(signal_id)
+    local record = signal_registry[signal_id]
+    if record == nil then return 0 end
+    local n = 0
+    for _ in pairs(record.listeners) do n = n + 1 end
+    return n
+end
+
 -- ---------------- Instance proxy ----------------
 local InstanceMeta = {}
 InstanceMeta.__metatable = "locked"
@@ -317,10 +528,17 @@ local function unwrap_value(value)
     -- through in a silently SHUFFLED order. Caught by an integration test
     -- asserting an exact Y value after `part.Position = part.Position +
     -- Vector3.new(0, 1, 0)`.
+    -- Stage 3.9: an Instance proxy assigned to a writable instance_ref
+    -- property (currently only `Parent`) unwraps to its bare id string --
+    -- the ONE extra case beyond Vector3/Color3 this function has ever
+    -- needed, added for `part.Parent = otherInstance` support. Never
+    -- reached for a Signal/Connection proxy (neither is ever the RHS of a
+    -- property assignment in this API).
     if type(value) == "table" then
         local mt = debug.getmetatable(value)
         if mt == Vector3Real then return {value.X, value.Y, value.Z} end
         if mt == Color3Meta then return {value.R, value.G, value.B} end
+        if mt == InstanceMeta then return rawget(value, "__id") end
     end
     return value
 end
@@ -333,11 +551,23 @@ local function wrap_value(kind, raw)
     return raw
 end
 
+-- Stage 3.9: instance-level signals (currently just Touched -- see
+-- physics.py/lua_runtime.py's RuntimeSceneLayer for the contact-detection
+-- side) are looked up BEFORE the generic property bridge, same precedence
+-- as the fixed method table just below -- a Part named "Touched" can never
+-- shadow the real signal, matching FindFirstChild's existing precedent.
+local INSTANCE_SIGNAL_NAMES = {Touched = true}
+
 InstanceMeta.__index = function(self, key)
     local id = rawget(self, "__id")
     local method = __bridge_get_method(key)
     if method ~= nil then
         return method
+    end
+    if INSTANCE_SIGNAL_NAMES[key] then
+        local ok, result = __bridge_get_signal(id, key)
+        if not ok then error(result, 2) end
+        return make_signal_proxy(result)
     end
     local kind, raw = __bridge_get(id, key)
     if kind == "error" then error(raw, 2) end
@@ -398,6 +628,12 @@ end
 
 function InstanceMethods.Destroy(self)
     __bridge_destroy(rawget(self, "__id"))
+end
+
+function InstanceMethods.Clone(self)
+    local ok, idOrErr = __bridge_clone(rawget(self, "__id"))
+    if not ok then error(idOrErr, 2) end
+    return make_proxy(idOrErr)
 end
 
 -- Stage 3.5: game:GetService(name) -- only meaningful on the "game"
@@ -489,6 +725,19 @@ _G.__registry_close = function(id)
     end
 end
 
+-- Stage 3.9 lifecycle fix: read-only diagnostic/test introspection --
+-- lets the Python side (and its regression tests) verify these tables
+-- actually shrink again after per-item cleanup, not just after a
+-- wholesale Stop. `#` is unreliable on a table with integer-key gaps
+-- (which these tables get once destroy()'d items are actually removed
+-- rather than merely nil-marked in place, so a real `pairs()` count is
+-- used instead of the `#` length operator.
+_G.__registry_count = function()
+    local n = 0
+    for _ in pairs(coroutine_registry) do n = n + 1 end
+    return n
+end
+
 -- ---------------- task scheduler bridge ----------------
 local task = {}
 
@@ -545,6 +794,90 @@ def _build_prelude_source() -> str:
 _MUTABLE_PART_KEYS = ("Position", "Rotation", "Size", "Anchored", "CanCollide", "Color", "Transparency")
 _TRANSFORM_KEYS = ("Position", "Rotation", "Size", "Anchored", "CanCollide")
 
+# Stage 3.9: sentinel for RuntimeSceneLayer._parent_overlay meaning
+# "explicitly parented to nothing" (`instance.Parent = nil`) -- distinct
+# from "not present in the overlay at all" (falls through to the
+# authoritative/runtime-created value). A plain Python `None` can't be
+# reused for this: every OTHER parent_id in this codebase already treats
+# `None`/falsy as "defaults to Workspace" (see `record.parent_id or
+# "Workspace"`, repeated throughout this module and server.py) -- using
+# None here too would make a nil-parented instance indistinguishable from
+# one that was never touched.
+_NIL_PARENT = object()
+
+# Stage 3.9: classes a running script may call Instance.new() for --
+# schema-driven (creatable=True, editor_only=False -- see object_registry.
+# ObjectTypeDefinition) MINUS a small denylist of classes that are
+# creatable in the EDITOR's Insert Object dialog but make no sense to hand
+# out fresh from Lua: Script/LocalScript/ModuleScript (this engine's
+# script-execution plan is built ONCE at Play start -- see
+# build_script_execution_plan() below -- a Script created mid-session
+# would never actually run, which would silently mislead a developer more
+# than a clear "not supported" error) and StarterPlayerScripts (a
+# server-enforced singleton per Place -- server.py's _singleton_conflict()
+# has no way to see a purely-local runtime instance, so Lua creating one
+# could not be safely validated against the real singleton rule).
+_LUA_UNCREATABLE_CLASSES = frozenset({"Script", "LocalScript", "ModuleScript", "StarterPlayerScripts"})
+
+
+def _lua_kind_for_property_spec(kind: str, value: Any) -> tuple[str, Any]:
+    """Maps a shared.object_registry.PropertySpec.kind to the same
+    (kind, raw) wire tuple wrap_value() in the prelude expects -- the
+    generic-property read-side counterpart of sanitize_properties_for_type()."""
+    if kind in ("vector3", "size3"):
+        vec = value if value is not None else [0.0, 0.0, 0.0]
+        return "vector3", [float(v) for v in vec]
+    if kind == "color":
+        rgb = value if value is not None else [255, 255, 255]
+        return "color3", [float(c) / 255.0 for c in rgb[:3]]
+    if kind == "bool":
+        return "bool", bool(value)
+    if kind in ("float", "float01"):
+        return "number", float(value) if value is not None else 0.0
+    if kind == "int":
+        # A raw Python int (not float(...)) so lupa marshals it as a real
+        # Lua 5.4 integer subtype, not a float -- IntValue.Value should
+        # print/compare as "2", not "2.0".
+        return "number", int(value) if value is not None else 0
+    if kind == "string":
+        return "string", str(value) if value is not None else ""
+    return "nil", None
+
+
+def _sanitize_lua_value_for_spec(spec: Any, value: Any) -> tuple[bool, Any]:
+    """Validates/coerces a value written from Lua against a PropertySpec,
+    returning (True, cleaned_value) or (False, error_message) -- the
+    generic-property write-side counterpart of sanitize_properties_for_type(),
+    reusing the exact same per-kind rules rather than inventing new ones."""
+    try:
+        if spec.kind in ("vector3", "size3"):
+            vec = [float(value[0]), float(value[1]), float(value[2])]
+            for component in vec:
+                if component != component or component in (float("inf"), float("-inf")):
+                    return False, "value components must be finite numbers"
+            if spec.kind == "size3":
+                from shared.instance import MIN_PART_SIZE
+                vec = [max(MIN_PART_SIZE, v) for v in vec]
+            return True, vec
+        if spec.kind == "color":
+            rgb = [max(0, min(255, int(round(float(c) * 255.0)))) for c in value[:3]]
+            return True, rgb
+        if spec.kind == "bool":
+            return True, bool(value)
+        if spec.kind == "float":
+            return True, float(value)
+        if spec.kind == "float01":
+            return True, max(0.0, min(1.0, float(value)))
+        if spec.kind == "int":
+            return True, int(value)
+        if spec.kind == "string":
+            if not isinstance(value, str):
+                return False, "value must be a string"
+            return True, value[: spec.max_len]
+    except (TypeError, ValueError, IndexError):
+        return False, "invalid value"
+    return False, f"unsupported property kind {spec.kind!r}"
+
 
 class LuaInstanceError(Exception):
     """Carries a Roblox-style message string straight back to Lua as a
@@ -592,6 +925,22 @@ class RuntimeSceneLayer:
         # value (spec: "runtime writes do not dirty or serialize the
         # Place"). Discarded wholesale in stop().
         self._service_overlay: dict[str, dict[str, Any]] = {}
+        # Stage 3.9: runtime-only Parent overrides for `instance.Parent = X`
+        # -- keyed by instance_id, value is either a real parent id/root-
+        # service-name string, or the module-level _NIL_PARENT sentinel for
+        # `instance.Parent = nil` (a real, distinct "no parent" state --
+        # see parent_of()'s docstring for why this can't just be Python
+        # None, which the REST of this codebase already uses to mean "no
+        # explicit parent_id override, defaults to Workspace"). Never
+        # touches the authoritative/networked parent_id -- purely local to
+        # this Play session, discarded wholesale in stop().
+        self._parent_overlay: dict[str, Any] = {}
+        # Stage 3.9: per-instance built-in signal ids (currently just
+        # "Touched") -- lazily created the first time a script reads
+        # `part.Touched` (see LuaRuntimeManager._register_bridge_functions'
+        # bridge_get_signal), looked up again by LuaRuntimeManager._poll_touched()
+        # every frame to know which signal_id to fire.
+        self._instance_signals: dict[str, dict[str, int]] = {}
 
     # ---------------- lifecycle ----------------
 
@@ -604,6 +953,8 @@ class RuntimeSceneLayer:
         self._runtime.clear()
         self._snapshot.clear()
         self._next_runtime_index = 0
+        self._parent_overlay.clear()
+        self._instance_signals.clear()
         self._physics = self.game._physics_world
         # Stage 3.8: deep-copy so mutating the overlay (runtime Lua writes)
         # can never reach back into self.game.services (the persistent,
@@ -664,6 +1015,17 @@ class RuntimeSceneLayer:
         for runtime_id, item in list(self._runtime.items()):
             if self._physics is not None:
                 self._physics.remove_part(runtime_id)
+            # Stage 3.9 fix: also drop the disabled Entity from
+            # self.game.parts, matching what destroy() already does for a
+            # runtime Part destroyed mid-session (see its own
+            # game.parts.pop() call). Without this, every runtime Part any
+            # script ever spawned across every past Play session stayed in
+            # game.parts forever as a permanently-disabled, dead Entity --
+            # game.parts is a persistent dict on the editor's own game
+            # object, not per-Play state, so this accumulated unboundedly
+            # across repeated Play/Stop cycles for the whole process
+            # lifetime, not just within one session.
+            self.game.parts.pop(runtime_id, None)
             if item.entity is not None:
                 try:
                     item.entity.disable()
@@ -679,6 +1041,8 @@ class RuntimeSceneLayer:
         self._runtime.clear()
         self._snapshot.clear()
         self._service_overlay.clear()
+        self._parent_overlay.clear()
+        self._instance_signals.clear()
         self._physics = None
 
     # ---------------- lookups shared by proxy + scheduler ----------------
@@ -727,9 +1091,21 @@ class RuntimeSceneLayer:
         return record.name if record is not None else None
 
     def parent_of(self, instance_id: str) -> Optional[str]:
+        """Stage 3.9: checks self._parent_overlay FIRST -- an instance
+        that has ever had `.Parent = X` assigned this Play session always
+        answers from there, regardless of what its authoritative/runtime-
+        created parent_id says, until Stop discards the overlay. Returns
+        real Python None ONLY for "game"/a ROOT_SERVICES name (unchanged
+        from before) or for an instance explicitly nil-parented via the
+        overlay (see _NIL_PARENT) -- every OTHER instance always resolves
+        to a real parent id/root-service string, same guarantee as before
+        this stage."""
         from shared.object_registry import ROOT_SERVICES
         if instance_id == "game" or instance_id in ROOT_SERVICES:
             return None
+        if instance_id in self._parent_overlay:
+            override = self._parent_overlay[instance_id]
+            return None if override is _NIL_PARENT else override
         item = self._runtime.get(instance_id)
         if item is not None:
             return item.parent_id or "Workspace"
@@ -739,16 +1115,21 @@ class RuntimeSceneLayer:
         return record.parent_id or "Workspace"
 
     def children_of(self, instance_id: str) -> list[str]:
+        """Stage 3.9: routed entirely through parent_of() (instead of
+        reading record.parent_id/item.parent_id directly) so a runtime
+        `.Parent = X` reassignment is immediately reflected here too --
+        GetChildren()/FindFirstChild()/GetDescendants() all build on this
+        one method."""
         result: list[str] = []
         for record in self.game.instances.values():
             if record.id in self._deleted:
                 continue
-            if (record.parent_id or "Workspace") == instance_id:
+            if self.parent_of(record.id) == instance_id:
                 result.append(record.id)
         for item in self._runtime.values():
             if item.id in self._deleted:
                 continue
-            if (item.parent_id or "Workspace") == instance_id:
+            if self.parent_of(item.id) == instance_id:
                 result.append(item.id)
         return result
 
@@ -787,19 +1168,35 @@ class RuntimeSceneLayer:
                 break
             parts.append(name)
             current = self.parent_of(current)
-        parts.append(current if current in ROOT_SERVICES else "Workspace")
+        if current in ROOT_SERVICES:
+            parts.append(current)
+        # else: current is None -- the walk reached a genuinely nil-parented
+        # (detached) instance, see parent_of()'s _NIL_PARENT handling. Stage
+        # 3.9 fix: this used to unconditionally append "Workspace" here,
+        # which made a detached instance's GetFullName() lie about it still
+        # living under Workspace -- a detached instance has no root segment
+        # to report, matching real Roblox (an unparented Instance's
+        # GetFullName() is just its own name chain, no "Workspace." prefix).
         return ".".join(reversed(parts))
 
     def is_a(self, instance_id: str, class_name: str) -> bool:
+        """Stage 3.9: delegates to datamodel_schema.is_a(), which walks the
+        REAL registered inheritance chain (Instance -> Part -> SpawnPoint,
+        ...) instead of this method's old single hand-rolled special case
+        -- a future subclass registered in datamodel_schema.py (e.g. a
+        Part-based class added in a later stage) automatically answers
+        IsA() correctly with zero changes needed here, matching the
+        "adding a future class should not require new dispatch code"
+        architecture goal."""
+        import datamodel_schema
         actual = self.class_name_of(instance_id)
         if actual is None:
             return False
         if actual == class_name:
             return True
-        # Minimal single-level inheritance: Part-like types answer IsA("Part") consistent with existing PART_LIKE handling.
-        if class_name == "Part" and actual == "SpawnPoint":
-            return True
-        return False
+        if datamodel_schema.get_class(actual) is None:
+            return False
+        return datamodel_schema.is_a(actual, class_name)
 
     # ---------------- property get/set (the __bridge_get/__bridge_set backends) ----------------
 
@@ -895,25 +1292,38 @@ class RuntimeSceneLayer:
             return ("nil", None) if parent_id is None else ("instance", parent_id)
 
         definition = self._definition(class_name) if class_name else None
-        if definition is None or not definition.has_3d_entity:
+        if definition is None:
             return "error", f"'{key}' is not a valid member of {class_name}"
 
-        overlay = self._overlay.get(instance_id, {})
-        base = self._base_properties(instance_id)
-        if key in ("Position", "Rotation"):
-            value = overlay.get(key, base.get(key, [0.0, 0.0, 0.0]))
-            return "vector3", [float(v) for v in value]
-        if key == "Size":
-            value = overlay.get(key, base.get(key, [1.0, 1.0, 1.0]))
-            return "vector3", [float(v) for v in value]
-        if key == "Color":
-            value = overlay.get(key, base.get(key, [255, 255, 255]))
-            return "color3", [float(c) / 255.0 for c in value[:3]]
-        if key == "Transparency":
-            return "number", float(overlay.get(key, base.get(key, 0.0)))
-        if key in ("Anchored", "CanCollide"):
-            default = True if key == "Anchored" else True
-            return "bool", bool(overlay.get(key, base.get(key, default)))
+        if definition.has_3d_entity:
+            overlay = self._overlay.get(instance_id, {})
+            base = self._base_properties(instance_id)
+            if key in ("Position", "Rotation"):
+                value = overlay.get(key, base.get(key, [0.0, 0.0, 0.0]))
+                return "vector3", [float(v) for v in value]
+            if key == "Size":
+                value = overlay.get(key, base.get(key, [1.0, 1.0, 1.0]))
+                return "vector3", [float(v) for v in value]
+            if key == "Color":
+                value = overlay.get(key, base.get(key, [255, 255, 255]))
+                return "color3", [float(c) / 255.0 for c in value[:3]]
+            if key == "Transparency":
+                return "number", float(overlay.get(key, base.get(key, 0.0)))
+            if key in ("Anchored", "CanCollide"):
+                default = True if key == "Anchored" else True
+                return "bool", bool(overlay.get(key, base.get(key, default)))
+            return "error", f"'{key}' is not a valid member of {class_name}"
+
+        # Stage 3.9: generic schema-driven property read for classes with
+        # no 3D entity (Value instances, and any future class registered
+        # the same way) -- reuses the same object_registry.PropertySpec
+        # metadata the editor's create/sanitize path already uses, so a
+        # newly-registered class needs zero new code here.
+        if key in definition.property_schema:
+            spec = definition.property_schema[key]
+            merged = self._merged_properties(instance_id)
+            value = merged.get(key, definition.default_properties.get(key))
+            return _lua_kind_for_property_spec(spec.kind, value)
         return "error", f"'{key}' is not a valid member of {class_name}"
 
     def _base_properties(self, instance_id: str) -> dict[str, Any]:
@@ -922,6 +1332,221 @@ class RuntimeSceneLayer:
             return item.properties
         record = self.game.instances.get(instance_id)
         return record.properties if record is not None else {}
+
+    # ---------------- Parent reparenting (Stage 3.9) ----------------
+
+    def _would_create_cycle(self, instance_id: str, new_parent_id: str) -> bool:
+        """True if `new_parent_id` is `instance_id` itself or one of its
+        own descendants -- walking UP from new_parent_id toward a root; if
+        that walk ever reaches instance_id, parenting there would make
+        instance_id its own ancestor. Bounded by a visited-set (defensive
+        only -- parent_of() cannot actually produce a cycle today, same
+        reasoning as _find_top_level_root's docstring)."""
+        walker: Optional[str] = new_parent_id
+        seen: set[str] = set()
+        from shared.object_registry import ROOT_SERVICES
+        while walker is not None and walker not in ROOT_SERVICES:
+            if walker == instance_id:
+                return True
+            if walker in seen:
+                return False
+            seen.add(walker)
+            walker = self.parent_of(walker)
+        return False
+
+    def can_set_parent(self, instance_id: str, new_parent_id: Optional[str]) -> tuple[bool, str]:
+        """Every rule the spec requires runtime reparenting to still
+        respect: destroyed-instance checks (caller already did the
+        instance_id side via exists() in set_property()/set_parent();
+        this also covers the NEW parent), self-parenting, hierarchy
+        cycles, and the same shared.object_registry allowed_parent_types
+        schema the editor's own drag-reparent/server SET_PARENT already
+        enforce -- ONE shared source of "is this parent allowed", not a
+        second copy of the rule."""
+        from shared import object_registry
+        from shared.object_registry import ROOT_SERVICES
+        if new_parent_id is None:
+            return True, ""  # `.Parent = nil` is always allowed
+        if new_parent_id == instance_id:
+            return False, "Cannot set Parent: an instance cannot be its own parent"
+        if new_parent_id not in ROOT_SERVICES and not self.exists(new_parent_id):
+            return False, "Cannot set Parent: the new parent does not exist"
+        if self._would_create_cycle(instance_id, new_parent_id):
+            return False, "Cannot set Parent: hierarchy cycle detected"
+        class_name = self.class_name_of(instance_id)
+        parent_type_id = new_parent_id if new_parent_id in ROOT_SERVICES else self.class_name_of(new_parent_id)
+        if class_name is not None and not object_registry.is_parent_allowed(class_name, parent_type_id):
+            return False, f"{class_name} cannot be parented to {parent_type_id or 'nil'}"
+        return True, ""
+
+    def set_parent(self, instance_id: str, value: Any) -> tuple[bool, Optional[str]]:
+        """Backend for `instance.Parent = X` -- X crosses in from the
+        prelude's __newindex as either a bare id string (an Instance
+        proxy's __id, already unwrapped by unwrap_value()) or None (Lua
+        nil). Purely local to RuntimeSceneLayer._parent_overlay -- never
+        touches the authoritative/networked parent_id, matches every
+        other runtime property write in this class (spec: "runtime
+        gameplay mutations should remain Play-session state").
+
+        Stage 3.9 fix: also keeps a has_3d_entity instance's real
+        Entity/physics presence in sync with whether it is actually
+        reachable from a root (see _is_world_attached()) -- e.g. setting
+        Parent = nil now genuinely removes a Part from rendering/physics,
+        and setting it back to a real location genuinely restores (or,
+        for a Clone() that never had an Entity yet, lazily creates) it.
+        Previously the overlay write alone was considered enough; a
+        nil-parented has_3d_entity instance kept whatever Entity/physics
+        presence it already had, which was harmless for ordinary
+        reparenting (Workspace -> a Folder -> Workspace, all attached)
+        but wrong the moment nil entered the picture at all."""
+        new_parent_id: Optional[str] = None if value is None else str(value)
+        ok, error = self.can_set_parent(instance_id, new_parent_id)
+        if not ok:
+            return False, error
+        # Stage 3.9 fix: re-parenting instance_id can change every
+        # DESCENDANT's effective world-attachment too, not just its own --
+        # e.g. `folder.Parent = nil` must also disable/detach a Part two
+        # levels below folder, even though that Part's own _parent_overlay
+        # entry never changes (_is_world_attached() walks the whole chain,
+        # so its result for a descendant depends on instance_id's new
+        # position). Snapshot descendants + their BEFORE attachment state
+        # first, since descendants_of() itself depends on parent_of(),
+        # which depends on the overlay we're about to mutate.
+        descendants = self.descendants_of(instance_id)
+        before_states = {instance_id: self._is_world_attached(instance_id)}
+        for descendant_id in descendants:
+            before_states[descendant_id] = self._is_world_attached(descendant_id)
+        self._parent_overlay[instance_id] = _NIL_PARENT if new_parent_id is None else new_parent_id
+        for target_id, was_attached in before_states.items():
+            is_attached = self._is_world_attached(target_id)
+            if was_attached != is_attached:
+                self._sync_world_attachment(target_id, is_attached)
+        return True, None
+
+    def _is_world_attached(self, instance_id: str) -> bool:
+        """True iff instance_id's Parent chain reaches a ROOT_SERVICES
+        string (or "game") without ever passing through a nil parent --
+        i.e. it is genuinely reachable from the DataModel, matching
+        Roblox's own rule for whether an Instance is "in the game"
+        (rendered/simulated) at all. An instance with Parent == nil, or
+        parented under an ancestor that is ITSELF nil-parented (however
+        many levels up), is not world-attached. Bounded by a visited-set,
+        same defensive reasoning as _would_create_cycle()."""
+        from shared.object_registry import ROOT_SERVICES
+        walker: Optional[str] = instance_id
+        seen: set[str] = set()
+        while walker is not None:
+            if walker == "game" or walker in ROOT_SERVICES:
+                return True
+            if walker in seen:
+                return False
+            seen.add(walker)
+            walker = self.parent_of(walker)
+        return False
+
+    def _sync_world_attachment(self, instance_id: str, attached: bool) -> None:
+        """Shows/hides a has_3d_entity instance's Entity and adds/removes
+        its physics body to match a Parent-chain attachment transition
+        (called only from set_parent(), only when _is_world_attached()'s
+        result actually changed). Mirrors destroy()'s own entity.enabled
+        = False + physics removal, for a different reason (nil-parenting
+        instead of :Destroy()). A runtime instance that has never had an
+        Entity built yet (every fresh Clone() -- see its own docstring)
+        gets one built here, lazily, the first time it actually becomes
+        attached; non-has_3d_entity classes (Folder, Value instances, ...)
+        are a no-op, same as they are everywhere else in this class."""
+        class_name = self.class_name_of(instance_id)
+        definition = self._definition(class_name) if class_name else None
+        if definition is None or not definition.has_3d_entity:
+            return
+        entity = self._entity_for(instance_id)
+        properties = self._merged_properties(instance_id)
+        if attached:
+            if entity is None:
+                item = self._runtime.get(instance_id)
+                if item is None:
+                    return
+                entity = self.game._build_part_entity(properties)
+                if entity is None:
+                    return
+                item.entity = entity
+                self.game.parts[instance_id] = entity
+            else:
+                try:
+                    entity.enabled = True
+                except Exception:
+                    pass
+            if self._physics is not None and not self._physics.has_body(instance_id):
+                self._physics.add_part(
+                    instance_id, entity, properties.get("Position", [0.0, 0.0, 0.0]),
+                    properties.get("Rotation", [0.0, 0.0, 0.0]), properties.get("Size", [1.0, 1.0, 1.0]),
+                    bool(properties.get("Anchored", True)), bool(properties.get("CanCollide", True)),
+                )
+        else:
+            if entity is not None:
+                try:
+                    entity.enabled = False
+                except Exception:
+                    pass
+            if self._physics is not None and self._physics.has_body(instance_id):
+                self._physics.remove_part(instance_id)
+                self._physics.wake_all_dynamic()
+
+    # ---------------- Clone (Stage 3.9) ----------------
+
+    def clone(self, instance_id: str) -> tuple[bool, str]:
+        """Always returns a NEW, independent runtime-only instance (never
+        the original id) -- matches Roblox's :Clone() in that respect even
+        when the original itself is an AUTHORED instance.
+
+        Stage 3.9 fix: a fresh clone now genuinely starts with Parent ==
+        nil, matching real Roblox -- it used to be parented alongside the
+        original immediately, documented at the time as a deliberate
+        simplification, but that made a cloned Part visibly appear in the
+        world (and gain a real physics body) before the developer ever
+        chose to put it anywhere, which is both wrong and -- worse --
+        actively misleading during manual verification (an untouched
+        clone left sitting in Workspace is indistinguishable from a
+        genuinely-still-alive original). Because Parent starts nil, and
+        _is_world_attached()/_sync_world_attachment() (see set_parent())
+        only give a has_3d_entity instance a real Entity/physics body
+        once it is actually reachable from a root, NO Entity is built
+        here at all -- it is built lazily, the first time the caller
+        does `clone.Parent = workspace` (or any other real location)."""
+        if len(self._runtime) >= MAX_RUNTIME_INSTANCES:
+            return False, f"runtime instance limit reached ({MAX_RUNTIME_INSTANCES})"
+        if not self.exists(instance_id):
+            return False, "attempt to clone a destroyed Instance"
+        class_name = self.class_name_of(instance_id)
+        definition = self._definition(class_name) if class_name else None
+        if definition is None:
+            return False, f"cannot clone an instance of unknown class {class_name}"
+        if class_name in _LUA_UNCREATABLE_CLASSES:
+            # Same reasoning as instance_new()'s own denylist check (see
+            # _LUA_UNCREATABLE_CLASSES' module-level comment): a cloned
+            # Script/LocalScript/ModuleScript would never actually run (the
+            # execution plan is built once at Play start), and a cloned
+            # StarterPlayerScripts can't be validated against the real
+            # server-enforced singleton rule -- silently allowing either
+            # would mislead a developer more than a clear, upfront error.
+            return False, f"{class_name} instances cannot be cloned at runtime"
+        name = self.name_of(instance_id) or class_name
+
+        # _merged_properties() is already fully generic (base properties +
+        # self._overlay, neither of which is has_3d_entity-specific), so
+        # it works unchanged for Value instances/Folders too.
+        properties = dict(self._merged_properties(instance_id))
+
+        self._next_runtime_index += 1
+        runtime_id = f"{_RUNTIME_ID_PREFIX}{self._next_runtime_index}"
+        item = _RuntimeCreated(
+            id=runtime_id, class_name=class_name, parent_id=None,
+            name=name, properties=properties, entity=None,
+        )
+        self._runtime[runtime_id] = item
+        self._parent_overlay[runtime_id] = _NIL_PARENT
+        _debug(f"Clone({instance_id!r}) -> {runtime_id} (Parent=nil)")
+        return True, runtime_id
 
     def set_property(self, instance_id: str, key: str, value: Any) -> tuple[bool, Optional[str]]:
         from shared.object_registry import ROOT_SERVICES
@@ -944,13 +1569,29 @@ class RuntimeSceneLayer:
                 return False, "Name must be a string"
             self._name_overlay[instance_id] = value
             return True, None
-        if key in ("ClassName", "Parent"):
-            return False, f"'{key}' cannot be assigned to in this API version"
+        if key == "ClassName":
+            return False, "ClassName cannot be assigned to"
+        if key == "Parent":
+            return self.set_parent(instance_id, value)
 
         class_name = self.class_name_of(instance_id)
         definition = self._definition(class_name) if class_name else None
-        if definition is None or not definition.has_3d_entity:
+        if definition is None:
             return False, f"'{key}' is not a valid member of {class_name}"
+
+        if not definition.has_3d_entity:
+            # Stage 3.9: generic schema-driven property write, the set-side
+            # mirror of the get_property() fallback above -- see its
+            # comment. Validation mirrors sanitize_properties_for_type()'s
+            # per-kind rules in shared/object_registry.py.
+            if key not in definition.property_schema:
+                return False, f"'{key}' is not a valid member of {class_name}"
+            spec = definition.property_schema[key]
+            ok, sanitized = _sanitize_lua_value_for_spec(spec, value)
+            if not ok:
+                return False, sanitized
+            self._overlay.setdefault(instance_id, {})[key] = sanitized
+            return True, None
 
         try:
             if key in ("Position", "Rotation", "Size"):
@@ -1044,42 +1685,84 @@ class RuntimeSceneLayer:
         if len(self._runtime) >= MAX_RUNTIME_INSTANCES:
             return False, f"runtime instance limit reached ({MAX_RUNTIME_INSTANCES})"
         definition = self._definition(class_name)
-        if definition is None or class_name not in ("Part", "Model", "Folder"):
+        # Stage 3.9: schema-driven instead of a hardcoded ("Part", "Model",
+        # "Folder") allowlist -- any class the registry marks creatable and
+        # not editor-only qualifies, MINUS _LUA_UNCREATABLE_CLASSES (see its
+        # module-level comment for why those specific classes are excluded
+        # even though the editor's Insert Object dialog allows them).
+        if (
+            definition is None
+            or not definition.creatable
+            or definition.editor_only
+            or class_name in _LUA_UNCREATABLE_CLASSES
+        ):
             return False, f"Instance.new(\"{class_name}\") is not supported in this API version"
         if parent_id is not None and not self.exists(parent_id):
             return False, "parent does not exist"
+
+        from shared import object_registry
+        from shared.object_registry import ROOT_SERVICES
+        if parent_id is not None:
+            parent_type_id = parent_id if parent_id in ROOT_SERVICES else self.class_name_of(parent_id)
+            if not object_registry.is_parent_allowed(class_name, parent_type_id):
+                return False, f"{class_name} cannot be parented to {parent_type_id or 'nil'}"
 
         self._next_runtime_index += 1
         runtime_id = f"{_RUNTIME_ID_PREFIX}{self._next_runtime_index}"
         default_name = class_name
         properties = dict(definition.default_properties)
-        entity = None
         if definition.has_3d_entity:
             properties.setdefault("Position", [0.0, 0.0, 0.0])
             properties.setdefault("Rotation", [0.0, 0.0, 0.0])
             properties.setdefault("Size", [1.0, 1.0, 1.0])
             properties.setdefault("Color", [255, 255, 255])
             properties.setdefault("Transparency", 0.0)
-            entity = self.game._build_part_entity(properties)
 
         item = _RuntimeCreated(
-            id=runtime_id, class_name=class_name, parent_id=parent_id or "Workspace",
-            name=default_name, properties=properties, entity=entity,
+            id=runtime_id, class_name=class_name, parent_id=None,
+            name=default_name, properties=properties, entity=None,
         )
         self._runtime[runtime_id] = item
-        if entity is not None and definition.has_3d_entity:
-            self.game.parts[runtime_id] = entity
-            if self._physics is not None:
-                self._physics.add_part(
-                    runtime_id, entity, properties["Position"], properties["Rotation"], properties["Size"],
-                    bool(properties.get("Anchored", True)), bool(properties.get("CanCollide", True)),
-                )
-        _debug(f"Instance.new({class_name!r}) -> {runtime_id}")
+
+        if parent_id is None:
+            # Stage 3.9 fix: matches Clone()'s already-fixed behavior (see
+            # clone()'s docstring) -- Instance.new(className) with no
+            # parent argument now genuinely starts Parent == nil instead
+            # of the old eager "defaults to Workspace, immediately visible
+            # and physical" behavior. No Entity/physics body is built here
+            # at all; both are created lazily the first time the caller
+            # does `instance.Parent = workspace` (or any other real
+            # location) -- see _sync_world_attachment().
+            self._parent_overlay[runtime_id] = _NIL_PARENT
+        else:
+            item.parent_id = parent_id
+            if definition.has_3d_entity:
+                entity = self.game._build_part_entity(properties)
+                if entity is not None:
+                    item.entity = entity
+                    self.game.parts[runtime_id] = entity
+                    if self._physics is not None:
+                        self._physics.add_part(
+                            runtime_id, entity, properties["Position"], properties["Rotation"], properties["Size"],
+                            bool(properties.get("Anchored", True)), bool(properties.get("CanCollide", True)),
+                        )
+        _debug(f"Instance.new({class_name!r}) -> {runtime_id} (parent={parent_id!r})")
         return True, runtime_id
 
     def destroy(self, instance_id: str) -> None:
         if instance_id in ("game", "Workspace") or instance_id in self._deleted:
             return
+        # Stage 3.9 fix: Destroy() must cascade to every descendant, same
+        # root cause as set_parent()'s attachment cascade above -- without
+        # this, a destroyed container's children stayed exists()==True,
+        # fully rendered/physical, and script-running/signal-firing for
+        # the rest of the Play session; only the container itself actually
+        # became unreachable via GetChildren(). Snapshot the descendant
+        # list BEFORE destroying anything: descendants_of() walks
+        # children_of()/parent_of(), which would stop finding a child the
+        # instant its own parent is marked deleted.
+        for descendant_id in self.descendants_of(instance_id):
+            self.destroy(descendant_id)
         self._deleted.add(instance_id)
         item = self._runtime.pop(instance_id, None)
         had_body = self._physics is not None and self._physics.has_body(instance_id)
@@ -1129,6 +1812,18 @@ class _ScheduledEntry:
     # below. Not used by anything from Stage 3.0-3.4.
     signal_id: Optional[int] = None
     started: bool = False
+    # Stage 3.9 lifecycle fix: True iff this entry was created through
+    # _count_task() (an explicit task.spawn/defer/delay call), as opposed
+    # to a script's own top-level entry from start_script() (never
+    # counted against MAX_QUEUED_TASKS_PER_SCRIPT in the first place, see
+    # schedule_immediate()'s docstring). Propagated unchanged across every
+    # reschedule of the SAME logical task (e.g. a task.spawn'd function
+    # that itself calls task.wait() gets a NEW _ScheduledEntry object with
+    # the same co_id, but it's still the same counted task) -- only the
+    # entry that reaches a truly terminal state (_resume() sees the
+    # coroutine finish/error, or the entry is cancelled) triggers exactly
+    # one _release_task() call, via this flag.
+    counted: bool = False
 
 
 class LuaTaskScheduler:
@@ -1168,11 +1863,28 @@ class LuaTaskScheduler:
             remaining = []
             for entry in bucket:
                 if entry.owner_script_id == script_id:
+                    self._release_task(entry)
                     self._close(entry.co_id)
                 else:
                     remaining.append(entry)
             bucket[:] = remaining
-        self._task_counts.pop(script_id, None)
+
+    def cancel_signal(self, signal_id: int) -> None:
+        """Stage 3.9 lifecycle fix: releases every coroutine currently
+        parked in a Signal:Wait() for signal_id -- called from
+        bridge_destroy() right before __signal_destroy() drops the
+        registry entry those waiters were waiting on, so a Wait() on a
+        just-destroyed Instance's signal doesn't sit blocked for the rest
+        of the session with nothing left that could ever resume it."""
+        for bucket in (self._pending, self._deferred):
+            remaining = []
+            for entry in bucket:
+                if entry.kind == "signal_wait" and entry.signal_id == signal_id:
+                    self._release_task(entry)
+                    self._close(entry.co_id)
+                else:
+                    remaining.append(entry)
+            bucket[:] = remaining
 
     def _close(self, co_id: int) -> None:
         try:
@@ -1181,12 +1893,38 @@ class LuaTaskScheduler:
             pass
 
     def _count_task(self, script_id: str) -> bool:
+        """Reserves one ACTIVE/PENDING task slot for script_id -- NOT a
+        lifetime-use counter. Every task this returns True for is
+        guaranteed exactly one matching _release_task() call once it
+        reaches a terminal state (see _release_task()'s own docstring),
+        so a script issuing many short-lived tasks one after another over
+        a long session never approaches the limit; only genuinely
+        simultaneously-active/pending tasks count against it."""
         count = self._task_counts.get(script_id, 0) + 1
         if count > MAX_QUEUED_TASKS_PER_SCRIPT:
             self.manager._report_error(script_id, f"too many queued tasks (limit {MAX_QUEUED_TASKS_PER_SCRIPT})")
             return False
         self._task_counts[script_id] = count
         return True
+
+    def _release_task(self, entry: "_ScheduledEntry") -> None:
+        """The exactly-once counterpart to _count_task() -- called from
+        every place a counted entry reaches a terminal state: _resume()
+        (normal completion, error, or the lupa-call-failure exception
+        path), cancel_owner() (owner destroyed), and cancel_signal()
+        (the signal it was Wait()ing on was destroyed). A no-op for an
+        uncounted entry (entry.counted is False -- e.g. a script's own
+        top-level entry from start_script(), which _count_task() was
+        never called for in the first place). Floor-clamped at 0 and pops
+        the key entirely once it reaches 0, so a stray extra release call
+        can never drive the count negative."""
+        if not entry.counted:
+            return
+        remaining = self._task_counts.get(entry.owner_script_id, 0) - 1
+        if remaining <= 0:
+            self._task_counts.pop(entry.owner_script_id, None)
+        else:
+            self._task_counts[entry.owner_script_id] = remaining
 
     # ---------------- entry points called from the Lua "task" bridge ----------------
 
@@ -1225,7 +1963,7 @@ class LuaTaskScheduler:
             return
         entry = _ScheduledEntry(
             co_id=co_id, owner_script_id=owner, kind="wait_seconds", deadline=0.0,
-            args=self._args_tuple(args_table),
+            args=self._args_tuple(args_table), counted=True,
         )
         self._resume(entry)
 
@@ -1244,7 +1982,7 @@ class LuaTaskScheduler:
         otherwise read from current_script_id."""
         if not self._count_task(owner_script_id):
             return
-        entry = _ScheduledEntry(co_id=co_id, owner_script_id=owner_script_id, kind="wait_seconds", deadline=0.0, args=tuple(args))
+        entry = _ScheduledEntry(co_id=co_id, owner_script_id=owner_script_id, kind="wait_seconds", deadline=0.0, args=tuple(args), counted=True)
         self._resume(entry)
 
     def mark_signal_fired(self, signal_id: int, args: tuple) -> None:
@@ -1261,7 +1999,7 @@ class LuaTaskScheduler:
         if owner is None or not self._count_task(owner):
             return
         self._deferred.append(_ScheduledEntry(
-            co_id=co_id, owner_script_id=owner, kind="deferred", args=self._args_tuple(args_table),
+            co_id=co_id, owner_script_id=owner, kind="deferred", args=self._args_tuple(args_table), counted=True,
         ))
 
     def schedule_delayed(self, co_id: int, seconds: float, args_table: Any = None) -> None:
@@ -1271,7 +2009,7 @@ class LuaTaskScheduler:
         deadline = _time.monotonic() + max(0.0, float(seconds))
         self._pending.append(_ScheduledEntry(
             co_id=co_id, owner_script_id=owner, kind="wait_seconds", deadline=deadline,
-            args=self._args_tuple(args_table),
+            args=self._args_tuple(args_table), counted=True,
         ))
 
     # ---------------- per-frame update ----------------
@@ -1286,8 +2024,22 @@ class LuaTaskScheduler:
                 break
 
         now = _time.monotonic()
+        # Stage 3.9 fix: a resumed entry's script can itself call
+        # cancel_owner() for a DIFFERENT entry already visited earlier in
+        # THIS SAME pass (e.g. Destroy() on a container cascades to cancel
+        # a nested Script's own pending task.wait()/WaitForChild()/
+        # Signal:Wait()) -- cancel_owner() mutates self._pending directly,
+        # but the old code built a separate still_pending list and blindly
+        # overwrote self._pending with it at the end, silently UNDOING any
+        # such mid-pass cancellation (the cancelled entry was already
+        # copied into still_pending before its cancellation happened).
+        # Snapshotting here and reconciling by identity below respects
+        # both a mid-pass cancel_owner() removal AND a mid-pass _resume()
+        # re-scheduling (a resumed entry that yields again pushes a new
+        # entry straight onto self._pending, which must not be lost either).
+        pending_snapshot = list(self._pending)
         still_pending: list[_ScheduledEntry] = []
-        for entry in self._pending:
+        for entry in pending_snapshot:
             if _time.monotonic() - frame_start > MAX_FRAME_WALL_TIME:
                 still_pending.append(entry)
                 continue
@@ -1313,9 +2065,37 @@ class LuaTaskScheduler:
                     still_pending.append(entry)
             else:
                 still_pending.append(entry)
-        self._pending = still_pending
+        current_ids = {id(e) for e in self._pending}
+        snapshot_ids = {id(e) for e in pending_snapshot}
+        kept = [e for e in still_pending if id(e) in current_ids]
+        newly_scheduled = [e for e in self._pending if id(e) not in snapshot_ids]
+        self._pending = kept + newly_scheduled
 
     def _resume(self, entry: _ScheduledEntry, resume_value: Any = None) -> None:
+        # Stage 3.9 fix: _resume() is REENTRANT. schedule_immediate()/
+        # schedule_immediate_external() (task.spawn()'s and a dispatched
+        # signal listener's own scheduling path) call this SYNCHRONOUSLY,
+        # from within the Lua "task"/signal bridge, while an OUTER
+        # coroutine may already be mid-resume (its own call to this same
+        # method still on the Python call stack) -- e.g. a script's own
+        # top-level coroutine calling task.spawn(fn) resumes fn's new
+        # coroutine via a nested _resume() call before the outer
+        # coroutine's own Lua execution ever continues.
+        #
+        # The old code unconditionally reset self.current_script_id to
+        # None on every exit path, instead of restoring whatever it was
+        # BEFORE this particular call started. For a nested call, that
+        # wiped out the OUTER coroutine's own "who am I" context the
+        # instant the FIRST task.spawn()'d child finished -- so every
+        # task.spawn()/task.defer()/task.delay() call after the first one
+        # in the same script execution read current_script_id as None and
+        # silently no-op'd (schedule_immediate()'s `if owner is None:
+        # return` guard swallows it -- no error, nothing scheduled).
+        # From the outside this looked exactly like "a Lua for loop
+        # calling task.spawn() repeatedly stops after one iteration" --
+        # it didn't: the loop ran to completion every time, only the
+        # FIRST task.spawn() call in it ever actually scheduled anything.
+        previous_script_id = self.current_script_id
         self.current_script_id = entry.owner_script_id
         self.manager._install_hook(entry.co_id)  # fresh per-resume budget -- see _install_hook docstring
         try:
@@ -1338,9 +2118,11 @@ class LuaTaskScheduler:
                 result = resume(entry.co_id, *entry.args)
         except Exception as exc:  # pragma: no cover -- lupa call machinery itself failing
             self.manager._report_error(entry.owner_script_id, f"scheduler error: {exc}")
-            self.current_script_id = None
+            self.current_script_id = previous_script_id
+            self._release_task(entry)
+            self._close(entry.co_id)
             return
-        self.current_script_id = None
+        self.current_script_id = previous_script_id
 
         if isinstance(result, tuple):
             ok = result[0]
@@ -1350,11 +2132,19 @@ class LuaTaskScheduler:
 
         if not ok:
             self.manager._report_error(entry.owner_script_id, str(payload))
+            self._release_task(entry)
+            self._close(entry.co_id)
             return
 
         status = self.manager.lua.globals()["__registry_status"](entry.co_id)
         if status == "dead":
-            return  # task finished normally, nothing left to reschedule
+            # Stage 3.9 lifecycle fix: task finished normally, nothing
+            # left to reschedule -- release its counted slot AND prune
+            # its now-dead coroutine_registry entry (previously left
+            # behind forever; see __registry_close's own docstring).
+            self._release_task(entry)
+            self._close(entry.co_id)
+            return
 
         kind = self._payload_field(payload, "kind")
         if kind == "wait_seconds":
@@ -1362,6 +2152,7 @@ class LuaTaskScheduler:
             self._pending.append(_ScheduledEntry(
                 co_id=entry.co_id, owner_script_id=entry.owner_script_id,
                 kind="wait_seconds", deadline=_time.monotonic() + float(seconds), started=True,
+                counted=entry.counted,
             ))
             return
         if kind == "wait_for_child":
@@ -1370,6 +2161,7 @@ class LuaTaskScheduler:
                 kind="wait_for_child", parent_id=self._payload_field(payload, "parent_id"),
                 child_name=self._payload_field(payload, "name"),
                 deadline=self._payload_field(payload, "deadline"), started=True,
+                counted=entry.counted,
             ))
             return
         if kind == "signal_wait":
@@ -1381,6 +2173,7 @@ class LuaTaskScheduler:
             self._pending.append(_ScheduledEntry(
                 co_id=entry.co_id, owner_script_id=entry.owner_script_id,
                 kind="signal_wait", signal_id=self._payload_field(payload, "signal_id"), started=True,
+                counted=entry.counted,
             ))
             return
         # Unrecognized yield (e.g. a bare coroutine.yield() with no
@@ -1388,7 +2181,7 @@ class LuaTaskScheduler:
         # silently dropping the task.
         self._pending.append(_ScheduledEntry(
             co_id=entry.co_id, owner_script_id=entry.owner_script_id,
-            kind="wait_seconds", deadline=0.0, started=True,
+            kind="wait_seconds", deadline=0.0, started=True, counted=entry.counted,
         ))
 
 
@@ -1673,6 +2466,74 @@ class LuaRuntimeManager:
         if not self._active or self.lua is None:
             return
         self.scheduler.update()
+        self._poll_touched()
+
+    # ---------------- signal firing (shared by Touched and lua_gameplay_api.py) ----------------
+
+    def fire_signal(self, signal_id: int, args: tuple) -> None:
+        """ONE shared dispatch path for every built-in signal this engine
+        fires from Python (Touched here, PlayerAdded/CharacterAdded/
+        InputBegan/... in lua_gameplay_api.py's LuaGameplayContext) --
+        creates one fresh coroutine per currently-connected listener
+        (done entirely in Lua, see __signal_fire's docstring in the
+        prelude), resumes each one through the normal scheduler path so
+        budget/error-isolation apply uniformly, and unblocks any
+        :Wait() callers via mark_signal_fired() (both mechanisms share the
+        same signal_id). A no-op if the runtime isn't active or the
+        signal_id is unknown/already gone."""
+        if not self._active or self.lua is None:
+            return
+        self.scheduler.mark_signal_fired(signal_id, args)
+        lua_args = self.lua.table_from(list(args)) if args else self.lua.table_from([])
+        dispatch = self.lua.globals()["__signal_fire"](signal_id, lua_args)
+        if dispatch is None:
+            return
+        try:
+            items = list(dispatch.values())
+        except AttributeError:
+            items = list(dispatch)
+        for item in items:
+            co_id = item["co_id"]
+            owner = item["owner"]
+            owner_script_id = str(owner) if owner is not None else "<engine>"
+            self.scheduler.schedule_immediate_external(owner_script_id, co_id, args)
+
+    # ---------------- Touched (physics-driven, see physics.py) ----------------
+
+    def _poll_touched(self) -> None:
+        physics = self.scene._physics
+        if physics is None:
+            return
+        new_pairs = physics.poll_new_contacts()
+        if not new_pairs:
+            return
+        for a, b in new_pairs:
+            self._fire_touched(a, b)
+            self._fire_touched(b, a)
+
+    def _fire_touched(self, instance_id: str, other_id: str) -> None:
+        signals = self.scene._instance_signals.get(instance_id)
+        if not signals:
+            return
+        signal_id = signals.get("Touched")
+        if signal_id is None:
+            return
+        if other_id == "__character__":
+            # Stage 3.9: the player character is not a RuntimeSceneLayer
+            # Instance (see physics.py's register_external_node() and
+            # client_studio.py's _start_character()) -- pass the SAME
+            # Character proxy `local character = Players.LocalPlayer.
+            # Character` already returns, rather than an Instance proxy
+            # that would error the moment a script read `.Name` off it.
+            # No-ops (does not fire) if the gameplay layer isn't active or
+            # the character isn't currently valid -- matches every other
+            # gameplay signal's own "no character, no event" behavior.
+            if self.gameplay is None or not getattr(self.gameplay, "_character_valid", False):
+                return
+            other_proxy = self.lua.eval("__gameplay_character_proxy")
+        else:
+            other_proxy = self.lua.eval("__make_proxy")(other_id)
+        self.fire_signal(signal_id, (other_proxy,))
 
     def stop(self) -> None:
         """Must complete before the caller's physics/editor Stop-restore
@@ -1864,7 +2725,20 @@ class LuaRuntimeManager:
         scene = self.scene
 
         def bridge_get(instance_id: Any, key: Any) -> tuple:
-            kind, value = scene.get_property(str(instance_id), str(key))
+            instance_id = str(instance_id)
+            key = str(key)
+            kind, value = scene.get_property(instance_id, key)
+            if kind == "error":
+                # Roblox convention (relied on by the Stage 3.9 spec's own
+                # example, `workspace.Baseplate:Destroy()`): `instance.Foo`
+                # falls back to "the child named Foo" whenever Foo isn't a
+                # recognized property/method/signal -- tried AFTER every
+                # other lookup (methods/signals/real properties always
+                # win), so a Part named e.g. "Position" still can't shadow
+                # the real Position property.
+                child_id = scene.find_first_child(instance_id, key)
+                if child_id is not None:
+                    return "instance", child_id
             if kind in ("vector3", "color3"):
                 return kind, self.lua.table_from([float(v) for v in value])
             return kind, value
@@ -1890,11 +2764,50 @@ class LuaRuntimeManager:
             return scene.full_name_of(str(instance_id))
 
         def bridge_destroy(instance_id: Any) -> None:
-            script_id = str(instance_id)
-            if self.game.instances.get(script_id) is not None and \
-               self.game.instances[script_id].class_name in ("Script", "LocalScript"):
-                self.scheduler.cancel_owner(script_id)
-            scene.destroy(script_id)
+            target_id = str(instance_id)
+            # Stage 3.9 fix: RuntimeSceneLayer.destroy() itself now cascades
+            # to descendants (render/physics/exists()), but a running
+            # Script/LocalScript's scheduled coroutine is cancelled here,
+            # one level up -- so cancellation must ALSO walk descendants,
+            # not just the exact id Destroy() was called on, otherwise a
+            # Script nested under a destroyed Folder/Model kept running
+            # (and its own signal connections stayed live) even though its
+            # ancestor was gone. Scripts/LocalScripts can only ever be
+            # AUTHORED instances (denylisted from Instance.new()/Clone(),
+            # see _LUA_UNCREATABLE_CLASSES), so game.instances is the
+            # complete place to look them up. Computed BEFORE scene.destroy()
+            # runs: its own cascade would stop descendants_of() from finding
+            # anything once the walk it's mid-cascading reaches them.
+            for candidate_id in (target_id, *scene.descendants_of(target_id)):
+                record = self.game.instances.get(candidate_id)
+                if record is not None and record.class_name in ("Script", "LocalScript"):
+                    # "owned by" cleanup: cancel this script's own
+                    # scheduled tasks/waits, AND disconnect every
+                    # :Connect()/:Once() listener IT registered on any
+                    # OTHER (possibly still-alive) Instance's signal --
+                    # otherwise a destroyed script's dangling listener
+                    # closures keep firing/keep getting scheduled forever,
+                    # nothing else ever calls Disconnect() on them.
+                    self.scheduler.cancel_owner(candidate_id)
+                    try:
+                        self.lua.globals()["__signal_disconnect_owner"](candidate_id)
+                    except Exception:
+                        pass
+                # "targeting" cleanup: this instance's OWN built-in
+                # signals (currently just Touched) -- release any
+                # Signal:Wait() waiters blocked on them, then drop the
+                # whole registry entry (and every listener closure with
+                # it) so nothing keeps them referenced just because a
+                # destroyed instance's signal_id is still a dict key here.
+                signals = scene._instance_signals.pop(candidate_id, None)
+                if signals:
+                    for signal_id in signals.values():
+                        self.scheduler.cancel_signal(signal_id)
+                        try:
+                            self.lua.globals()["__signal_destroy"](signal_id)
+                        except Exception:
+                            pass
+            scene.destroy(target_id)
 
         def bridge_instance_new(class_name: Any, parent_id: Any) -> tuple:
             if len(self.scene._runtime) > MAX_RUNTIME_INSTANCES:
@@ -1952,6 +2865,32 @@ class LuaRuntimeManager:
         def bridge_current_script_id() -> Optional[str]:
             return self.scheduler.current_script_id
 
+        # Stage 3.9: per-instance built-in signals (currently only
+        # Touched). Lazily creates the underlying __signal_new() the FIRST
+        # time any script reads `part.Touched` for a given instance,
+        # rather than eagerly creating one for every Part up front --
+        # mirrors _instance_signals' own "dict of dicts, populated on
+        # demand" design. Existence/class checks reuse the exact same
+        # scene.exists()/is_a() every other Instance member access already
+        # goes through, so an error here reads the same as any other
+        # "not a valid member" case.
+        def bridge_get_signal(instance_id: Any, name: Any) -> tuple:
+            instance_id = str(instance_id)
+            name = str(name)
+            if not scene.exists(instance_id):
+                return False, "attempt to use a destroyed Instance"
+            if name == "Touched" and not scene.is_a(instance_id, "Part"):
+                return False, f"'{name}' is not a valid member of {scene.class_name_of(instance_id)}"
+            signals = scene._instance_signals.setdefault(instance_id, {})
+            signal_id = signals.get(name)
+            if signal_id is None:
+                signal_id = int(self.lua.globals()["__signal_new"]())
+                signals[name] = signal_id
+            return True, signal_id
+
+        def bridge_clone(instance_id: Any) -> tuple:
+            return scene.clone(str(instance_id))
+
         g["__bridge_get"] = bridge_get
         g["__bridge_set"] = bridge_set
         g["__bridge_find_first_child"] = bridge_find_first_child
@@ -1965,6 +2904,8 @@ class LuaRuntimeManager:
         g["__bridge_require"] = bridge_require
         g["__bridge_get_service"] = bridge_get_service
         g["__bridge_current_script_id"] = bridge_current_script_id
+        g["__bridge_get_signal"] = bridge_get_signal
+        g["__bridge_clone"] = bridge_clone
         g["__bridge_schedule_immediate"] = self.scheduler.schedule_immediate
         g["__bridge_schedule_deferred"] = self.scheduler.schedule_deferred
         g["__bridge_schedule_delayed"] = self.scheduler.schedule_delayed

@@ -46,7 +46,7 @@ ROOT_SERVICES: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class PropertySpec:
-    kind: str  # "vector3" | "size3" | "color" | "bool" | "float" | "float01" | "string"
+    kind: str  # "vector3" | "size3" | "color" | "bool" | "float" | "float01" | "int" | "string"
     max_len: int = 64  # используется только для kind == "string"
 
 
@@ -173,6 +173,9 @@ def sanitize_properties_for_type(type_id: str, raw_properties: Any) -> dict[str,
         elif spec.kind == "float01":
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 clean[key] = max(0.0, min(1.0, float(value)))
+        elif spec.kind == "int":
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                clean[key] = int(value)
         elif spec.kind == "string":
             if isinstance(value, str):
                 clean[key] = value[: spec.max_len]
@@ -493,6 +496,43 @@ def _register_defaults() -> None:
         editor_only=True,
         inspector_sections=("placeholder",),
     ))
+
+    # Stage 3.9: minimal gameplay-state primitives (score counters, flags,
+    # ...). Deliberately generic -- a single "Value" property per class,
+    # driven entirely through the same PropertySpec machinery every other
+    # non-Part type already uses (see RuntimeSceneLayer's generic
+    # get_property/set_property fallback in lua_runtime.py), so there is no
+    # parallel property system. allowed_parent_types is left empty (allowed
+    # anywhere a Parent can point) rather than restricted to containers:
+    # unlike Folder/Model, a Value instance is commonly parented directly to
+    # a leaf object (e.g. a Part acting as a pickup, or a player-tracking
+    # container) and gains nothing from being container-only. NOTE: Players.
+    # LocalPlayer is a Lua-side proxy object owned by LuaGameplayContext, not
+    # a RuntimeSceneLayer hierarchy instance -- `.Parent = player` from the
+    # spec's example is therefore not literally supported (there is no
+    # Instance for it to parent under); use a Folder under the player's
+    # Character or Workspace instead. This is a deliberate, documented scope
+    # decision (see Stage 3.9 report), not an oversight.
+    for _value_type in ("BoolValue", "IntValue", "NumberValue", "StringValue"):
+        _value_kind, _value_default = {
+            "BoolValue": ("bool", False),
+            "IntValue": ("int", 0),
+            "NumberValue": ("float", 0.0),
+            "StringValue": ("string", ""),
+        }[_value_type]
+        register_object_type(ObjectTypeDefinition(
+            type_id=_value_type,
+            display_name=_value_type,
+            category="Values",
+            description="Holds a single gameplay value, readable and writable from Lua.",
+            icon="value",
+            default_parent="Workspace",
+            allowed_parent_types=(),
+            keywords=("value", "state", "score", "variable"),
+            default_properties={"Value": _value_default},
+            property_schema={"Value": PropertySpec(_value_kind)},
+            inspector_sections=("value",),
+        ))
 
 
 _register_defaults()

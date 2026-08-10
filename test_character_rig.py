@@ -552,6 +552,55 @@ def test_v_key_wired_in_play_mode_input() -> None:
     check('key == "v"' in src and "toggle_third_person" in src, "input(): 'v' key routes to toggle_third_person() in Play mode")
 
 
+def test_e_no_longer_spawns_a_part_in_editor_or_play_mode() -> None:
+    """Stage 3.9 input-binding cleanup: 'e' used to spawn a debug Part via
+    request_create_instance() in BOTH the editor-mode branch and the
+    Play-mode branch of input() -- the Play-mode one in particular meant
+    every 'E' press during a real gameplay session silently created an
+    authored, network-synced Part in addition to whatever a LocalScript's
+    own InputBegan handler did, which is exactly the kind of hidden
+    duplicate binding that made a Stage 3.9 vertical-slice E-key test
+    misleading. Both call sites are gone; input() must never match
+    'key == "e"' at all now."""
+    src = _source(cs.MultiplayerGame.input)
+    check('key == "e"' not in src, "input(): no 'e' branch remains anywhere (editor or Play mode)")
+    check(src.count('request_create_instance("Part")') == 0, "input(): request_create_instance('Part') is never called from a raw key handler anymore")
+
+
+def test_flight_camera_uses_q_and_e_not_ctrl_and_shift() -> None:
+    """The editor-only noclip fly camera's down-movement/speed-boost
+    modifiers moved from bare Ctrl/Shift to Q/E (freeing Ctrl/Shift up,
+    and giving Q/E their old direction/meaning: Q still moves down,
+    paired with Space moving up; E still boosts speed) -- update_flight()
+    only ever runs while `not self.studio_playing` (see its own call
+    site), so this can never shadow UserInputService's InputBegan/
+    InputEnded for E/Q during an actual Play session."""
+    src = _source(cs.MultiplayerGame.update_flight)
+    check('held_keys["q"]' in src, "update_flight(): reads Q for downward movement")
+    check('held_keys["e"]' in src, "update_flight(): reads E for the speed boost")
+    check('held_keys["control"]' not in src and 'held_keys["left control"]' not in src, "update_flight(): no longer reads Ctrl at all")
+    check('held_keys["shift"]' not in src and 'held_keys["left shift"]' not in src, "update_flight(): no longer reads Shift at all")
+
+
+def test_e_and_q_still_reach_user_input_service_unconsumed() -> None:
+    """input()'s purely-additive on_key_event() forward to
+    UserInputService must still run for every Play-mode key -- including
+    E and Q -- before any of the (now E/Q-free) elif branches below it,
+    so a LocalScript's InputBegan/InputEnded listeners for KeyCode E/Q
+    are never starved by editor-only bindings that don't even run in
+    Play mode to begin with."""
+    src = _source(cs.MultiplayerGame.input)
+    forward_index = src.index("self._lua_gameplay.on_key_event(key)")
+    # Search for the first Play-mode 'elif key ==' STARTING FROM
+    # forward_index -- the editor-mode branch (textually earlier in the
+    # function, guarded by its own `if not self.studio_playing: ... return`)
+    # has its own 'elif key ==' chain that would otherwise false-positive
+    # here, even though it's a mutually-exclusive branch this check isn't
+    # about.
+    first_play_elif_index = src.index('elif key ==', forward_index)
+    check(forward_index < first_play_elif_index, "input(): on_key_event() forwarding happens before any Play-mode elif branch")
+
+
 test_select_animation_state_idle()
 test_select_animation_state_walk()
 test_select_animation_state_walk_threshold()
@@ -603,6 +652,9 @@ test_character_rig_module_never_touches_legacy_playervisual()
 test_start_character_never_touches_legacy_playervisual()
 test_toggle_third_person_prefers_new_rig()
 test_v_key_wired_in_play_mode_input()
+test_e_no_longer_spawns_a_part_in_editor_or_play_mode()
+test_flight_camera_uses_q_and_e_not_ctrl_and_shift()
+test_e_and_q_still_reach_user_input_service_unconsumed()
 
 print()
 if FAILURES:

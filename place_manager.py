@@ -68,10 +68,17 @@ from shared.object_registry import ROOT_SERVICES, sanitize_properties_for_type
 # ============================================================
 
 SCENE_FORMAT = "nebula-scene"
-# Must stay equal to studio_editor_live.SCENE_FORMAT_VERSION -- both describe
-# the same `.nebula.json` envelope; only the shape of "objects" differs
-# between the offline SceneObject path and this module's Instance path, and
-# open() tells them apart per-file (see _looks_like_legacy_scene_object).
+# The single authoritative version for the canonical, networked Place
+# format this module owns (save()/save_as()/open() below) -- NOT the same
+# counter as studio_editor_live.SCENE_FORMAT_VERSION, which versions the
+# separate, disconnected offline-demo SceneObject path (EngineBridge.
+# serialize()/save_to_file(), reachable only when live_mode=False; the real
+# app always constructs EngineBridge with live_mode=True, see
+# client_studio.main()). Both paths happen to share the same `.nebula.json`
+# envelope shape (`{"format": "nebula-scene", "version": N, "objects": [...]}`),
+# so open() tells the two "objects" shapes apart structurally, per-file (see
+# _looks_like_legacy_scene_object), not by version number -- the two
+# counters are independent and are not expected to match.
 SCENE_FORMAT_VERSION = 3
 
 PROJECT_METADATA_FILENAME = "project.sstudio.json"

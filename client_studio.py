@@ -42,11 +42,12 @@ from websockets.exceptions import ConnectionClosed
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt
 from PySide6.QtGui import QCursor, QWindow
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QWidget
 
 from studio_editor_live import (
     DARK_STYLE,
     EngineBridge,
+    SCENE_FILE_FILTER,
     SceneObject,
     StudioMainWindow,
     Vec3 as EditorVec3,
@@ -425,6 +426,22 @@ GIZMO_NETWORK_SEND_RATE = 25.0
 FLIGHT_SPEED = 8.0
 BOOST_MULTIPLIER = 2.5
 
+# Viewport-interaction rewrite: editor-camera mouse-wheel dolly step
+# (world units moved along the current view direction per wheel tick) --
+# editor mode previously had no scroll-wheel handling at all (scroll was
+# only ever wired for Play-mode third-person zoom, THIRD_PERSON_ZOOM_STEP
+# below). Deliberately its own constant rather than reusing that one --
+# "zoom" there orbits a fixed third-person offset; this dollies the whole
+# free camera through world space, a different feel at a different scale.
+EDITOR_ZOOM_STEP = 1.5
+
+# focus_selected_part() ("F"): camera-back-off distance = bounding-box
+# diagonal * FACTOR, clamped to at least MIN -- a small Part isn't
+# approached until the camera is uncomfortably close, a huge one isn't
+# framed from so far away it reads as a speck.
+FOCUS_DISTANCE_FACTOR = 1.5
+FOCUS_MIN_DISTANCE = 4.0
+
 MOUSE_SENSITIVITY_X = 55.0
 MOUSE_SENSITIVITY_Y = 55.0
 
@@ -464,6 +481,16 @@ MAX_PITCH = 80.0
 # ------------------------------------------------------------
 
 DEBUG_MOUSE_LOOK = False
+
+# Bug-report follow-up: logs the full editor-viewport lifecycle state
+# (viewport_focused, editor_look_active, capture state, current Qt
+# focus widget, cursor positions, computed delta, gizmo.dragging, camera
+# yaw/pitch) at every RMB-look begin/end, every focus-loss detection,
+# and every applicationStateChanged transition -- see
+# MultiplayerGame._log_viewport_lifecycle(). Off by default; flip to
+# True to diagnose a future "RMB look / Alt+Tab recovery" regression
+# without needing to re-derive this instrumentation from scratch.
+DEBUG_VIEWPORT_LIFECYCLE = False
 
 # Логирует container/native-window геометрию вокруг событий, которые, как
 # выяснилось, портят размер встроенного Panda3D-окна (см. коммент у
@@ -1265,6 +1292,17 @@ class MultiplayerGame(Entity):
 
         self.studio_playing = False
         self.editor_look_active = False
+        # Viewport-interaction rewrite: THE single source of truth for
+        # "the editor viewport currently owns keyboard input" -- separate
+        # from editor_look_active (RMB-look/rotation specifically) on
+        # purpose. True the moment any click lands in the viewport (see
+        # PandaWindowFocusFilter), False the moment focus moves to any
+        # other Qt widget or the app loses OS focus (see
+        # release_play_input_capture(), called from both). update()'s
+        # editor-mode branch gates WASD/Space/Q/E flight on THIS flag,
+        # not on editor_look_active -- holding RMB is no longer a
+        # prerequisite for ordinary camera movement.
+        self.viewport_focused = False
         self.player_yaw = 0.0
         self.player_pitch = 0.0
         self.last_send_time = 0.0
@@ -1440,6 +1478,7 @@ class MultiplayerGame(Entity):
 
         if playing:
             self.editor_look_active = False
+            self.viewport_focused = False
             self.local_player.position = Vec3(self.saved_play_position)
             self.player_yaw = self.saved_play_yaw
             self.player_pitch = self.saved_play_pitch
@@ -1488,6 +1527,13 @@ class MultiplayerGame(Entity):
             was_playing = self.studio_playing
             self.studio_playing = False
             self.editor_look_active = False
+            # Stage 3.9 viewport rewrite: deliberately NOT restored to True
+            # here -- "click gives focus" stays the one consistent rule
+            # (see viewport_focused's own docstring at __init__) rather
+            # than a Stop-specific exception; a single click back into the
+            # viewport (the natural next action after Stop) restores WASD
+            # immediately, same as any other focus transfer.
+            self.viewport_focused = False
             self.hud_root.enabled = False
             # Stage 3.7: Stop must work on the first click from EVERY Play
             # input state, including mid-RMB-drag or first-person capture --
@@ -1760,6 +1806,12 @@ class MultiplayerGame(Entity):
             )
             self._character_runtime = runtime
             print(f"[CHARACTER] spawned at {spawn_position}")
+            # Stage 3.9: lets Touched fire when a Part overlaps/contacts the
+            # player (see physics.py's poll_new_contacts() docstring) --
+            # "__character__" is a sentinel id, not a real RuntimeSceneLayer
+            # instance; LuaRuntimeManager._fire_touched() special-cases it.
+            if self._physics_world is not None:
+                self._physics_world.register_external_node("__character__", runtime.controller.node)
 
             visual = character_rig.CharacterVisualRig(initial_yaw_degrees=self.player_yaw)
             visual.set_first_person(not self.third_person_enabled)
@@ -1788,6 +1840,8 @@ class MultiplayerGame(Entity):
             self._character_visual = None
         if self._character_runtime is None:
             return
+        if self._physics_world is not None:
+            self._physics_world.unregister_external_node(self._character_runtime.controller.node)
         self._character_runtime.destroy()
         self._character_runtime = None
         # Always leave the editor camera in its normal first-person
@@ -1907,7 +1961,23 @@ class MultiplayerGame(Entity):
         the viewport to let Escape (or anything else) reach it either --
         a genuine deadlock. Safe to call any time, including when nothing
         is captured or Play isn't running (both branches below are no-ops
-        in that case)."""
+        in that case).
+
+        Viewport-interaction rewrite: also unconditionally resets
+        editor_look_active and viewport_focused -- every caller of this
+        method (Escape, a click landing outside the viewport, the app
+        losing OS foreground focus) is exactly a "the viewport just lost
+        input ownership" event in EDITOR mode too, not just Play. Fixes a
+        real, confirmed-by-code-reading gap: this method used to stop the
+        mouse-look/cursor capture but leave editor_look_active itself
+        True, so update()'s `elif self.editor_look_active and not
+        self.gizmo.dragging:` branch kept calling update_mouse_look()/
+        update_flight() every frame after a focus-loss mid-RMB-drag, even
+        though capture had already been released -- "losing focus must
+        always release captured mouse state safely" (spec) means the
+        FLAG has to go too, not just the cursor's visible state."""
+        self.editor_look_active = False
+        self.viewport_focused = False
         if self._mouse_look_captured():
             self._stop_mouse_look()
             if self.studio_playing:
@@ -1919,6 +1989,7 @@ class MultiplayerGame(Entity):
             # "stuck key" can never survive losing capture for any reason.
             if self._lua_gameplay is not None:
                 self._lua_gameplay.release_all_keys()
+        self._log_viewport_lifecycle("release_play_input_capture")
 
     def play_input_state(self) -> str:
         """Stage 3.7: pure derivation of the current Play input-ownership
@@ -2020,12 +2091,42 @@ class MultiplayerGame(Entity):
             return
         self.editor_look_active = True
         self._start_mouse_look()
+        self._log_viewport_lifecycle("begin_editor_look")
 
     def end_editor_look(self) -> None:
         if self.studio_playing:
             return
         self.editor_look_active = False
         self._stop_mouse_look()
+        self._log_viewport_lifecycle("end_editor_look")
+
+    def _log_viewport_lifecycle(self, label: str) -> None:
+        """Bug-report follow-up instrumentation ("RMB look works
+        initially, then stops rotating the camera" / Alt+Tab recovery) --
+        dumps every piece of state the report asked to have instrumented,
+        in one place, so a future regression here doesn't need this
+        re-derived from scratch. Gated behind DEBUG_VIEWPORT_LIFECYCLE
+        (default False); a no-op call otherwise, safe to sprinkle at
+        every relevant transition point."""
+        if not DEBUG_VIEWPORT_LIFECYCLE:
+            return
+        container = self.qt_viewport_container
+        focus_widget = QApplication.focusWidget()
+        cursor_pos = QCursor.pos()
+        print(
+            f"[VIEWPORT_LIFECYCLE] {label}: "
+            f"viewport_focused={self.viewport_focused} "
+            f"editor_look_active={self.editor_look_active} "
+            f"mouse_look_captured={self._mouse_look_captured()} "
+            f"qt_look_last_pos={self._qt_look_last_pos} "
+            f"cursor_pos=({cursor_pos.x()},{cursor_pos.y()}) "
+            f"focus_widget={focus_widget!r} "
+            f"is_container={focus_widget is container} "
+            f"active_window={QApplication.activeWindow()!r} "
+            f"gizmo_dragging={self.gizmo.dragging} "
+            f"studio_playing={self.studio_playing} "
+            f"yaw={self.player_yaw:.2f} pitch={self.player_pitch:.2f}"
+        )
 
     # --------------------------------------------------------
     # RELATIVE MOUSE LOOK (см. комментарий у QT_LOOK_SENSITIVITY_*)
@@ -2297,10 +2398,38 @@ class MultiplayerGame(Entity):
         # frame regardless of whether Ursina's own input() ever sees an
         # "escape" key, which it structurally cannot once the native Panda
         # window itself has lost keyboard focus.
-        if QApplication.focusWidget() is not container:
+        #
+        # Bug-report follow-up ("RMB look works initially, then stops
+        # rotating the camera"): the original check bailed on ANY
+        # `focusWidget() is not container`, INCLUDING `focusWidget() is
+        # None`. None is a legitimate, expected state once the embedded
+        # viewport (a createWindowContainer()-wrapped FOREIGN native
+        # window, see embed_panda_window()) genuinely holds real OS
+        # keyboard focus via foreign_window.requestActivate() -- Qt's own
+        # widget-focus bookkeeping does not reliably keep reporting
+        # `container` once a foreign HWND owns real keyboard input.
+        # Confirmed by code-path analysis: RMB release/cursor-restore
+        # (which does NOT depend on this check at all -- see
+        # _stop_mouse_look(), driven purely by native RMB-up reaching
+        # Ursina's input()) kept working exactly when rotation silently
+        # stopped, meaning capture correctly engaged/disengaged the whole
+        # time and ONLY this focus-widget comparison was ever wrong.
+        # Distinguishing None (focus genuinely belongs to the native
+        # window -- keep rotating) from "some OTHER real Qt widget"
+        # (Explorer, Inspector, a dialog -- focus genuinely left the
+        # viewport -- stop) is what actually matters here;
+        # PlayInputReleaseFilter (an app-wide, cursor-position-based
+        # click detector, NOT a focusWidget() query) remains the primary/
+        # reliable "the user clicked something else" signal this check
+        # was only ever meant to complement, see its own docstring.
+        current_focus = QApplication.focusWidget()
+        if current_focus is not None and current_focus is not container:
             self._stop_mouse_look()
+            self.editor_look_active = False
+            self.viewport_focused = False
             if self.studio_playing:
                 print("[CHARACTER] Play input released (Qt focus left the viewport)")
+            self._log_viewport_lifecycle("_poll_qt_look_delta: focus lost")
             return 0.0, 0.0
 
         current_global = QCursor.pos()
@@ -2412,6 +2541,40 @@ class MultiplayerGame(Entity):
                 self.ground.color = GROUND_COLOR
             window.color = SKY_COLOR
 
+    def _trigger_editor_undo(self) -> None:
+        """Bug-report follow-up: "Undo/Redo eventually stops responding".
+        Root cause confirmed by architecture, not guessed: Ctrl+Z/Ctrl+Y
+        are wired ONLY as QAction/QShortcut objects on StudioMainWindow
+        (see _build_menu()'s self.undo_action/self.redo_action), which
+        only ever fire for a keystroke that passes through QT'S OWN event
+        loop. The embedded viewport is a createWindowContainer()-wrapped
+        FOREIGN native window (see embed_panda_window()) -- once it holds
+        real OS keyboard focus (which PandaWindowFocusFilter's
+        foreign_window.requestActivate() deliberately gives it, so WASD/
+        camera keys work at all), a keystroke typed while it has focus is
+        delivered directly to Panda3D's own native window procedure and
+        NEVER reaches Qt's event loop/shortcut map -- Qt's QAction system
+        structurally cannot see it. "worked initially" was simply
+        whatever moment Qt (not the viewport) still happened to hold real
+        keyboard focus, before the user's first click into the viewport.
+
+        Fixed by giving the viewport its OWN entry point into the exact
+        same undo path Qt's QAction already uses (self.studio_adapter.
+        undo(), unchanged -- see MultiplayerStudioAdapter.undo()) rather
+        than a second, divergent implementation: same can_undo guard,
+        same log message, same self.game.history.add_state_listener()
+        notification that keeps the Edit-menu's enabled state/text in
+        sync no matter which entry point triggered it."""
+        if self.studio_adapter is not None:
+            self.studio_adapter.undo()
+
+    def _trigger_editor_redo(self) -> None:
+        """See _trigger_editor_undo()'s docstring -- same fix, same
+        reasoning, for Ctrl+Y and the Ctrl+Shift+Z alt-chord (mirroring
+        _build_menu()'s self.redo_alt_shortcut)."""
+        if self.studio_adapter is not None:
+            self.studio_adapter.redo()
+
         self.background_status_text.text = (
             f"Фон: {'сетка' if self.background_mode == 'grid' else 'небо'} (B)"
         )
@@ -2484,12 +2647,11 @@ class MultiplayerGame(Entity):
             parent=self.hud_root,
             text=(
                 "WASD — полёт\n"
-                "Space / Ctrl — вверх и вниз\n"
-                "Shift — ускорение\n"
+                "Space / Q — вверх и вниз\n"
+                "E — ускорение\n"
                 "Мышь — обзор\n"
                 "V — первое/третье лицо\n"
                 "B — небо/сетка\n"
-                "E — создать Part\n"
                 "Esc — освободить мышь\n"
                 "Shift+F5 — вернуться в Studio"
             ),
@@ -2641,11 +2803,58 @@ class MultiplayerGame(Entity):
         self.select_part(str(part_id))
 
     def focus_selected_part(self) -> None:
-        entity = self.parts.get(self.selected_part_id or "")
-        if entity is None:
+        """Roblox-Studio-style "F to focus" -- bug-report follow-up: the
+        old version moved the camera to `entity.world_position + (some
+        fixed backward offset) + Vec3(0, 2.0, 0)` WITHOUT ever re-aiming
+        the camera's yaw/pitch at the target, so the fixed "+2 up" put
+        the camera's OWN eye-line above the object with nothing pointing
+        it back down -- the crosshair ended up aiming at the horizon at
+        the camera's new (raised) height, i.e. visibly above the object's
+        real center, exactly the reported symptom.
+
+        Fixed properly: computes the object's actual world-space bounds
+        CENTER (not just its .position, which can differ once rotation
+        is involved) by reusing _world_bounds_points() -- the exact same
+        oriented-corner AABB math _model_pivot_world()'s own auto-pivot
+        already relies on, not a new parallel implementation -- and backs
+        the camera straight up along its CURRENT view direction (yaw/
+        pitch left untouched) by a distance scaled to the object's own
+        size. Camera position = center - forward*distance means the
+        camera is now looking EXACTLY at center by construction (center
+        sits distance units along the view ray from the new position) --
+        no vertical fudge factor needed at all. Works for a plain Part/
+        SpawnPoint (its own oriented box) and for a Model (combined
+        bounds of every transformable descendant, same as the gizmo's
+        own auto-pivot)."""
+        part_id = self.selected_part_id
+        if not part_id:
             return
-        offset = forward_from_angles(self.player_yaw, self.player_pitch) * -8.0
-        self.local_player.position = entity.world_position + offset + Vec3(0, 2.0, 0)
+        record = self.instances.get(part_id)
+        if record is None:
+            return
+
+        if record.class_name == "Model":
+            points: list[Vec3] = []
+            for descendant_id in self._collect_transformable_descendants(part_id):
+                points.extend(self._world_bounds_points(descendant_id))
+        else:
+            points = self._world_bounds_points(part_id)
+        if not points:
+            return
+
+        xs = [p.x for p in points]
+        ys = [p.y for p in points]
+        zs = [p.z for p in points]
+        center = Vec3(
+            (min(xs) + max(xs)) / 2.0,
+            (min(ys) + max(ys)) / 2.0,
+            (min(zs) + max(zs)) / 2.0,
+        )
+        extent = Vec3(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
+        distance = max(extent.length() * FOCUS_DISTANCE_FACTOR, FOCUS_MIN_DISTANCE)
+
+        forward_direction = forward_from_angles(self.player_yaw, self.player_pitch)
+        self.local_player.position = center - forward_direction * distance
 
     # --------------------------------------------------------
     # TRANSFORM GIZMO (Move/Rotate)
@@ -3702,6 +3911,18 @@ class MultiplayerGame(Entity):
 
     def input(self, key: str) -> None:
         if not self.studio_playing:
+            if key in ("left mouse down", "right mouse down"):
+                # Viewport-interaction rewrite: Ursina only ever calls
+                # input() for a key/button event once the native Panda
+                # window genuinely has OS focus (Panda3D does not deliver
+                # input otherwise) -- so reaching this branch at all is
+                # itself proof the viewport has focus, independent of and
+                # redundant with PandaWindowFocusFilter's own Qt-level
+                # MouseButtonPress/FocusIn handling (see its docstring).
+                # Deliberately reconfirmed here rather than assumed, since
+                # the two event systems (Qt's filter vs. Panda's native
+                # input) are not guaranteed to fire in a fixed order.
+                self.viewport_focused = True
             if key == "left mouse down":
                 if not self.try_begin_gizmo_drag():
                     self.handle_editor_click()
@@ -3716,10 +3937,18 @@ class MultiplayerGame(Entity):
                 self.end_editor_look()
             elif key == "b":
                 self.toggle_background()
-            elif key == "e":
-                self.request_create_instance("Part")
             elif key == "f":
                 self.focus_selected_part()
+            elif key == "scroll up":
+                self.dolly_camera(EDITOR_ZOOM_STEP)
+            elif key == "scroll down":
+                self.dolly_camera(-EDITOR_ZOOM_STEP)
+            elif key == "z" and held_keys["control"] and held_keys["shift"]:
+                self._trigger_editor_redo()
+            elif key == "z" and held_keys["control"]:
+                self._trigger_editor_undo()
+            elif key == "y" and held_keys["control"]:
+                self._trigger_editor_redo()
             return
 
         # Stage 3.5: purely additive observer -- forwards every Play-mode
@@ -3786,8 +4015,6 @@ class MultiplayerGame(Entity):
             self.toggle_third_person()
         elif key == "b":
             self.toggle_background()
-        elif key == "e":
-            self.request_create_instance("Part")
 
     def _apply_third_person_camera(self) -> None:
         """Applies self.third_person_enabled's camera transform --
@@ -3945,14 +4172,19 @@ class MultiplayerGame(Entity):
             self.local_visual.set_pitch(self.player_pitch)
 
     def update_flight(self) -> None:
+        """Editor-only noclip fly camera (see the call site's `not
+        self.studio_playing` guard) -- Q/E replaced the bare Ctrl/Shift
+        bindings for downward movement / speed boost so those keys are
+        free for gameplay use (Q and E are both forwarded to
+        UserInputService's InputBegan/InputEnded during Play -- this
+        method never runs then, so there is no conflict either way).
+        Direction/meaning unchanged: Q still moves down (paired with
+        Space moving up), E still boosts flight speed."""
         forward_input = held_keys["w"] - held_keys["s"]
         right_input = held_keys["d"] - held_keys["a"]
 
-        control_pressed = max(
-            held_keys["control"],
-            held_keys["left control"],
-        )
-        vertical_input = held_keys["space"] - control_pressed
+        down_pressed = held_keys["q"]
+        vertical_input = held_keys["space"] - down_pressed
 
         forward_direction = forward_from_angles(
             self.player_yaw,
@@ -3970,13 +4202,10 @@ class MultiplayerGame(Entity):
         if movement.length() <= 0:
             return
 
-        shift_pressed = max(
-            held_keys["shift"],
-            held_keys["left shift"],
-        )
+        boost_pressed = held_keys["e"]
 
         speed = FLIGHT_SPEED
-        if shift_pressed:
+        if boost_pressed:
             speed *= BOOST_MULTIPLIER
 
         self.local_player.position += (
@@ -3985,6 +4214,16 @@ class MultiplayerGame(Entity):
 
         self.local_player.rotation_x = 0
         self.local_player.rotation_z = 0
+
+    def dolly_camera(self, step: float) -> None:
+        """Viewport-interaction rewrite: editor-mode mouse-wheel camera
+        dolly -- moves the free camera forward/backward along its current
+        view direction by a fixed step per wheel tick (a discrete event,
+        not a per-frame rate, so unlike update_flight() this is NOT
+        scaled by ursina_time.dt). Editor-only, mirrors update_flight()'s
+        own `not self.studio_playing` guard at its call site in input()."""
+        forward_direction = forward_from_angles(self.player_yaw, self.player_pitch)
+        self.local_player.position += forward_direction * step
 
     # --------------------------------------------------------
     # СЕТЕВЫЕ СООБЩЕНИЯ
@@ -4591,9 +4830,24 @@ class MultiplayerGame(Entity):
             # movement); sync_character_camera() must run AFTER it (reads
             # back the post-step position) -- see both methods' docstrings.
             self.update_character()
-        elif self.editor_look_active and not self.gizmo.dragging:
-            self.update_mouse_look()
-            self.update_flight()
+        elif not self.gizmo.dragging:
+            # Viewport-interaction rewrite: WASD/Space/Q/E flight and RMB
+            # look-rotation are now two INDEPENDENT gates, not one bundled
+            # condition -- this is the actual fix for "must hold RMB for
+            # WASD to work" (root-caused to this exact line: the old code
+            # only ever called update_flight() when editor_look_active was
+            # True, and editor_look_active is ONLY ever set True by RMB-
+            # down, see begin_editor_look()). viewport_focused (true from
+            # any click into the viewport, false the moment focus moves
+            # away -- see PandaWindowFocusFilter/release_play_input_
+            # capture()) is what now gates ordinary camera movement;
+            # editor_look_active (RMB-down/up only) still independently
+            # gates rotation. Both are skipped entirely while a gizmo
+            # handle is being dragged, same as before.
+            if self.viewport_focused:
+                self.update_flight()
+            if self.editor_look_active:
+                self.update_mouse_look()
         if self.studio_playing:
             self.send_transform()
             self.update_physics()
@@ -5299,6 +5553,13 @@ class PandaWindowFocusFilter(QObject):
         }:
             self.container.setFocus(Qt.FocusReason.MouseFocusReason)
             self.foreign_window.requestActivate()
+            # Viewport-interaction rewrite: an actual click (or a genuine
+            # Qt FocusIn) gives the editor viewport WASD/camera control --
+            # deliberately excludes plain Enter (hover) so merely moving
+            # the mouse over the viewport never grants control on its own,
+            # matching "clicking gives focus", not "hovering gives focus".
+            if event.type() != QEvent.Type.Enter and not self.game.studio_playing:
+                self.game.viewport_focused = True
         elif event.type() == QEvent.Type.Resize:
             # Держит ursina.window.size синхронным с реальным размером
             # контейнера при КАЖДОМ ресайзе (окно студии, доки, maximize) —
@@ -5524,6 +5785,138 @@ def _on_navigation_requested(studio: StudioMainWindow, section: str) -> None:
         binding.show()
 
 
+def _run_launcher_and_resolve_place_path(qt_app: QApplication) -> Optional[Path]:
+    """Stage 3.9 UI-architecture fix: the Home/Projects/Templates page used
+    to be a SECOND page inside StudioMainWindow.central_stack, embedded
+    between Explorer and Inspector in the same top-level window as the
+    actual 3D editor -- this shows it as a genuinely separate, standalone
+    top-level window instead (sstudio_templates.SStudioTemplatesWindow,
+    already built for exactly this purpose but previously only exercised
+    by that module's own standalone demo main()), shown and fully resolved
+    BEFORE any Ursina/Panda3D/network/StudioMainWindow state is created.
+
+    This ordering is not optional: Panda3D's ShowBase (what Ursina(...)
+    constructs) is a process-wide singleton (see character_controller.py's
+    "do not introduce a second Bullet world" precedent for the same kind
+    of constraint one layer down) -- the launcher must fully resolve its
+    choice and close BEFORE Ursina(...) ever runs, not coexist alongside a
+    live editor window.
+
+    Blocks the calling thread via a nested QEventLoop (the same technique
+    QDialog.exec() itself uses internally) until the user either:
+      - picks or creates a Place -> returns its resolved file path so the
+        caller can treat it exactly like an already-resolved --place
+        argument (see main()'s own use of this), or
+      - closes the launcher window -> returns None, so the caller can exit
+        cleanly instead of falling through to build a full editor session
+        for a project the user never actually chose.
+
+    Uses its own throwaway place_manager.PlaceManager() -- deliberately
+    NOT the instance StudioMainWindow constructs later (this window closes
+    before that one exists) -- safe because PlaceManager is plain data
+    (no engine/Qt-widget references, see its own docstring) and
+    RecentPlacesStore persists through QSettings, so both instances
+    observe the exact same on-disk Recents list; a Place created here via
+    "New from Template" is fully written to disk before this function
+    returns (place_manager.create_from_template() always does, success or
+    not), so the caller re-opening it by path afterward sees the real,
+    complete file, not something only this throwaway instance knows about.
+
+    Bug-report follow-up: the very first version of this function ended
+    the nested loop via `qt_app.lastWindowClosed.connect(loop.quit)` --
+    confirmed EMPIRICALLY (isolated PySide6 6.11.1 repro, not guessed)
+    that QApplication.lastWindowClosed simply never fires for a window
+    closed while a NESTED QEventLoop (as opposed to the top-level
+    QCoreApplication::exec()) is the one currently running -- regardless
+    of quitOnLastWindowClosed's value either way. That signal-based
+    design meant loop.exec() below never returned once the user picked a
+    project (window.close() ran, but nothing ever unblocked the loop),
+    so main()'s rest never executed and the editor window never
+    appeared. Fixed by never depending on that signal at all: `_finish()`
+    calls loop.quit() directly (the normal "developer picked something"
+    path), and the window's own closeEvent is intercepted directly (the
+    "user clicked the window's X button without picking anything" path)
+    -- both call loop.quit() unconditionally, so there is no code path
+    left that can leave this function's nested loop running forever, and
+    no reliance on quitOnLastWindowClosed at all (it is never touched
+    here, so the app's normal shutdown-on-last-window-closed behavior
+    for the REAL editor window, later, is completely untouched)."""
+    from PySide6.QtCore import QEventLoop
+
+    launcher_place_manager = place_manager.PlaceManager()
+    window = sstudio_templates.SStudioTemplatesWindow()
+    # Real (C++-level) destruction on close, not just hide -- a launcher
+    # is a one-shot window (this function runs exactly once per process,
+    # see main()'s own comment), so there is no reason for it to keep
+    # existing as a hidden top-level widget for the rest of the app's
+    # lifetime once resolved. Also closes a real gap this had without it:
+    # QApplication.topLevelWidgets() keeps listing a merely-hidden
+    # QMainWindow indefinitely, which is exactly the kind of stale
+    # reference future code (or a test) could accidentally pick up.
+    window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+    loop = QEventLoop()
+    resolved: dict[str, Optional[Path]] = {"path": None}
+
+    def _finish(path: Path) -> None:
+        resolved["path"] = path
+        window.close()
+        loop.quit()
+
+    def _on_template(spec: sstudio_templates.TemplateSpec) -> None:
+        dialog = place_manager.PlaceCreateDialog(spec.name, launcher_place_manager.projects_root, parent=window)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        result = launcher_place_manager.create_from_template(
+            spec.template_id, dialog.result_name(), dialog.result_directory()
+        )
+        if not result.success:
+            QMessageBox.critical(window, "Create Place Failed", result.message)
+            return
+        _finish(result.path)
+
+    def _on_navigation(section: str) -> None:
+        # Mirrors _on_navigation_requested()'s in-editor mapping above, but
+        # against launcher_place_manager/window instead of a live studio --
+        # "home" is deliberately absent: this window already IS Home, a
+        # click on it is a harmless no-op here.
+        if section == "recent":
+            dialog = place_manager.RecentPlacesDialog(launcher_place_manager.recents, parent=window)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                chosen = dialog.chosen_path()
+                if chosen:
+                    _finish(Path(chosen))
+        elif section == "projects":
+            start_dir = str(launcher_place_manager.projects_root)
+            path, _ = QFileDialog.getOpenFileName(window, "Open Place", start_dir, SCENE_FILE_FILTER)
+            if path:
+                _finish(Path(path))
+        elif section == "archive":
+            QMessageBox.information(window, "Archive", "Archive is not implemented in this stage.")
+
+    window.page.template_activated_spec.connect(_on_template)
+    window.page.navigation_requested.connect(_on_navigation)
+
+    # The "user closed the launcher without choosing anything" path --
+    # intercepting closeEvent directly (confirmed reliable, unlike
+    # lastWindowClosed -- see docstring above) rather than a signal.
+    # Calling loop.quit() twice (once here, once from _finish() above,
+    # since _finish() also calls window.close() which re-enters this
+    # override) is harmless -- QEventLoop.quit() on an already-stopped
+    # loop is a documented no-op.
+    original_close_event = window.closeEvent
+
+    def _on_close_event(event: Any) -> None:
+        original_close_event(event)
+        loop.quit()
+
+    window.closeEvent = _on_close_event
+
+    window.show()
+    loop.exec()
+
+    return resolved["path"]
+
+
 def main() -> int:
     # На большинстве Windows-машин консоль по умолчанию НЕ в UTF-8 (обычно
     # cp1251/cp1252), а в коде много print() с кириллицей — без этого первый
@@ -5545,6 +5938,37 @@ def main() -> int:
     qt_app.setApplicationName("Pick A Door Studio")
     qt_app.setOrganizationName("LegitsEngine")
     qt_app.setStyleSheet(DARK_STYLE)
+
+    # Stage 3.9 UI-architecture fix: the standalone Home/Projects/Templates
+    # launcher window is resolved to a concrete Place path (or "the user
+    # closed it without choosing anything") BEFORE any Ursina/Panda3D/
+    # network/StudioMainWindow state exists -- see
+    # _run_launcher_and_resolve_place_path()'s own docstring for why this
+    # ordering is required, not just stylistic. --place PATH bypasses the
+    # interactive launcher entirely (unchanged from before this fix --
+    # existing tooling/tests that rely on skipping the picker keep working
+    # exactly as before); once resolved either way, `arguments.place` is
+    # always set, so every later `if arguments.place:` branch below (the
+    # deferred-open-on-connect flow, install_template_browser()'s
+    # show_immediately=) needs no further special-casing for "launched via
+    # the new launcher" vs. "launched via --place".
+    if not arguments.place:
+        launcher_place_path = _run_launcher_and_resolve_place_path(qt_app)
+        if launcher_place_path is None:
+            return 0
+        arguments.place = str(launcher_place_path)
+        # Bug-report follow-up: on Windows, hide()/WA_DeleteOnClose alone
+        # were not enough to make the launcher visually disappear before
+        # the editor appeared -- Ursina(...) below blocks the thread for
+        # a real, human-noticeable amount of time (window creation,
+        # simplepbr.init(), asset loading) WITHOUT pumping Qt's event
+        # loop at all, and DWM appears to need that pump to actually
+        # finish compositing the hide/close (and, per Alt+Tab, fully drop
+        # the window) rather than leaving its last frame on screen.
+        # Forcing a few explicit processEvents() passes right here, while
+        # nothing else competes for the event loop, closes that gap.
+        for _ in range(5):
+            qt_app.processEvents()
 
     application.asset_folder = ASSETS_DIR
     ursina_app = Ursina(
@@ -5588,6 +6012,8 @@ def main() -> int:
     # app) -- it only fires on click and Tab, so an app-level release is
     # wired separately here to cover that case explicitly.
     def _on_app_state_changed(state: Qt.ApplicationState) -> None:
+        if DEBUG_VIEWPORT_LIFECYCLE:
+            print(f"[VIEWPORT_LIFECYCLE] applicationStateChanged -> {state!r}")
         if state != Qt.ApplicationState.ApplicationActive:
             game.release_play_input_capture()
 
