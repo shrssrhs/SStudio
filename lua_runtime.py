@@ -1424,19 +1424,34 @@ class RuntimeSceneLayer:
         return True, None
 
     def _is_world_attached(self, instance_id: str) -> bool:
-        """True iff instance_id's Parent chain reaches a ROOT_SERVICES
-        string (or "game") without ever passing through a nil parent --
-        i.e. it is genuinely reachable from the DataModel, matching
-        Roblox's own rule for whether an Instance is "in the game"
-        (rendered/simulated) at all. An instance with Parent == nil, or
-        parented under an ancestor that is ITSELF nil-parented (however
-        many levels up), is not world-attached. Bounded by a visited-set,
-        same defensive reasoning as _would_create_cycle()."""
-        from shared.object_registry import ROOT_SERVICES
+        """True iff instance_id's Parent chain reaches specifically
+        "Workspace" without ever passing through a nil parent -- i.e. it
+        is a genuine descendant of the live world scene. This is an
+        SStudio architecture rule, not a copy of Roblox behavior: only
+        Workspace descendants participate in rendering/physics. Every
+        OTHER root service (ReplicatedStorage, ServerStorage,
+        StarterPlayer, ServerScriptService, StarterGui, Players) is a
+        valid, live location for an Instance to sit in -- a template
+        Model waiting in ReplicatedStorage to be cloned in later, for
+        example -- but never renders or simulates while it sits there.
+
+        Stage 4.0 fix: this used to accept ANY ROOT_SERVICES member (or
+        the literal "game" DataModel root), not just Workspace -- so a
+        spatial Instance parented anywhere under, say, ReplicatedStorage
+        got a real Entity and physics body anyway, and reparenting it
+        from Workspace back into a non-Workspace service didn't detach
+        it at all (both roots satisfied the old check equally). Confirmed
+        via direct behavioral reproduction, not just this docstring's own
+        claim -- see test_world_membership.py.
+
+        An instance with Parent == nil, or parented under an ancestor
+        that is ITSELF nil-parented (however many levels up) or sitting
+        in a non-Workspace root, is not world-attached. Bounded by a
+        visited-set, same defensive reasoning as _would_create_cycle()."""
         walker: Optional[str] = instance_id
         seen: set[str] = set()
         while walker is not None:
-            if walker == "game" or walker in ROOT_SERVICES:
+            if walker == "Workspace":
                 return True
             if walker in seen:
                 return False
@@ -1736,7 +1751,18 @@ class RuntimeSceneLayer:
             self._parent_overlay[runtime_id] = _NIL_PARENT
         else:
             item.parent_id = parent_id
-            if definition.has_3d_entity:
+            # Stage 4.0 fix: gate the eager build on _is_world_attached()
+            # (the same central Workspace-ancestry predicate set_parent()
+            # uses), not merely "a parent was given". Instance.new(cls,
+            # someInstanceUnderReplicatedStorage) used to build a real
+            # Entity/physics body unconditionally -- harmless back when
+            # _is_world_attached() itself wrongly accepted any root
+            # service, but wrong now that only genuine Workspace
+            # descendants are world-attached. An instance created with a
+            # non-Workspace-attached parent still gets one lazily, the
+            # first time it (or an ancestor) is actually reparented under
+            # Workspace -- see _sync_world_attachment().
+            if definition.has_3d_entity and self._is_world_attached(runtime_id):
                 entity = self.game._build_part_entity(properties)
                 if entity is not None:
                     item.entity = entity
