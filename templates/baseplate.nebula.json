@@ -1,0 +1,41 @@
+{
+  "format": "nebula-scene",
+  "version": 2,
+  "objects": [
+    {
+      "id": "a1",
+      "class_name": "Part",
+      "name": "Baseplate",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          -0.5,
+          0
+        ],
+        "Size": [
+          128,
+          1,
+          128
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          163,
+          163,
+          166
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    }
+  ]
+}

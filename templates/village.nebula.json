@@ -1,0 +1,591 @@
+{
+  "format": "nebula-scene",
+  "version": 2,
+  "objects": [
+    {
+      "id": "ground",
+      "class_name": "Part",
+      "name": "Ground",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          -0.5,
+          0
+        ],
+        "Size": [
+          160,
+          1,
+          160
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          92,
+          145,
+          88
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "houses_folder",
+      "class_name": "Folder",
+      "name": "Houses",
+      "parent_id": "Workspace",
+      "properties": {},
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_model_1",
+      "class_name": "Model",
+      "name": "House1",
+      "parent_id": "houses_folder",
+      "properties": {
+        "PivotPosition": [
+          -25,
+          0,
+          -20
+        ],
+        "PivotRotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "PivotIsExplicit": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_walls_1",
+      "class_name": "Part",
+      "name": "Walls",
+      "parent_id": "house_model_1",
+      "properties": {
+        "Position": [
+          -25,
+          2,
+          -20
+        ],
+        "Size": [
+          8,
+          4,
+          8
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          190,
+          175,
+          150
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_roof_1",
+      "class_name": "Part",
+      "name": "Roof",
+      "parent_id": "house_model_1",
+      "properties": {
+        "Position": [
+          -25,
+          4.5,
+          -20
+        ],
+        "Size": [
+          9,
+          1,
+          9
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          150,
+          60,
+          55
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_model_2",
+      "class_name": "Model",
+      "name": "House2",
+      "parent_id": "houses_folder",
+      "properties": {
+        "PivotPosition": [
+          -25,
+          0,
+          10
+        ],
+        "PivotRotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "PivotIsExplicit": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_walls_2",
+      "class_name": "Part",
+      "name": "Walls",
+      "parent_id": "house_model_2",
+      "properties": {
+        "Position": [
+          -25,
+          2,
+          10
+        ],
+        "Size": [
+          8,
+          4,
+          8
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          190,
+          175,
+          150
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_roof_2",
+      "class_name": "Part",
+      "name": "Roof",
+      "parent_id": "house_model_2",
+      "properties": {
+        "Position": [
+          -25,
+          4.5,
+          10
+        ],
+        "Size": [
+          9,
+          1,
+          9
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          150,
+          60,
+          55
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_model_3",
+      "class_name": "Model",
+      "name": "House3",
+      "parent_id": "houses_folder",
+      "properties": {
+        "PivotPosition": [
+          15,
+          0,
+          -20
+        ],
+        "PivotRotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "PivotIsExplicit": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_walls_3",
+      "class_name": "Part",
+      "name": "Walls",
+      "parent_id": "house_model_3",
+      "properties": {
+        "Position": [
+          15,
+          2,
+          -20
+        ],
+        "Size": [
+          8,
+          4,
+          8
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          190,
+          175,
+          150
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_roof_3",
+      "class_name": "Part",
+      "name": "Roof",
+      "parent_id": "house_model_3",
+      "properties": {
+        "Position": [
+          15,
+          4.5,
+          -20
+        ],
+        "Size": [
+          9,
+          1,
+          9
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          150,
+          60,
+          55
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_model_4",
+      "class_name": "Model",
+      "name": "House4",
+      "parent_id": "houses_folder",
+      "properties": {
+        "PivotPosition": [
+          15,
+          0,
+          15
+        ],
+        "PivotRotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "PivotIsExplicit": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_walls_4",
+      "class_name": "Part",
+      "name": "Walls",
+      "parent_id": "house_model_4",
+      "properties": {
+        "Position": [
+          15,
+          2,
+          15
+        ],
+        "Size": [
+          8,
+          4,
+          8
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          190,
+          175,
+          150
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_roof_4",
+      "class_name": "Part",
+      "name": "Roof",
+      "parent_id": "house_model_4",
+      "properties": {
+        "Position": [
+          15,
+          4.5,
+          15
+        ],
+        "Size": [
+          9,
+          1,
+          9
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          150,
+          60,
+          55
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_model_5",
+      "class_name": "Model",
+      "name": "House5",
+      "parent_id": "houses_folder",
+      "properties": {
+        "PivotPosition": [
+          35,
+          0,
+          -5
+        ],
+        "PivotRotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "PivotIsExplicit": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_walls_5",
+      "class_name": "Part",
+      "name": "Walls",
+      "parent_id": "house_model_5",
+      "properties": {
+        "Position": [
+          35,
+          2,
+          -5
+        ],
+        "Size": [
+          8,
+          4,
+          8
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          190,
+          175,
+          150
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "house_roof_5",
+      "class_name": "Part",
+      "name": "Roof",
+      "parent_id": "house_model_5",
+      "properties": {
+        "Position": [
+          35,
+          4.5,
+          -5
+        ],
+        "Size": [
+          9,
+          1,
+          9
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          150,
+          60,
+          55
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "paths_folder",
+      "class_name": "Folder",
+      "name": "Paths",
+      "parent_id": "Workspace",
+      "properties": {},
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "path_main",
+      "class_name": "Part",
+      "name": "MainPath",
+      "parent_id": "paths_folder",
+      "properties": {
+        "Position": [
+          0,
+          0.05,
+          -5
+        ],
+        "Size": [
+          6,
+          0.1,
+          100
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          128,
+          128,
+          122
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "path_cross",
+      "class_name": "Part",
+      "name": "CrossPath",
+      "parent_id": "paths_folder",
+      "properties": {
+        "Position": [
+          0,
+          0.05,
+          0
+        ],
+        "Size": [
+          90,
+          0.1,
+          6
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          128,
+          128,
+          122
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    }
+  ]
+}

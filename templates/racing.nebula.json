@@ -1,0 +1,401 @@
+{
+  "format": "nebula-scene",
+  "version": 2,
+  "objects": [
+    {
+      "id": "ground",
+      "class_name": "Part",
+      "name": "Ground",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          -0.5,
+          0
+        ],
+        "Size": [
+          250,
+          1,
+          250
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          92,
+          145,
+          88
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "track_folder",
+      "class_name": "Folder",
+      "name": "Track",
+      "parent_id": "Workspace",
+      "properties": {},
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "track_1",
+      "class_name": "Part",
+      "name": "TrackSegment1",
+      "parent_id": "track_folder",
+      "properties": {
+        "Position": [
+          0,
+          0.1,
+          -80
+        ],
+        "Size": [
+          20,
+          0.2,
+          20
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          70,
+          74
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "track_2",
+      "class_name": "Part",
+      "name": "TrackSegment2",
+      "parent_id": "track_folder",
+      "properties": {
+        "Position": [
+          60,
+          0.1,
+          -60
+        ],
+        "Size": [
+          20,
+          0.2,
+          60
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          70,
+          74
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "track_3",
+      "class_name": "Part",
+      "name": "TrackSegment3",
+      "parent_id": "track_folder",
+      "properties": {
+        "Position": [
+          90,
+          0.1,
+          0
+        ],
+        "Size": [
+          60,
+          0.2,
+          20
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          70,
+          74
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "track_4",
+      "class_name": "Part",
+      "name": "TrackSegment4",
+      "parent_id": "track_folder",
+      "properties": {
+        "Position": [
+          60,
+          0.1,
+          60
+        ],
+        "Size": [
+          20,
+          0.2,
+          60
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          70,
+          74
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "track_5",
+      "class_name": "Part",
+      "name": "TrackSegment5",
+      "parent_id": "track_folder",
+      "properties": {
+        "Position": [
+          0,
+          0.1,
+          80
+        ],
+        "Size": [
+          20,
+          0.2,
+          20
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          70,
+          74
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "track_6",
+      "class_name": "Part",
+      "name": "TrackSegment6",
+      "parent_id": "track_folder",
+      "properties": {
+        "Position": [
+          -60,
+          0.1,
+          60
+        ],
+        "Size": [
+          20,
+          0.2,
+          60
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          70,
+          74
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "track_7",
+      "class_name": "Part",
+      "name": "TrackSegment7",
+      "parent_id": "track_folder",
+      "properties": {
+        "Position": [
+          -90,
+          0.1,
+          0
+        ],
+        "Size": [
+          60,
+          0.2,
+          20
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          70,
+          74
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "track_8",
+      "class_name": "Part",
+      "name": "TrackSegment8",
+      "parent_id": "track_folder",
+      "properties": {
+        "Position": [
+          -60,
+          0.1,
+          -60
+        ],
+        "Size": [
+          20,
+          0.2,
+          60
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          70,
+          74
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "start_line",
+      "class_name": "Part",
+      "name": "StartLine",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          0.15,
+          -90
+        ],
+        "Size": [
+          20,
+          0.25,
+          2
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          235,
+          235,
+          235
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "spawn",
+      "class_name": "SpawnPoint",
+      "name": "SpawnLocation",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          3,
+          -80
+        ],
+        "Size": [
+          6.0,
+          0.4,
+          6.0
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          0,
+          200,
+          90
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.25,
+        "Anchored": true,
+        "CanCollide": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    }
+  ]
+}

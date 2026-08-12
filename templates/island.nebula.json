@@ -1,0 +1,581 @@
+{
+  "format": "nebula-scene",
+  "version": 2,
+  "objects": [
+    {
+      "id": "water",
+      "class_name": "Part",
+      "name": "Water",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          -1,
+          0
+        ],
+        "Size": [
+          300,
+          1,
+          300
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          58,
+          110,
+          168
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.35,
+        "Anchored": true,
+        "CanCollide": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "island_surface",
+      "class_name": "Part",
+      "name": "IslandSurface",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          0,
+          0
+        ],
+        "Size": [
+          60,
+          2,
+          60
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          214,
+          198,
+          150
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "spawn",
+      "class_name": "SpawnPoint",
+      "name": "SpawnLocation",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [
+          0,
+          3,
+          0
+        ],
+        "Size": [
+          6.0,
+          0.4,
+          6.0
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          0,
+          200,
+          90
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.25,
+        "Anchored": true,
+        "CanCollide": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palms_folder",
+      "class_name": "Folder",
+      "name": "Palms",
+      "parent_id": "Workspace",
+      "properties": {},
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_model_1",
+      "class_name": "Model",
+      "name": "Palm1",
+      "parent_id": "palms_folder",
+      "properties": {
+        "PivotPosition": [
+          15,
+          1,
+          -18
+        ],
+        "PivotRotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "PivotIsExplicit": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_trunk_1",
+      "class_name": "Part",
+      "name": "Trunk",
+      "parent_id": "palm_model_1",
+      "properties": {
+        "Position": [
+          15,
+          3,
+          -18
+        ],
+        "Size": [
+          1,
+          6,
+          1
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          79,
+          58,
+          41
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_fronds_1",
+      "class_name": "Part",
+      "name": "Fronds",
+      "parent_id": "palm_model_1",
+      "properties": {
+        "Position": [
+          15,
+          6.5,
+          -18
+        ],
+        "Size": [
+          5,
+          1,
+          5
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          130,
+          70
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_model_2",
+      "class_name": "Model",
+      "name": "Palm2",
+      "parent_id": "palms_folder",
+      "properties": {
+        "PivotPosition": [
+          -18,
+          1,
+          12
+        ],
+        "PivotRotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "PivotIsExplicit": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_trunk_2",
+      "class_name": "Part",
+      "name": "Trunk",
+      "parent_id": "palm_model_2",
+      "properties": {
+        "Position": [
+          -18,
+          3,
+          12
+        ],
+        "Size": [
+          1,
+          6,
+          1
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          79,
+          58,
+          41
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_fronds_2",
+      "class_name": "Part",
+      "name": "Fronds",
+      "parent_id": "palm_model_2",
+      "properties": {
+        "Position": [
+          -18,
+          6.5,
+          12
+        ],
+        "Size": [
+          5,
+          1,
+          5
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          130,
+          70
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_model_3",
+      "class_name": "Model",
+      "name": "Palm3",
+      "parent_id": "palms_folder",
+      "properties": {
+        "PivotPosition": [
+          10,
+          1,
+          20
+        ],
+        "PivotRotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "PivotIsExplicit": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_trunk_3",
+      "class_name": "Part",
+      "name": "Trunk",
+      "parent_id": "palm_model_3",
+      "properties": {
+        "Position": [
+          10,
+          3,
+          20
+        ],
+        "Size": [
+          1,
+          6,
+          1
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          79,
+          58,
+          41
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_fronds_3",
+      "class_name": "Part",
+      "name": "Fronds",
+      "parent_id": "palm_model_3",
+      "properties": {
+        "Position": [
+          10,
+          6.5,
+          20
+        ],
+        "Size": [
+          5,
+          1,
+          5
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          130,
+          70
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_model_4",
+      "class_name": "Model",
+      "name": "Palm4",
+      "parent_id": "palms_folder",
+      "properties": {
+        "PivotPosition": [
+          -12,
+          1,
+          -15
+        ],
+        "PivotRotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "PivotIsExplicit": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_trunk_4",
+      "class_name": "Part",
+      "name": "Trunk",
+      "parent_id": "palm_model_4",
+      "properties": {
+        "Position": [
+          -12,
+          3,
+          -15
+        ],
+        "Size": [
+          1,
+          6,
+          1
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          79,
+          58,
+          41
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_fronds_4",
+      "class_name": "Part",
+      "name": "Fronds",
+      "parent_id": "palm_model_4",
+      "properties": {
+        "Position": [
+          -12,
+          6.5,
+          -15
+        ],
+        "Size": [
+          5,
+          1,
+          5
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          130,
+          70
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_model_5",
+      "class_name": "Model",
+      "name": "Palm5",
+      "parent_id": "palms_folder",
+      "properties": {
+        "PivotPosition": [
+          0,
+          1,
+          24
+        ],
+        "PivotRotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "PivotIsExplicit": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_trunk_5",
+      "class_name": "Part",
+      "name": "Trunk",
+      "parent_id": "palm_model_5",
+      "properties": {
+        "Position": [
+          0,
+          3,
+          24
+        ],
+        "Size": [
+          1,
+          6,
+          1
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          79,
+          58,
+          41
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "palm_fronds_5",
+      "class_name": "Part",
+      "name": "Fronds",
+      "parent_id": "palm_model_5",
+      "properties": {
+        "Position": [
+          0,
+          6.5,
+          24
+        ],
+        "Size": [
+          5,
+          1,
+          5
+        ],
+        "Rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Color": [
+          70,
+          130,
+          70
+        ],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    }
+  ]
+}
