@@ -219,6 +219,33 @@ def _register_defaults() -> None:
         inspector_sections=("transform", "appearance", "behavior"),
     ))
 
+    # Stage 4.1 (showcase sprint): a Part-like object whose visual geometry
+    # is a loaded mesh (.glb/.gltf via panda3d-gltf, see
+    # client_studio.py's load_mesh_node()) instead of the primitive cube
+    # every other Part-form uses. Deliberately reuses _PART_LIKE_SCHEMA/
+    # _PART_LIKE_DEFAULTS wholesale (same Position/Size/Rotation/Color-as-
+    # tint/Transparency/Anchored/CanCollide contract as Part) plus exactly
+    # one new field -- MeshId, a path relative to client_studio.py's
+    # MESH_ASSETS_DIR -- rather than inventing a parallel property system.
+    # Size still drives the (box-only) physics/picking collider, same as
+    # Part/SpawnPoint: this is a deliberate scope decision (see Stage 4.1
+    # report), not an oversight -- true per-triangle mesh collision is not
+    # implemented and is out of scope for the showcase sprint.
+    register_object_type(ObjectTypeDefinition(
+        type_id="MeshPart",
+        display_name="MeshPart",
+        category="Basic",
+        description="A Part-like object that displays an imported 3D mesh (glTF/GLB) instead of a primitive cube.",
+        icon="cube",
+        default_parent="Workspace",
+        allowed_parent_types=_CONTAINER_PARENTS,
+        keywords=("mesh", "model", "import", "gltf", "glb", "prop"),
+        default_properties={**_PART_LIKE_DEFAULTS, "MeshId": ""},
+        property_schema={**_PART_LIKE_SCHEMA, "MeshId": PropertySpec("string", 256)},
+        has_3d_entity=True,
+        inspector_sections=("transform", "appearance", "behavior"),
+    ))
+
     register_object_type(ObjectTypeDefinition(
         type_id="Model",
         display_name="Model",

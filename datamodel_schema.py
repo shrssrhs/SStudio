@@ -578,6 +578,12 @@ for _legacy_name, _legacy_base in (
     # replacing the single hand-rolled special case that used to live in
     # lua_runtime.py's RuntimeSceneLayer.is_a() (see its Stage 3.9 update).
     ("SpawnPoint", "Part"),
+    # Stage 4.1 (showcase sprint): MeshPart is genuinely Part-like (same
+    # has_3d_entity transform/physics presence, see shared/object_registry
+    # .py), differing only in visual representation (a loaded mesh instead
+    # of a primitive cube) and one extra property (MeshId) -- basing it on
+    # "Part" here for the same IsA("Part") reasoning as SpawnPoint above.
+    ("MeshPart", "Part"),
     # Stage 3.9: gameplay-state primitives (see shared/object_registry.py
     # registration) -- registered here too, purely so IsA("Instance") and
     # class_chain() resolve correctly for them; their actual properties are

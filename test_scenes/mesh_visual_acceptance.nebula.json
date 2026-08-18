@@ -1,0 +1,159 @@
+{
+  "format": "nebula-scene",
+  "version": 3,
+  "objects": [
+    {
+      "id": "floor",
+      "class_name": "Part",
+      "name": "Floor",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, -0.1, 0],
+        "Size": [12, 0.2, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [92, 86, 80],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "ceiling",
+      "class_name": "Part",
+      "name": "Ceiling",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 4.1, 0],
+        "Size": [12, 0.2, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [58, 56, 54],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_north",
+      "class_name": "Part",
+      "name": "Wall_North",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 2, -4.1],
+        "Size": [12, 4, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [72, 74, 78],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_south",
+      "class_name": "Part",
+      "name": "Wall_South",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 2, 4.1],
+        "Size": [12, 4, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [72, 74, 78],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_west",
+      "class_name": "Part",
+      "name": "Wall_West",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-6.1, 2, 0],
+        "Size": [0.2, 4, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [72, 74, 78],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "wall_east",
+      "class_name": "Part",
+      "name": "Wall_East",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [6.1, 2, 0],
+        "Size": [0.2, 4, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [72, 74, 78],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "test_prop",
+      "class_name": "MeshPart",
+      "name": "TestProp",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 0.0, 0],
+        "Size": [1.0, 1.0, 1.0],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [255, 255, 255],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": false,
+        "MeshId": "test_prop.glb"
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    },
+    {
+      "id": "spawn",
+      "class_name": "SpawnPoint",
+      "name": "SpawnLocation",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 0.0, 3],
+        "Size": [2.0, 0.4, 2.0],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [0, 200, 90],
+        "Material": "Plastic",
+        "Transparency": 0.25,
+        "Anchored": true,
+        "CanCollide": false
+      },
+      "tags": [],
+      "attributes": {},
+      "enabled": true
+    }
+  ]
+}

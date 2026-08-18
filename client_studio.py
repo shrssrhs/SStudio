@@ -395,8 +395,73 @@ else:
     PROJECT_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = PROJECT_DIR / "assets"
 PLAYER_MODEL_PATH = ASSETS_DIR / "player.glb"
+# Stage 4.1 (showcase sprint): MeshPart.MeshId is a path relative to this
+# folder (e.g. "crate.glb" or "props/crate.glb") -- kept separate from
+# ASSETS_DIR's root (which already holds engine assets like player.glb) so
+# user/project mesh props have one dedicated, unambiguous home.
+MESH_ASSETS_DIR = ASSETS_DIR / "meshes"
 
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+MESH_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_mesh_asset_path(mesh_id: str) -> Optional[Path]:
+    """Resolves a MeshPart.MeshId string to a real file under
+    MESH_ASSETS_DIR, or None if mesh_id is empty/malformed/escapes that
+    folder. MeshId is untrusted data (Lua-writable, Inspector-writable,
+    round-trips through Place JSON) -- rejecting absolute paths and ".."
+    segments before ever touching the filesystem is a deliberate guard
+    against it being used to read files outside the project's mesh folder,
+    not just a correctness nicety."""
+    if not mesh_id or not isinstance(mesh_id, str):
+        return None
+    normalized = mesh_id.strip().replace("\\", "/")
+    if not normalized or normalized.startswith("/") or ":" in normalized:
+        return None
+    parts = [segment for segment in normalized.split("/") if segment not in ("", ".")]
+    if not parts or any(segment == ".." for segment in parts):
+        return None
+    candidate = MESH_ASSETS_DIR.joinpath(*parts)
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(MESH_ASSETS_DIR.resolve())
+    except (OSError, ValueError):
+        return None
+    return resolved
+
+
+def load_mesh_node(mesh_id: str):
+    """Loads a MeshPart's geometry via Panda3D's own model loader (the same
+    call model_debug_viewer.py already proved works for a .glb, backed by
+    the installed panda3d-gltf loader) -- returns (node_path, error_message);
+    node_path is None on any failure, with error_message describing why
+    (missing file, empty file, malformed asset, loader not ready yet)."""
+    path = resolve_mesh_asset_path(mesh_id)
+    if path is None:
+        return None, f"invalid or missing MeshId: {mesh_id!r}"
+    if not path.exists() or not path.is_file():
+        return None, f"mesh asset not found: {mesh_id}"
+    if path.stat().st_size <= 0:
+        return None, f"mesh asset is empty: {mesh_id}"
+
+    panda_loader = getattr(builtins, "loader", None)
+    if panda_loader is None:
+        return None, "engine loader is not ready yet"
+
+    try:
+        node = panda_loader.loadModel(Filename.from_os_specific(str(path)))
+    except Exception as error:  # noqa: BLE001 -- any loader failure is a "missing/bad asset", not a crash
+        return None, f"failed to load mesh {mesh_id!r}: {type(error).__name__}: {error}"
+
+    if node is None or node.isEmpty():
+        return None, f"failed to load mesh {mesh_id!r}: loader returned no geometry"
+
+    try:
+        node.setTransparency(TransparencyAttrib.MNone)
+    except Exception:
+        pass
+
+    return node, ""
 
 
 # ============================================================
@@ -2916,7 +2981,7 @@ class MultiplayerGame(Entity):
             current = frontier.pop()
             for child_id in children_by_parent.get(current, []):
                 child_record = self.instances.get(child_id)
-                if child_record is not None and child_record.class_name in ("Part", "SpawnPoint", "Model"):
+                if child_record is not None and child_record.class_name in ("Part", "SpawnPoint", "Model", "MeshPart"):
                     result.append(child_id)
                 frontier.append(child_id)
         return result
@@ -4484,17 +4549,22 @@ class MultiplayerGame(Entity):
         if self.studio_adapter is not None:
             self.studio_adapter.sync_full_scene()
 
-    def _build_part_entity(self, properties: dict[str, Any]) -> Entity | None:
-        """Строит Ursina-куб для типов с has_3d_entity=True (Part/SpawnPoint —
-        обе Part-формы, различаются только дефолтными properties)."""
+    def _build_part_entity(self, properties: dict[str, Any], class_name: str = "Part") -> Entity | None:
+        """Строит Ursina-Entity для типов с has_3d_entity=True. Part/SpawnPoint
+        остаются кубом (различаются только дефолтными properties); MeshPart
+        (Stage 4.1) вместо примитива грузит реальную геометрию через
+        load_mesh_node() и реэродителит её на тот же transform/collider-root,
+        так что Position/Size/Rotation/выделение/picking-коллайдер и Bullet-
+        физика (см. physics.py — AABB по-прежнему из Size, не по треугольникам)
+        работают identично обычному Part-у."""
         try:
             position = properties["Position"]
             size = properties["Size"]
             rotation = properties["Rotation"]
             rgb = properties["Color"]
             transparency = properties["Transparency"]
-            return Entity(
-                model="cube",
+            root = Entity(
+                model="cube" if class_name != "MeshPart" else None,
                 position=Vec3(float(position[0]), float(position[1]), float(position[2])),
                 scale=Vec3(float(size[0]), float(size[1]), float(size[2])),
                 rotation=Vec3(float(rotation[0]), float(rotation[1]), float(rotation[2])),
@@ -4515,6 +4585,52 @@ class MultiplayerGame(Entity):
         except (TypeError, ValueError, IndexError, KeyError) as error:
             print(f"[WORLD] Не удалось построить Entity: битые properties: {error}")
             return None
+
+        if class_name == "MeshPart":
+            self._apply_mesh_geometry(root, str(properties.get("MeshId", "")))
+        return root
+
+    def _apply_mesh_geometry(self, entity: Entity, mesh_id: str) -> None:
+        """(Re)loads a MeshPart's visual geometry onto `entity`, replacing
+        whatever mesh geometry it currently carries. `entity` itself stays
+        the unscaled-by-mesh transform/collider root built by
+        _build_part_entity (its own `scale` already carries Size, exactly
+        like a Part's cube) -- the loaded model node is reparented as a
+        plain Panda child, matching the already-proven
+        model_debug_viewer.py pattern. The previous geometry is tracked via
+        entity._mesh_node/_mesh_placeholder and torn down explicitly rather
+        than by scanning entity.children, since a raw reparentTo()'d Panda
+        NodePath is not one of Ursina's own tracked child Entities. On any
+        failure (empty MeshId, missing file, bad asset) falls back to a
+        visibly-distinct magenta placeholder cube instead of leaving the
+        Part invisible, so a broken reference is obvious in the viewport,
+        not silently blank. Destroying `entity` itself (Destroy()/Stop)
+        still cleans up whichever of the two is active for free -- both are
+        genuine Panda scene-graph descendants of entity's own NodePath."""
+        previous_node = getattr(entity, "_mesh_node", None)
+        if previous_node is not None:
+            previous_node.removeNode()
+        previous_placeholder = getattr(entity, "_mesh_placeholder", None)
+        if previous_placeholder is not None:
+            destroy(previous_placeholder)
+        entity._mesh_node = None
+        entity._mesh_placeholder = None
+
+        node, error = load_mesh_node(mesh_id) if mesh_id else (None, "MeshId is empty")
+        if node is not None:
+            node.reparentTo(entity)
+            node.setPos(0, 0, 0)
+            node.setHpr(0, 0, 0)
+            entity._mesh_node = node
+            return
+
+        if mesh_id:
+            print(f"[MESH] {error}")
+        entity._mesh_placeholder = Entity(
+            parent=entity,
+            model="cube",
+            color=color.rgba32(255, 0, 220, 255),
+        )
 
     def _apply_instance_properties(
         self, record: "InstanceRecord", properties: dict[str, Any], replace: bool,
@@ -4592,7 +4708,7 @@ class MultiplayerGame(Entity):
         self.instances[instance_id] = record
 
         if definition is not None and definition.has_3d_entity:
-            entity = self._build_part_entity(properties)
+            entity = self._build_part_entity(properties, class_name)
             if entity is not None:
                 entity.part_id = instance_id
                 entity.instance_name = name

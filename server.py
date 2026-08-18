@@ -28,7 +28,7 @@ PART_LIKE_TYPES = ("Part", "SpawnPoint")
 # прочие непространственные типы транзитом проходят через дерево потомков
 # при обходе get_descendant_ids, но сами transform не имеют — их id здесь
 # отклоняются.
-_MODEL_TRANSFORM_DESCENDANT_TYPES = PART_LIKE_TYPES + ("Model",)
+_MODEL_TRANSFORM_DESCENDANT_TYPES = PART_LIKE_TYPES + ("Model", "MeshPart")
 
 
 HOST = "0.0.0.0"

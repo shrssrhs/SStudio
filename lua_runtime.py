@@ -1312,6 +1312,13 @@ class RuntimeSceneLayer:
             if key in ("Anchored", "CanCollide"):
                 default = True if key == "Anchored" else True
                 return "bool", bool(overlay.get(key, base.get(key, default)))
+            if key == "MeshId":
+                # Stage 4.1 (showcase sprint): only meaningful on MeshPart,
+                # but reading it on a plain Part/SpawnPoint is harmless
+                # (base.get always misses -> "") rather than a special-cased
+                # per-class error, matching how Color/Transparency etc. are
+                # already handled uniformly across every has_3d_entity class.
+                return "string", str(overlay.get(key, base.get(key, "")))
             return "error", f"'{key}' is not a valid member of {class_name}"
 
         # Stage 3.9: generic schema-driven property read for classes with
@@ -1481,7 +1488,7 @@ class RuntimeSceneLayer:
                 item = self._runtime.get(instance_id)
                 if item is None:
                     return
-                entity = self.game._build_part_entity(properties)
+                entity = self.game._build_part_entity(properties, class_name)
                 if entity is None:
                     return
                 item.entity = entity
@@ -1625,6 +1632,22 @@ class RuntimeSceneLayer:
                 self._overlay.setdefault(instance_id, {})[key] = max(0.0, min(1.0, float(value)))
             elif key in ("Anchored", "CanCollide"):
                 self._overlay.setdefault(instance_id, {})[key] = bool(value)
+            elif key == "MeshId":
+                # Stage 4.1: stored like any other has_3d_entity field.
+                # Deliberately NOT rebuilt into a live mesh swap here -- a
+                # MeshPart's geometry is loaded once, when its Entity is
+                # first built (creation, or the first time it becomes
+                # Workspace-attached; see _build_part_entity/
+                # _sync_world_attachment) -- changing MeshId afterward
+                # updates the serialized/Lua-visible value but does not
+                # hot-swap an already-built Entity's geometry. This keeps
+                # the property's behavior simple and matches what's
+                # actually tested/verified this sprint; hot-swapping is a
+                # reasonable future addition, not a silent correctness gap
+                # (the value it reports back is always what was last set).
+                if not isinstance(value, str):
+                    return False, "MeshId must be a string"
+                self._overlay.setdefault(instance_id, {})[key] = value[:256]
             else:
                 return False, f"'{key}' is not a valid member of {class_name}"
         except (TypeError, ValueError, IndexError):
@@ -1763,7 +1786,7 @@ class RuntimeSceneLayer:
             # first time it (or an ancestor) is actually reparented under
             # Workspace -- see _sync_world_attachment().
             if definition.has_3d_entity and self._is_world_attached(runtime_id):
-                entity = self.game._build_part_entity(properties)
+                entity = self.game._build_part_entity(properties, class_name)
                 if entity is not None:
                     item.entity = entity
                     self.game.parts[runtime_id] = entity
