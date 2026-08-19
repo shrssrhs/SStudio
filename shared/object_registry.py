@@ -37,6 +37,15 @@ ROOT_SERVICES: tuple[str, ...] = (
     "ReplicatedStorage",
     "ServerScriptService",
     "ServerStorage",
+    # Stage 4.1 (atmosphere slice): deliberately separate from Workspace --
+    # Workspace owns world-membership/physics (Gravity, CurrentCamera);
+    # Environment owns visual/rendering configuration (fog, exposure,
+    # shadows) that has nothing to do with simulation. Kept as its own
+    # small root service rather than growing Workspace into two unrelated
+    # responsibilities, and rather than cloning Roblox's own Lighting
+    # service wholesale -- see datamodel_schema.py's registration for the
+    # actual (small, SStudio-specific) property set.
+    "Environment",
 )
 
 
@@ -231,6 +240,25 @@ def _register_defaults() -> None:
     # Part/SpawnPoint: this is a deliberate scope decision (see Stage 4.1
     # report), not an oversight -- true per-triangle mesh collision is not
     # implemented and is out of scope for the showcase sprint.
+    #
+    # DESIGN NOTE, NOT YET RESOLVED (recorded during the Stage 4.1
+    # mesh-lighting investigation, see test_mesh_part.py's
+    # test_size_is_a_raw_multiplier_on_native_mesh_bounds_not_normalized):
+    # Size currently SCALES whatever native bounding-box dimensions the
+    # loaded GLB happens to have -- it is NOT normalized against those
+    # native bounds first. Two GLBs with different native sizes and the
+    # SAME MeshPart.Size therefore end up with different world-space
+    # dimensions, which is surprising for a creator coming from an engine
+    # where Size means "final size." The likely better long-term contract
+    # is Size = final world-space bounding-box dimensions (normalize the
+    # imported mesh against its own native tight-bounds, then scale to
+    # Size) -- but do NOT implement that yet: first-load timing (bounds
+    # aren't known until the mesh is actually loaded), MeshId-replacement
+    # behavior (what happens to an already-placed MeshPart's world size
+    # when its MeshId changes to an asset with different native
+    # proportions), and non-uniform aspect-ratio handling all need to be
+    # designed before changing this contract. Do not add MeshScale or any
+    # other speculative property in the meantime.
     register_object_type(ObjectTypeDefinition(
         type_id="MeshPart",
         display_name="MeshPart",
@@ -243,7 +271,9 @@ def _register_defaults() -> None:
         default_properties={**_PART_LIKE_DEFAULTS, "MeshId": ""},
         property_schema={**_PART_LIKE_SCHEMA, "MeshId": PropertySpec("string", 256)},
         has_3d_entity=True,
-        inspector_sections=("transform", "appearance", "behavior"),
+        # "mesh" (Stage 4.1 follow-up): minimum MeshId authoring -- see
+        # studio_editor_live.py's InspectorPanel._build_mesh_section().
+        inspector_sections=("transform", "mesh", "appearance", "behavior"),
     ))
 
     register_object_type(ObjectTypeDefinition(

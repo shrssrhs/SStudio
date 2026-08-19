@@ -507,6 +507,71 @@ for _name in ("Players", "StarterGui", "ReplicatedStorage", "ServerScriptService
     _register_service(_name)
 
 
+# ============================================================
+# ENVIRONMENT (Stage 4.1: atmospheric rendering foundation)
+# ============================================================
+
+# Deliberately its own service, not new Workspace properties: Workspace
+# owns world-membership/physics (Gravity, CurrentCamera -- see above),
+# Environment owns visual/rendering configuration that has nothing to do
+# with simulation. Kept small and specific to what this slice actually
+# needs (fog, exposure, directional shadows) -- NOT a clone of Roblox's
+# Lighting service (no ClockTime/Technology/ColorShift/ambient-vs-outdoor
+# split); grows later (Stage 4.3) by adding more properties here, not by
+# retrofitting Workspace.
+register_class(ClassDescriptor(
+    class_name="Environment",
+    base_class="Instance",
+    display_name="Environment",
+    category="Service",
+    creatable=False,
+    service=True,
+    singleton=True,
+    deletable=False,
+    renameable=False,
+    properties=(
+        PropertyDescriptor(
+            "FogEnabled", "bool", category="Fog", default=False,
+        ),
+        PropertyDescriptor(
+            "FogColor", "color3", category="Fog", default=[160.0, 165.0, 175.0],
+        ),
+        PropertyDescriptor(
+            # Exponential fog density -- the only fog model
+            # simplepbr==0.13.1's shader actually reads (p3d_Fog.density,
+            # see simplepbr/shaders.py's ENABLE_FOG block); a linear
+            # start/end range would silently do nothing under this
+            # renderer, so it is deliberately not exposed as a second,
+            # half-working fog system.
+            "FogDensity", "float", category="Fog", default=0.01,
+            minimum=0.0, maximum=0.5,
+        ),
+        PropertyDescriptor(
+            # Stops, matching simplepbr.Pipeline.exposure's own convention
+            # (applied as 2**exposure) -- 0.0 is neutral/current appearance.
+            "Exposure", "float", category="Rendering", default=0.0,
+            minimum=-4.0, maximum=4.0,
+        ),
+        PropertyDescriptor(
+            "ShadowsEnabled", "bool", category="Shadows", default=True,
+        ),
+        PropertyDescriptor(
+            # Half-extent (world units) of the directional shadow frustum
+            # around the camera/origin -- NOT a resolution or bias knob;
+            # see client_studio.py's apply_environment_settings() for why
+            # this alone is the one shadow-quality property this slice
+            # exposes (Ursina's own DirectionalLight.update_bounds() was
+            # found to size the frustum around the WHOLE scene including
+            # the 1000-unit sky sphere, making shadows unusably low-res;
+            # this property drives an explicit, predictable lens size
+            # instead).
+            "ShadowDistance", "float", category="Shadows", default=40.0,
+            minimum=1.0, maximum=500.0,
+        ),
+    ),
+))
+
+
 def validate_starter_player_zoom(min_value: float, max_value: float) -> ValidationResult:
     """Cross-field rule Inspector edits and Lua writes both need: the pair
     must stay ordered. Called explicitly by callers editing either bound

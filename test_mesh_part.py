@@ -265,6 +265,51 @@ def test_meshpart_shares_ordinary_part_properties() -> None:
         teardown(game, manager, ctx)
 
 
+def test_size_is_a_raw_multiplier_on_native_mesh_bounds_not_normalized() -> None:
+    """Documents CURRENT, NOT-YET-FROZEN behavior (see the design note next
+    to MeshPart's registration in shared/object_registry.py): Size scales
+    whatever native bounding-box dimensions the loaded GLB happens to have
+    -- it is not normalized against those native bounds first. Two GLBs
+    with different native sizes and the SAME MeshPart.Size therefore end up
+    with different world-space dimensions; this test exists to make that
+    concrete and to break loudly if a future Size-semantics change (see the
+    design note) alters it, so that change is deliberate, not accidental.
+    """
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    scene = manager.scene
+    try:
+        # MeshId must be set BEFORE the Entity is built (see set_property's
+        # MeshId docstring: it does not hot-swap an already-built Entity)
+        # -- create unparented, set MeshId, then parent into Workspace so
+        # the eager-build path picks it up, same pattern as
+        # test_creating_meshpart_loads_real_geometry().
+        ok, pid = scene.instance_new("MeshPart", None)
+        assert ok, pid
+        scene.set_property(pid, "MeshId", REAL_MESH_ID)
+        ok, err = scene.set_parent(pid, "Workspace")
+        assert ok, err
+        entity = game.parts.get(pid)
+        node_at_size_1 = getattr(entity, "_mesh_node", None)
+        check(node_at_size_1 is not None, "mesh geometry loaded at Size=(1,1,1)")
+        bounds_1 = node_at_size_1.getTightBounds(cs.application.base.render)
+        size_1 = (bounds_1[1] - bounds_1[0]) if bounds_1 else None
+        check(size_1 is not None, "world-space tight bounds are computable at Size=1")
+
+        scene.set_property(pid, "Size", [2.0, 2.0, 2.0])
+        entity2 = game.parts.get(pid)
+        check(entity2 is entity, "changing Size does not rebuild the Entity")
+        node_at_size_2 = getattr(entity2, "_mesh_node", None)
+        bounds_2 = node_at_size_2.getTightBounds(cs.application.base.render) if node_at_size_2 else None
+        size_2 = (bounds_2[1] - bounds_2[0]) if bounds_2 else None
+
+        if size_1 is not None and size_2 is not None:
+            ratio = tuple(round(b / a, 3) if a else None for a, b in zip(size_1, size_2))
+            check(ratio == (2.0, 2.0, 2.0), f"doubling Size exactly doubles world-space bounds (raw multiplier, not normalized): got ratio={ratio}")
+    finally:
+        teardown(game, manager, ctx)
+
+
 # ============================================================
 # Serialization / save-open round trip
 # ============================================================
@@ -459,6 +504,7 @@ test_missing_asset_falls_back_to_placeholder_not_a_crash()
 test_empty_mesh_id_falls_back_to_placeholder()
 test_mesh_id_get_set_roundtrip()
 test_meshpart_shares_ordinary_part_properties()
+test_size_is_a_raw_multiplier_on_native_mesh_bounds_not_normalized()
 test_serialization_round_trip_via_datamodel_schema()
 test_place_save_open_round_trip()
 test_workspace_attach_detach_carries_mesh()

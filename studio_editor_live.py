@@ -1551,7 +1551,13 @@ class Ribbon(QWidget):
         model_group = RibbonGroup("Model")
         model_group.add_widget(RibbonToolButton("Duplicate", "group", self.bridge.duplicate_selected))
         model_group.add_widget(RibbonToolButton("Delete", "stop", self.bridge.delete_selected))
-        model_group.add_widget(RibbonToolButton("Mesh", "mesh", lambda: self.bridge.add_part("Mesh")))
+        # Stage 4.1 fix: this button used to request "Mesh" -- not a
+        # registered class (object_registry only knows "MeshPart", added
+        # this stage) -- so it produced "Unknown or non-creatable object
+        # type 'Mesh'" instead of ever creating anything. Insert Object's
+        # own MeshPart entry always worked correctly; this toolbar
+        # shortcut just never got pointed at the real class name.
+        model_group.add_widget(RibbonToolButton("Mesh", "mesh", lambda: self.bridge.add_part("MeshPart")))
         row.addWidget(model_group)
 
         physics = RibbonGroup("Physics")
@@ -2395,6 +2401,7 @@ class InspectorPanel(QWidget):
             "behavior": self._build_behavior_section,
             "container": self._build_container_section,
             "pivot": self._build_pivot_section,
+            "mesh": self._build_mesh_section,
             "script": lambda o: self._build_script_section(o, definition),
             "placeholder": lambda o: self._build_placeholder_section(o, definition),
         }
@@ -2552,6 +2559,29 @@ class InspectorPanel(QWidget):
         transform.add_row("Scale", scale)
         transform.add_row("Size", size)
         return transform
+
+    def _build_mesh_section(self, obj: SceneObject) -> CollapsibleSection:
+        """Stage 4.1 follow-up: minimum MeshId authoring for MeshPart --
+        Insert Object always created a correct MeshPart, but there was no
+        packaged-editor way to ever give it a MeshId (only Lua or hand-
+        edited Place JSON could), so a freshly inserted one only ever
+        showed the missing-asset magenta placeholder. Reuses the existing
+        generic "properties.<key>" write path in
+        MultiplayerStudioAdapter.set_property() (client_studio.py) --
+        no new property-edit machinery, same as every other field here."""
+        mesh = CollapsibleSection("Mesh")
+        mesh_id_edit = QLineEdit(str(obj.properties.get("MeshId", "")))
+        mesh_id_edit.setPlaceholderText("e.g. crate.glb or props/crate.glb")
+        mesh_id_edit.editingFinished.connect(
+            lambda edit=mesh_id_edit: self._set_value("properties.MeshId", edit.text().strip())
+        )
+        mesh.add_row("Mesh Id", mesh_id_edit)
+
+        hint = QLabel("Path relative to the project's assets/meshes/ folder (.glb/.gltf).")
+        hint.setObjectName("MutedLabel")
+        hint.setWordWrap(True)
+        mesh.add_row("", hint)
+        return mesh
 
     def _build_appearance_section(self, obj: SceneObject) -> CollapsibleSection:
         appearance = CollapsibleSection("Appearance")

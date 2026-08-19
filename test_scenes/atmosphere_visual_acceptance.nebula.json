@@ -1,0 +1,272 @@
+{
+  "format": "nebula-scene",
+  "version": 3,
+  "objects": [
+    {
+      "id": "room_floor",
+      "class_name": "Part",
+      "name": "RoomFloor",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, -0.1, 0],
+        "Size": [12, 0.2, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [95, 90, 82],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_ceiling",
+      "class_name": "Part",
+      "name": "RoomCeiling",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 4.1, 0],
+        "Size": [12, 0.2, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [55, 53, 50],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "corridor_floor",
+      "class_name": "Part",
+      "name": "CorridorFloor",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, -0.1, -7],
+        "Size": [4, 0.2, 6],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [70, 67, 62],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "corridor_ceiling",
+      "class_name": "Part",
+      "name": "CorridorCeiling",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 4.1, -7],
+        "Size": [4, 0.2, 6],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [40, 39, 37],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_wall_south",
+      "class_name": "Part",
+      "name": "Wall_Room_South",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 2, 4.1],
+        "Size": [12, 4, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [120, 122, 128],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_wall_west",
+      "class_name": "Part",
+      "name": "Wall_Room_West",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-6.1, 2, 0],
+        "Size": [0.2, 4, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [120, 122, 128],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_wall_east",
+      "class_name": "Part",
+      "name": "Wall_Room_East",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [6.1, 2, 0],
+        "Size": [0.2, 4, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [120, 122, 128],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_wall_north_left",
+      "class_name": "Part",
+      "name": "Wall_Room_North_Left",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-4, 2, -4.1],
+        "Size": [4, 4, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [120, 122, 128],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_wall_north_right",
+      "class_name": "Part",
+      "name": "Wall_Room_North_Right",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [4, 2, -4.1],
+        "Size": [4, 4, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [120, 122, 128],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "corridor_wall_west",
+      "class_name": "Part",
+      "name": "Wall_Corridor_West",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-2.1, 2, -7],
+        "Size": [0.2, 4, 6],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [70, 72, 78],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "corridor_wall_east",
+      "class_name": "Part",
+      "name": "Wall_Corridor_East",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [2.1, 2, -7],
+        "Size": [0.2, 4, 6],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [70, 72, 78],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "corridor_wall_end",
+      "class_name": "Part",
+      "name": "Wall_Corridor_End",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 2, -10.1],
+        "Size": [4, 4, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [70, 72, 78],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "shadow_pillar",
+      "class_name": "Part",
+      "name": "ShadowPillar",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [2.5, 1.5, 1.0],
+        "Size": [1.5, 3.0, 1.5],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [150, 138, 118],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "corridor_prop",
+      "class_name": "MeshPart",
+      "name": "CorridorProp",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 0.0, -7],
+        "Size": [1.0, 1.0, 1.0],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [255, 255, 255],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": false,
+        "MeshId": "test_prop.glb"
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "spawn",
+      "class_name": "SpawnPoint",
+      "name": "SpawnLocation",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 0.0, 3],
+        "Size": [2.0, 0.4, 2.0],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [0, 200, 90],
+        "Material": "Plastic",
+        "Transparency": 0.25,
+        "Anchored": true,
+        "CanCollide": false
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    }
+  ],
+  "services": {
+    "Environment": {
+      "FogEnabled": true,
+      "FogColor": [130.0, 133.0, 148.0],
+      "FogDensity": 0.035,
+      "Exposure": -0.7,
+      "ShadowsEnabled": true,
+      "ShadowDistance": 20.0
+    }
+  }
+}

@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from panda3d.core import Filename, Quat, TransparencyAttrib
+from panda3d.core import Filename, Fog, Quat, TransparencyAttrib
 from ursina import (
     AmbientLight,
     Cone,
@@ -729,7 +729,17 @@ PLACEHOLDER_FRONT_COLOR = color.rgb32(25, 25, 25)
 ARROW_COLOR = color.rgba32(20, 255, 120, 190)
 ARROW_TIP_COLOR = color.rgba32(20, 255, 120, 235)
 
-AMBIENT_LIGHT_COLOR = color.rgba32(125, 125, 145, 255)
+# Stage 4.1 rendering diagnosis: at (125,125,145), AmbientLight normalized
+# to ~0.49 gray -- applied UNIFORMLY to every surface by simplepbr's shader
+# (the ambient/IBL terms are NOT attenuated by the shadow factor, only the
+# direct per-light term is), so a fully-shadowed surface still kept ~half
+# of a fully-lit surface's brightness. That's the actual root cause of the
+# scene reading "flat gray" regardless of correctly-configured shadows/fog
+# -- there was never enough light/dark RANGE for shadow or fog contrast to
+# read as anything but subtle. Roughly halved here (~0.27) so directional
+# shading/shadows are actually visible while staying well short of unlit
+# black (Stage 4.1 spec: "should remain navigable and readable").
+AMBIENT_LIGHT_COLOR = color.rgba32(68, 68, 82, 255)
 SUN_LIGHT_COLOR = color.rgba32(235, 225, 205, 255)
 
 
@@ -1310,11 +1320,27 @@ class MultiplayerGame(Entity):
     PLAY_INPUT_STATE_FIRST_PERSON_CAPTURED = "PLAY_FIRST_PERSON_CAPTURED"
     PLAY_INPUT_STATE_FIRST_PERSON_RELEASED = "PLAY_FIRST_PERSON_RELEASED"
 
-    def __init__(self, server_url: str, player_name: str, legacy_demo: bool = False) -> None:
+    def __init__(
+        self, server_url: str, player_name: str, legacy_demo: bool = False, pbr_pipeline: Any = None,
+    ) -> None:
         super().__init__()
 
         self.server_url = server_url
         self.player_name = player_name
+        # Stage 4.1 (atmosphere slice): the ONE simplepbr.Pipeline object
+        # for this process's whole lifetime -- captured once from
+        # simplepbr.init()'s return value in main() (previously discarded
+        # entirely) and never recreated (Play/Stop must not call
+        # simplepbr.init() again; see apply_environment_settings()). None
+        # when simplepbr isn't installed (SIMPLEPBR_AVAILABLE False) or in
+        # a test harness that never called main() -- every environment
+        # write below is a no-op in that case, not a crash.
+        self.pbr_pipeline = pbr_pipeline
+        # Last-applied Environment properties, purely to avoid redundantly
+        # re-touching the DirectionalLight's shadow buffer (see
+        # apply_environment_settings()'s docstring for why that specific
+        # call is the one worth guarding against repetition).
+        self._environment_state: dict[str, Any] | None = None
         # Gates the original PickADoor demo content (hardcoded ground plane,
         # 5 hardcoded test blocks, eagerly-loaded player.glb avatar) that
         # used to be created unconditionally on every launch, independently
@@ -1572,6 +1598,13 @@ class MultiplayerGame(Entity):
             self._camera_mode_locked_first_person = starter_player.get("CameraMode") == "LockFirstPerson"
             self.third_person_enabled = not self._camera_mode_locked_first_person
             self._third_person_distance = max(self._runtime_min_zoom, min(self._runtime_max_zoom, THIRD_PERSON_DISTANCE))
+            # Stage 4.1: defensive re-apply, same reasoning as the zoom
+            # limits just above -- guarantees Play always starts from the
+            # authored Environment state even if something else drifted
+            # it between world-snapshot load and now (it also self-guards
+            # against redundant shadow-buffer churn when nothing changed;
+            # see apply_environment_settings()).
+            self.apply_environment_settings(self.services.get("Environment", {}))
             self.gizmo.set_target(None)
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = False
@@ -1620,6 +1653,14 @@ class MultiplayerGame(Entity):
                 self._stop_lua()
                 self._stop_character()
                 self._stop_physics()
+                # Stage 4.1: a Lua session may have written Environment.*
+                # at runtime (apply_runtime_service_write() applies those
+                # live but never touches self.services) -- restoring the
+                # authored values here is what makes that change session-
+                # only, the exact same contract every other runtime
+                # overlay in this class already has (Position/Rotation/
+                # Destroyed/Signals/...).
+                self.apply_environment_settings(self.services.get("Environment", {}))
             self.history.refresh_ui()
 
     def _start_physics(self) -> None:
@@ -1777,6 +1818,17 @@ class MultiplayerGame(Entity):
                 self._physics_world.set_gravity(-gravity_magnitude)
             if self._character_runtime is not None:
                 self._character_runtime.controller.gravity = gravity_magnitude
+            return
+
+        if service_name == "Environment":
+            # Stage 4.1: same "session-only, discarded on Stop" contract
+            # every other runtime service overlay already has -- this
+            # never touches self.services (the persisted dict), so
+            # set_studio_playing()'s Stop path re-applying
+            # self.services["Environment"] is what restores the authored
+            # values, exactly like every other Lua runtime mutation in
+            # this class.
+            self.apply_environment_settings(properties)
             return
 
         if service_name != "StarterPlayer":
@@ -2586,9 +2638,82 @@ class MultiplayerGame(Entity):
         self.ambient_light = AmbientLight()
         self.ambient_light.color = AMBIENT_LIGHT_COLOR
 
-        self.sun = DirectionalLight()
+        # shadows=False: suppresses Ursina's own DEFERRED (invoke(),
+        # ~1 frame later) default shadow setup, which would otherwise call
+        # its update_bounds() -- sizing the shadow frustum to the tight
+        # bounds of the WHOLE scene, including the 1000-unit sky sphere
+        # (SStudio's sky is a plain Entity, not a tracked ursina.prefabs.
+        # sky.Sky instance, so update_bounds()'s sky-exclusion never
+        # catches it) -- unusably low shadow resolution for a room-sized
+        # scene. apply_environment_settings() below (and every later call
+        # to it) is the sole, deliberate owner of self.sun.shadows instead.
+        self.sun = DirectionalLight(shadows=False)
         self.sun.color = SUN_LIGHT_COLOR
         self.sun.look_at(Vec3(1, -1, -1))
+
+        # Stage 4.1 (atmosphere slice): one Fog object, owned and mutated
+        # in place for the whole process lifetime -- never recreated, same
+        # "one clearly owned lifecycle" reasoning as self.pbr_pipeline.
+        self._environment_fog = Fog("EnvironmentFog")
+        self.apply_environment_settings(self.services.get("Environment", {}))
+
+    def apply_environment_settings(self, properties: dict[str, Any]) -> None:
+        """Applies Environment.* (Fog/Exposure/Shadows) to the live scene.
+        The ONE place this happens -- called from create_world() (initial
+        default), load_world_snapshot() (Place open/REPLACE_WORLD), Play
+        start and Stop (see set_studio_playing()), and runtime Lua writes
+        (see apply_runtime_service_write()) -- so there is exactly one
+        code path to reason about for "where do these settings apply".
+
+        Guarded by self._environment_state: repeatedly applying identical
+        properties (e.g. every Play/Stop cycle when nothing changed) must
+        not repeatedly rebuild the DirectionalLight's shadow buffer --
+        Panda3D's set_shadow_caster() reallocates its shadow buffer on
+        every call, so calling it every Play/Stop even with an unchanged
+        value would be a real (if slow) leak-like buffer churn, not just
+        pointless work."""
+        if properties == self._environment_state:
+            return
+        self._environment_state = dict(properties)
+
+        if self.pbr_pipeline is not None:
+            fog_enabled = bool(properties.get("FogEnabled", False))
+            self.pbr_pipeline.enable_fog = fog_enabled
+            if fog_enabled:
+                fog_color = properties.get("FogColor", [160.0, 165.0, 175.0])
+                self._environment_fog.setColor(
+                    float(fog_color[0]) / 255.0, float(fog_color[1]) / 255.0, float(fog_color[2]) / 255.0,
+                )
+                self._environment_fog.setExpDensity(float(properties.get("FogDensity", 0.01)))
+                application.base.render.setFog(self._environment_fog)
+            else:
+                application.base.render.clearFog()
+
+            self.pbr_pipeline.exposure = float(properties.get("Exposure", 0.0))
+
+        shadows_enabled = bool(properties.get("ShadowsEnabled", True))
+        # getattr(..., None), not self.sun.shadows: DirectionalLight's own
+        # `shadows` default is applied via a ONE-FRAME-DEFERRED invoke()
+        # (see ursina/lights.py), so immediately after construction
+        # self.sun._shadows may not exist yet -- reading the property
+        # directly here (this method runs synchronously right after
+        # DirectionalLight() in create_world()) would raise AttributeError.
+        if getattr(self.sun, "_shadows", None) != shadows_enabled:
+            self.sun.shadows = shadows_enabled
+        if shadows_enabled:
+            # Deliberately NOT self.sun.update_bounds(): that method sizes
+            # the shadow frustum to the TIGHT BOUNDS OF THE WHOLE SCENE,
+            # including the unlit sky sphere (scale=1000, see
+            # create_world()) -- SStudio's sky is a plain Entity, not an
+            # instance of ursina.prefabs.sky.Sky, so update_bounds()'s own
+            # sky-exclusion logic never catches it, producing a shadow map
+            # spread across ~2000 world units (unusably low resolution for
+            # a room-sized scene). ShadowDistance gives an explicit,
+            # predictable, author-controlled frustum instead.
+            distance = float(properties.get("ShadowDistance", 40.0))
+            lens = self.sun._light.get_lens()
+            lens.set_near_far(-distance, distance)
+            lens.set_film_size(distance * 2.0, distance * 2.0)
 
     def toggle_background(self) -> None:
         if self.background_mode == "sky":
@@ -4538,6 +4663,11 @@ class MultiplayerGame(Entity):
             # dict wholesale, same as parts above -- this is a brand-new
             # authoritative world, not a merge.
             self.services = datamodel_schema.sanitize_services_snapshot(raw_services)
+            # Stage 4.1: a brand-new authoritative world means a brand-new
+            # authoritative Environment too -- reapply fog/exposure/
+            # shadows to match whatever this Place actually has saved
+            # (or the schema defaults, for a Place with none yet).
+            self.apply_environment_settings(self.services.get("Environment", {}))
         finally:
             if self.studio_adapter is not None:
                 self.studio_adapter.end_snapshot_reload()
@@ -4668,6 +4798,15 @@ class MultiplayerGame(Entity):
             # _build_part_entity) — it only affects the Play Mode physics
             # body, applied fresh from current properties at the start of
             # each Play (see MultiplayerGame.set_studio_playing).
+            if record.class_name == "MeshPart" and (replace or "MeshId" in properties):
+                # Stage 4.1 follow-up: an Inspector edit to an EXISTING
+                # MeshPart's MeshId must hot-swap its geometry immediately
+                # (magenta placeholder -> real mesh), not just persist the
+                # new value for the next Place open. Gated to MeshPart
+                # only -- calling this unconditionally would attach a
+                # placeholder mesh child to every ordinary Part on its
+                # very first property edit.
+                self._apply_mesh_geometry(entity, str(merged.get("MeshId", "")))
         except (TypeError, ValueError, IndexError, KeyError) as error:
             print(f"[WORLD] Не удалось обновить {record.id}: {error}")
 
@@ -6097,8 +6236,18 @@ def main() -> int:
         vsync=True,
     )
 
+    # Stage 4.1 (atmosphere slice): capture the Pipeline object -- it used
+    # to be discarded entirely (simplepbr.init() called for its side
+    # effect only), which meant nothing in SStudio could ever reconfigure
+    # fog/exposure/shadows after startup. This is the ONE simplepbr.init()
+    # call for the whole process; it must never be called again (a second
+    # call would build a second, competing post-process pipeline, not
+    # reconfigure the first one) -- see MultiplayerGame.pbr_pipeline /
+    # apply_environment_settings() for the single owned-lifecycle contract
+    # this feeds into.
+    pbr_pipeline = None
     if SIMPLEPBR_AVAILABLE:
-        simplepbr.init()
+        pbr_pipeline = simplepbr.init()
         print("[MODEL] simplepbr инициализирован")
     else:
         print(
@@ -6119,6 +6268,7 @@ def main() -> int:
         server_url=arguments.server,
         player_name=arguments.name,
         legacy_demo=arguments.legacy_demo,
+        pbr_pipeline=pbr_pipeline,
     )
 
     # Stage 3.3 pointer-capture fix, supplementary safety net: Qt's own

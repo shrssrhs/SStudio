@@ -1633,18 +1633,19 @@ class RuntimeSceneLayer:
             elif key in ("Anchored", "CanCollide"):
                 self._overlay.setdefault(instance_id, {})[key] = bool(value)
             elif key == "MeshId":
-                # Stage 4.1: stored like any other has_3d_entity field.
-                # Deliberately NOT rebuilt into a live mesh swap here -- a
-                # MeshPart's geometry is loaded once, when its Entity is
-                # first built (creation, or the first time it becomes
-                # Workspace-attached; see _build_part_entity/
-                # _sync_world_attachment) -- changing MeshId afterward
-                # updates the serialized/Lua-visible value but does not
-                # hot-swap an already-built Entity's geometry. This keeps
-                # the property's behavior simple and matches what's
-                # actually tested/verified this sprint; hot-swapping is a
-                # reasonable future addition, not a silent correctness gap
-                # (the value it reports back is always what was last set).
+                # Stage 4.1 follow-up: a runtime Lua write here is
+                # deliberately NOT rebuilt into a live mesh swap -- unlike
+                # the EDITOR path (Inspector edits DO hot-swap immediately,
+                # see client_studio.py's _apply_instance_properties()),
+                # there is no established "Lua write should visually
+                # rebuild an Entity's geometry" precedent elsewhere in this
+                # class to extend, and the sprint's acceptance target is
+                # the authoring workflow, not scripted mesh-swapping. The
+                # written value is always correctly stored/reported back
+                # (get_property reads the same overlay); only an
+                # already-built Entity's geometry stays as it was. A
+                # genuinely fresh MeshPart (MeshId set before Parent =
+                # workspace) is unaffected -- see _build_part_entity.
                 if not isinstance(value, str):
                     return False, "MeshId must be a string"
                 self._overlay.setdefault(instance_id, {})[key] = value[:256]
@@ -2284,7 +2285,7 @@ _EXECUTION_ROOTS: tuple[str, ...] = ("Workspace", "ServerScriptService", "Starte
 # keeps failing cleanly when no gameplay layer is attached, instead of
 # silently handing back a useless memberless container.
 _GENERIC_CONTAINER_SERVICES: frozenset[str] = frozenset(
-    {"Workspace", "StarterPlayer", "StarterGui", "ReplicatedStorage", "ServerScriptService", "ServerStorage"}
+    {"Workspace", "StarterPlayer", "StarterGui", "ReplicatedStorage", "ServerScriptService", "ServerStorage", "Environment"}
 )
 
 
