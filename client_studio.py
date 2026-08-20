@@ -23,6 +23,8 @@ from ursina import (
     DirectionalLight,
     Entity,
     Grid,
+    PointLight as UrsinaPointLight,
+    SpotLight as UrsinaSpotLight,
     Text,
     Ursina,
     Vec3,
@@ -63,7 +65,7 @@ import place_manager
 import sstudio_templates
 from shared import object_registry, protocol
 from shared.instance import DEFAULT_PART_PROPERTIES, MIN_PART_SIZE
-from shared.object_registry import ROOT_SERVICES
+from shared.object_registry import LIGHT_CLASS_NAMES, ROOT_SERVICES
 from transform_gizmo import (
     DEFAULT_MOVE_SNAP,
     TransformGizmo,
@@ -729,17 +731,17 @@ PLACEHOLDER_FRONT_COLOR = color.rgb32(25, 25, 25)
 ARROW_COLOR = color.rgba32(20, 255, 120, 190)
 ARROW_TIP_COLOR = color.rgba32(20, 255, 120, 235)
 
-# Stage 4.1 rendering diagnosis: at (125,125,145), AmbientLight normalized
-# to ~0.49 gray -- applied UNIFORMLY to every surface by simplepbr's shader
-# (the ambient/IBL terms are NOT attenuated by the shadow factor, only the
-# direct per-light term is), so a fully-shadowed surface still kept ~half
-# of a fully-lit surface's brightness. That's the actual root cause of the
-# scene reading "flat gray" regardless of correctly-configured shadows/fog
-# -- there was never enough light/dark RANGE for shadow or fog contrast to
-# read as anything but subtle. Roughly halved here (~0.27) so directional
-# shading/shadows are actually visible while staying well short of unlit
-# black (Stage 4.1 spec: "should remain navigable and readable").
-AMBIENT_LIGHT_COLOR = color.rgba32(68, 68, 82, 255)
+# Stage 4.1 rendering diagnosis (superseded): AmbientLight used to be a
+# hardcoded constant here -- at its ORIGINAL (125,125,145), normalized to
+# ~0.49 gray, applied UNIFORMLY to every surface by simplepbr's shader (the
+# ambient/IBL terms are NOT attenuated by the shadow factor, only the
+# direct per-light term is), a fully-shadowed surface still kept ~half of a
+# fully-lit surface's brightness -- the actual root cause of the scene
+# reading "flat gray" regardless of correctly-configured shadows/fog, since
+# there was never enough light/dark RANGE for contrast to read as anything
+# but subtle. Now authored via Environment.AmbientColor/AmbientIntensity
+# (see apply_environment_settings()) -- default [68,68,82]*1.0 preserves
+# the corrected (~0.27, roughly halved) value exactly.
 SUN_LIGHT_COLOR = color.rgba32(235, 225, 205, 255)
 
 
@@ -1608,6 +1610,7 @@ class MultiplayerGame(Entity):
             self.gizmo.set_target(None)
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = False
+            self._set_light_markers_visible(False)
             self._start_physics()
             self._start_character()
             if self._camera_mode_locked_first_person:
@@ -1643,6 +1646,7 @@ class MultiplayerGame(Entity):
             self.release_play_input_capture()
             if self.selection_highlight is not None:
                 self.selection_highlight.enabled = True
+            self._set_light_markers_visible(True)
             if was_playing:
                 # Lua first: every task/coroutine must be cancelled and
                 # its scene overlay restored before physics tears down
@@ -1713,6 +1717,11 @@ class MultiplayerGame(Entity):
                 if record is None or not record.enabled:
                     if physics.DEBUG_PHYSICS and record is not None:
                         print(f"[PHYSICS] skip id={instance_id} name={record.name!r} (disabled)")
+                    continue
+                if record.class_name in LIGHT_CLASS_NAMES:
+                    # Stage 4.1 (local lighting foundation): lights are
+                    # real has_3d_entity Instances (world-membership,
+                    # picking, Clone/Destroy) but never get a Bullet body.
                     continue
                 properties = record.properties
                 position = properties.get("Position", [0.0, 0.0, 0.0])
@@ -2635,8 +2644,11 @@ class MultiplayerGame(Entity):
                 )
                 self.static_blocks.append(block)
 
+        # Stage 4.1: color is NOT set here -- apply_environment_settings()
+        # below (Environment.AmbientColor/AmbientIntensity) is the sole
+        # owner, same "one clearly owned lifecycle" reasoning as
+        # self._environment_fog/self.pbr_pipeline.
         self.ambient_light = AmbientLight()
-        self.ambient_light.color = AMBIENT_LIGHT_COLOR
 
         # shadows=False: suppresses Ursina's own DEFERRED (invoke(),
         # ~1 frame later) default shadow setup, which would otherwise call
@@ -2675,6 +2687,22 @@ class MultiplayerGame(Entity):
         if properties == self._environment_state:
             return
         self._environment_state = dict(properties)
+
+        # Stage 4.1 (local lighting foundation): AmbientColor*AmbientIntensity
+        # replaces the old hardcoded AMBIENT_LIGHT_COLOR constant -- see its
+        # own comment above for why this specific value matters (it's what
+        # makes shadow/local-light contrast visible at all). Independent of
+        # self.pbr_pipeline (a plain Ursina/Panda3D AmbientLight, not a
+        # simplepbr-owned setting), so it applies even if simplepbr isn't
+        # installed.
+        ambient_rgb = properties.get("AmbientColor", [68.0, 68.0, 82.0])
+        ambient_intensity = max(0.0, float(properties.get("AmbientIntensity", 1.0)))
+        self.ambient_light.color = color.rgba32(
+            min(255, max(0, int(float(ambient_rgb[0]) * ambient_intensity))),
+            min(255, max(0, int(float(ambient_rgb[1]) * ambient_intensity))),
+            min(255, max(0, int(float(ambient_rgb[2]) * ambient_intensity))),
+            255,
+        )
 
         if self.pbr_pipeline is not None:
             fog_enabled = bool(properties.get("FogEnabled", False))
@@ -4686,7 +4714,13 @@ class MultiplayerGame(Entity):
         load_mesh_node() и реэродителит её на тот же transform/collider-root,
         так что Position/Size/Rotation/выделение/picking-коллайдер и Bullet-
         физика (см. physics.py — AABB по-прежнему из Size, не по треугольникам)
-        работают identично обычному Part-у."""
+        работают identично обычному Part-у. PointLight/SpotLight (Stage 4.1)
+        dispatch entirely separately, BEFORE the Part-cube properties are
+        even indexed -- a light's own properties dict has no Size/Rotation/
+        Transparency at all (see shared/object_registry.py's registration),
+        so falling through to the code below would KeyError."""
+        if class_name in LIGHT_CLASS_NAMES:
+            return self._build_light_entity(class_name, properties)
         try:
             position = properties["Position"]
             size = properties["Size"]
@@ -4719,6 +4753,113 @@ class MultiplayerGame(Entity):
         if class_name == "MeshPart":
             self._apply_mesh_geometry(root, str(properties.get("MeshId", "")))
         return root
+
+    def _build_light_entity(self, class_name: str, properties: dict[str, Any]) -> Entity | None:
+        """PointLight/SpotLight (Stage 4.1 local lighting foundation).
+        UrsinaPointLight/UrsinaSpotLight ARE Entities (see ursina/lights.py)
+        that already self-register with Panda3D's render.setLight() on
+        construction -- no separate "attach the light" step needed, same
+        as self.ambient_light/self.sun in create_world(). A small always-
+        visible-in-editor marker sphere is added as a child purely so the
+        (otherwise geometry-less) light can be seen/selected/moved --
+        its own enabled state is toggled off during Play by
+        set_studio_playing() (see _light_markers), matching the spec's
+        "must NOT render as game geometry during Play" requirement. The
+        light entity itself keeps a small picking collider, same
+        "always a picking collider, independent of gameplay semantics"
+        reasoning _build_part_entity's own docstring gives for Parts."""
+        try:
+            position = properties.get("Position", [0.0, 0.0, 0.0])
+            light_cls = UrsinaPointLight if class_name == "PointLight" else UrsinaSpotLight
+            light_entity = light_cls(
+                position=Vec3(float(position[0]), float(position[1]), float(position[2])),
+                collider="box",
+            )
+        except (TypeError, ValueError, IndexError, KeyError) as error:
+            print(f"[WORLD] Не удалось построить Entity света: битые properties: {error}")
+            return None
+
+        if class_name == "SpotLight":
+            rotation = properties.get("Rotation", [0.0, 0.0, 0.0])
+            try:
+                light_entity.rotation = Vec3(float(rotation[0]), float(rotation[1]), float(rotation[2]))
+            except (TypeError, ValueError, IndexError):
+                pass
+
+        marker = Entity(
+            parent=light_entity,
+            model="sphere",
+            scale=0.3,
+            color=color.rgba32(255, 255, 200, 255),
+            unlit=True,
+            collider=None,
+        )
+        light_entity._editor_marker = marker
+        marker.enabled = not self.studio_playing
+
+        self._apply_light_properties(light_entity, class_name, properties)
+        return light_entity
+
+    def _apply_light_properties(self, entity: Entity, class_name: str, properties: dict[str, Any]) -> None:
+        """The ONE place PointLight/SpotLight's Color/Intensity/Range/Angle
+        actually reach the real Panda3D light node -- called from
+        _build_light_entity (initial build), _apply_instance_properties
+        (editor/Inspector edits), and RuntimeSceneLayer._apply_visual (Lua
+        writes -- see its own docstring for why this Panda3D-specific work
+        lives here rather than in lua_runtime.py). Range/Intensity are
+        deliberately a small, creator-friendly abstraction over Panda3D's
+        raw quadratic-attenuation coefficients (spec: "do not expose low-
+        level attenuation coefficients directly unless unavoidable"):
+        constant=1, linear=0, quadratic=1/Range^2 -- a standard, simple,
+        documented convention (brightness is roughly halved at
+        distance=Range), not a claim of physical correctness."""
+        light = getattr(entity, "_light", None)
+        if light is None:
+            return
+        try:
+            rgb = properties.get("Color", [255, 255, 255])
+            intensity = max(0.0, float(properties.get("Intensity", 1.0)))
+            light.setColor((
+                float(rgb[0]) / 255.0 * intensity,
+                float(rgb[1]) / 255.0 * intensity,
+                float(rgb[2]) / 255.0 * intensity,
+                1.0,
+            ))
+            light_range = max(0.01, float(properties.get("Range", 8.0)))
+            quadratic = 1.0 / (light_range * light_range)
+            light.setAttenuation(Vec3(1.0, 0.0, quadratic))
+            if class_name == "SpotLight":
+                angle = max(1.0, min(179.0, float(properties.get("Angle", 45.0))))
+                light.getLens().setFov(angle, angle)
+                # Stage 4.1 (local lighting foundation): SpotLight shadows
+                # ARE enabled -- a Spotlight uses one PerspectiveLens, the
+                # same "one shadow camera" shape DirectionalLight already
+                # uses successfully, unlike PointLight (which would need a
+                # 6-face cube shadow map -- genuinely more complex/costly,
+                # deliberately deferred, not implemented this pass). Small
+                # fixed 512x512 map (half DirectionalLight's 1024, since
+                # these are local/smaller-scale fixtures) -- not exposed as
+                # an authorable property, always on for SpotLight, always
+                # off for PointLight. Guarded the same way DirectionalLight
+                # is (only call setShadowCaster once) since it reallocates
+                # a real buffer every call.
+                if not getattr(entity, "_shadow_caster_enabled", False):
+                    light.setShadowCaster(True, 512, 512)
+                    entity._shadow_caster_enabled = True
+        except (TypeError, ValueError, IndexError, AttributeError):
+            pass
+
+    def _set_light_markers_visible(self, visible: bool) -> None:
+        """Toggles every PointLight/SpotLight's editor-only marker sphere
+        (see _build_light_entity) -- called from set_studio_playing() at
+        Play start (False) and Stop (True), same "editor-only visual must
+        not render as game geometry during Play" pattern already used for
+        self.selection_highlight. The light itself (and its illumination)
+        is never touched here -- only the small visible marker child."""
+        for entity in self.parts.values():
+            marker = getattr(entity, "_editor_marker", None)
+            if marker is not None:
+                marker.enabled = visible
 
     def _apply_mesh_geometry(self, entity: Entity, mesh_id: str) -> None:
         """(Re)loads a MeshPart's visual geometry onto `entity`, replacing
@@ -4777,17 +4918,23 @@ class MultiplayerGame(Entity):
         entity.instance_properties = record.properties
         merged = record.properties
 
+        is_light = record.class_name in LIGHT_CLASS_NAMES
         try:
-            if replace or "Position" in properties:
+            # .get(...) here, not direct indexing -- PointLight/SpotLight
+            # (Stage 4.1) don't carry Size at all, and PointLight has no
+            # Rotation either (see shared/object_registry.py), so a
+            # replace=True full-record update must not assume every
+            # Part-shaped key exists.
+            if (replace or "Position" in properties) and "Position" in merged:
                 position = merged["Position"]
                 entity.position = Vec3(float(position[0]), float(position[1]), float(position[2]))
-            if replace or "Size" in properties:
+            if (replace or "Size" in properties) and "Size" in merged:
                 size = merged["Size"]
                 entity.scale = Vec3(float(size[0]), float(size[1]), float(size[2]))
-            if replace or "Rotation" in properties:
+            if (replace or "Rotation" in properties) and "Rotation" in merged:
                 rotation = merged["Rotation"]
                 entity.rotation = Vec3(float(rotation[0]), float(rotation[1]), float(rotation[2]))
-            if replace or "Color" in properties or "Transparency" in properties:
+            if not is_light and (replace or "Color" in properties or "Transparency" in properties):
                 rgb = merged.get("Color", [255, 255, 255])
                 transparency = merged.get("Transparency", 0.0)
                 entity.color = color.rgba32(
@@ -4807,6 +4954,11 @@ class MultiplayerGame(Entity):
                 # placeholder mesh child to every ordinary Part on its
                 # very first property edit.
                 self._apply_mesh_geometry(entity, str(merged.get("MeshId", "")))
+            if is_light and (
+                replace or "Color" in properties or "Intensity" in properties
+                or "Range" in properties or "Angle" in properties
+            ):
+                self._apply_light_properties(entity, record.class_name, merged)
         except (TypeError, ValueError, IndexError, KeyError) as error:
             print(f"[WORLD] Не удалось обновить {record.id}: {error}")
 

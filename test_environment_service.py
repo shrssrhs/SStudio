@@ -41,7 +41,7 @@ from PySide6.QtWidgets import QApplication
 
 app = QApplication.instance() or QApplication([])
 
-from ursina import DirectionalLight, Ursina
+from ursina import AmbientLight, DirectionalLight, Ursina
 
 ursina_app = Ursina(window_type="none")
 
@@ -103,6 +103,7 @@ class _FakeGame:
         # deferred (invoke(), ~1 frame later) default shadow setup so it
         # can't race with a test's own synchronous assertions.
         self.sun = DirectionalLight(shadows=False)
+        self.ambient_light = AmbientLight()
         self._environment_fog = Fog("TestEnvironmentFog")
         self.pbr_pipeline = _FakePipeline() if with_pipeline else None
         self._environment_state: dict | None = None
@@ -158,6 +159,8 @@ def test_default_values_match_current_appearance() -> None:
     check(defaults["Exposure"] == 0.0, "Exposure defaults to 0.0 (neutral, matches current appearance)")
     check(defaults["ShadowsEnabled"] is True, "ShadowsEnabled defaults to True (existing DirectionalLight already casts light)")
     check(defaults["ShadowDistance"] == 40.0, "ShadowDistance has a sane default")
+    check(defaults["AmbientColor"] == [68.0, 68.0, 82.0], "AmbientColor defaults to the exact value the old hardcoded constant held")
+    check(defaults["AmbientIntensity"] == 1.0, "AmbientIntensity defaults to 1.0 (neutral multiplier -- reproduces AmbientColor exactly)")
 
 
 def test_environment_reachable_via_sanitize_services_snapshot() -> None:
@@ -282,6 +285,43 @@ def test_exposure_change_applies() -> None:
         check(game.pbr_pipeline.exposure == 3.0, "a brighter exposure value is applied")
     finally:
         game.teardown()
+
+
+def test_ambient_color_and_intensity_apply_to_the_real_ambient_light() -> None:
+    game = _FakeGame()
+    try:
+        game.apply_environment_settings({"AmbientColor": [100.0, 50.0, 200.0], "AmbientIntensity": 1.0})
+        applied = tuple(game.ambient_light.color)
+        expected = (100.0 / 255.0, 50.0 / 255.0, 200.0 / 255.0)
+        check(all(abs(a - e) < 0.01 for a, e in zip(applied[:3], expected)), f"AmbientColor at Intensity=1.0 reaches the real AmbientLight: got {applied[:3]}, expected {expected}")
+
+        game.apply_environment_settings({"AmbientColor": [100.0, 50.0, 200.0], "AmbientIntensity": 0.0})
+        applied_dark = tuple(game.ambient_light.color)
+        check(all(abs(c) < 0.01 for c in applied_dark[:3]), f"AmbientIntensity=0.0 gives a genuinely dark (black) ambient contribution: got {applied_dark[:3]}")
+    finally:
+        game.teardown()
+
+
+def test_ambient_persists_through_save_open_and_restores_after_lua_session() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        game.services = datamodel_schema.sanitize_services_snapshot({"Environment": {"AmbientColor": [10.0, 10.0, 10.0], "AmbientIntensity": 0.2}})
+        game.apply_environment_settings(game.services["Environment"])
+        dark_applied = tuple(game.ambient_light.color)
+
+        ok, err = manager.scene.set_property("Environment", "AmbientIntensity", 2.0)
+        check(ok, f"Environment.AmbientIntensity = 2.0 from Lua succeeds: {err}")
+        bright_applied = tuple(game.ambient_light.color)
+        check(bright_applied[0] > dark_applied[0], "the runtime Lua write actually brightened the live ambient light")
+        check(game.services["Environment"]["AmbientIntensity"] == 0.2, "...but the persisted services dict is untouched (session-only, same contract as Fog/Exposure)")
+
+        # Simulate Stop's restore step.
+        game.apply_environment_settings(game.services.get("Environment", {}))
+        restored = tuple(game.ambient_light.color)
+        check(all(abs(a - b) < 0.001 for a, b in zip(restored, dark_applied)), "re-applying the persisted Environment (Stop's restore step) brings ambient back to the authored dark value")
+    finally:
+        teardown(game, manager, ctx)
 
 
 def test_shadow_configuration_state() -> None:
@@ -423,6 +463,8 @@ test_apply_environment_settings_writes_pipeline_fields()
 test_apply_environment_settings_is_a_no_op_without_a_pipeline()
 test_fog_enable_disable_toggles_the_render_fog_node()
 test_exposure_change_applies()
+test_ambient_color_and_intensity_apply_to_the_real_ambient_light()
+test_ambient_persists_through_save_open_and_restores_after_lua_session()
 test_shadow_configuration_state()
 test_repeated_identical_apply_does_not_retouch_shadow_caster()
 test_changed_shadow_distance_does_retouch_lens_but_not_necessarily_caster()

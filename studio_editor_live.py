@@ -2402,6 +2402,7 @@ class InspectorPanel(QWidget):
             "container": self._build_container_section,
             "pivot": self._build_pivot_section,
             "mesh": self._build_mesh_section,
+            "light": self._build_light_section,
             "script": lambda o: self._build_script_section(o, definition),
             "placeholder": lambda o: self._build_placeholder_section(o, definition),
         }
@@ -2559,6 +2560,50 @@ class InspectorPanel(QWidget):
         transform.add_row("Scale", scale)
         transform.add_row("Size", size)
         return transform
+
+    def _build_light_section(self, obj: SceneObject) -> CollapsibleSection:
+        """Stage 4.1 (local lighting foundation): minimum PointLight/
+        SpotLight authoring. Position/[Rotation] reuse the same
+        VectorEditor + self._set_value("position"/"rotation", ...) path
+        Transform normally uses -- lights get their own section instead of
+        the full Transform one since Scale/Size don't apply to them.
+        Color reuses ColorField + self._set_value("color", ...) exactly
+        like Appearance's own Color row (obj.color is already correctly
+        populated for any has_3d_entity class, lights included -- see
+        instance_to_scene_object()). Intensity/Range/[Angle] go through
+        the existing generic "properties.<key>" write path, same as
+        MeshId -- no new property-edit machinery anywhere in this method."""
+        light = CollapsibleSection("Light")
+
+        position = VectorEditor(obj.position, "position")
+        position.value_changed.connect(self._set_value)
+        light.add_row("Position", position)
+        self._live_vector_editors["position"] = position
+
+        if obj.object_type == "SpotLight":
+            rotation = VectorEditor(obj.rotation, "rotation")
+            rotation.value_changed.connect(self._set_value)
+            light.add_row("Rotation", rotation)
+            self._live_vector_editors["rotation"] = rotation
+
+        color_field = ColorField(obj.color)
+        color_field.color_selected.connect(lambda value: self._set_value("color", value))
+        light.add_row("Color", color_field)
+
+        intensity = self._float_box(float(obj.properties.get("Intensity", 1.0)), 0.0, 20.0, 0.1)
+        intensity.valueChanged.connect(lambda value: self._set_value("properties.Intensity", float(value)))
+        light.add_row("Intensity", intensity)
+
+        light_range = self._float_box(float(obj.properties.get("Range", 8.0)), 0.1, 100.0, 0.5)
+        light_range.valueChanged.connect(lambda value: self._set_value("properties.Range", float(value)))
+        light.add_row("Range", light_range)
+
+        if obj.object_type == "SpotLight":
+            angle = self._float_box(float(obj.properties.get("Angle", 45.0)), 1.0, 179.0, 1.0)
+            angle.valueChanged.connect(lambda value: self._set_value("properties.Angle", float(value)))
+            light.add_row("Angle", angle)
+
+        return light
 
     def _build_mesh_section(self, obj: SceneObject) -> CollapsibleSection:
         """Stage 4.1 follow-up: minimum MeshId authoring for MeshPart --

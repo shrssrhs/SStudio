@@ -192,6 +192,16 @@ def sanitize_properties_for_type(type_id: str, raw_properties: Any) -> dict[str,
     return clean
 
 
+# Stage 4.1 (local lighting foundation): has_3d_entity classes that are
+# real spatial Instances (Position, world-membership, Clone/Destroy, ...)
+# but are NOT Part-shaped -- no picking-relevant Size/Anchored/CanCollide
+# collider, and MUST NEVER get a Bullet physics body. Every
+# self._physics(.world).add_part(...) call site in lua_runtime.py/
+# client_studio.py checks this before adding a body, rather than each
+# guessing "is this a light" from class_name directly -- one definition.
+LIGHT_CLASS_NAMES: tuple[str, ...] = ("PointLight", "SpotLight")
+
+
 # ============================================================
 # ПЕРВАЯ ВЕРСИЯ НАБОРА ТИПОВ
 # ============================================================
@@ -412,23 +422,70 @@ def _register_defaults() -> None:
         inspector_sections=("transform", "appearance", "behavior"),
     ))
 
+    # Stage 4.1 (local lighting foundation): a real spatial light Instance,
+    # not the old "not implemented yet" placeholder. Deliberately NOT
+    # has_3d_entity in the Part sense (no Size/Anchored/CanCollide/Material/
+    # MeshId) -- see LIGHT_CLASS_NAMES's own comment for why every physics-
+    # body-adding call site excludes it. Position is still declared here
+    # (client_studio.py's has_3d_entity property-read/write branches handle
+    # Position/Color generically for every has_3d_entity class already;
+    # Intensity/Range are new, light-specific fields).
     register_object_type(ObjectTypeDefinition(
         type_id="PointLight",
         display_name="PointLight",
         category="World",
-        description="Editor-only placeholder — real-time lighting is not implemented yet.",
+        description="A local light source that illuminates nearby geometry with distance falloff.",
         icon="light",
         default_parent="Workspace",
         allowed_parent_types=_CONTAINER_PARENTS,
-        keywords=("light", "lamp", "glow"),
-        default_properties={"Color": [255, 255, 255], "Brightness": 1.0, "Range": 8.0},
+        keywords=("light", "lamp", "glow", "point"),
+        default_properties={
+            "Position": [0.0, 0.0, 0.0],
+            "Color": [255, 255, 255],
+            "Intensity": 1.0,
+            "Range": 8.0,
+        },
         property_schema={
+            "Position": PropertySpec("vector3"),
             "Color": PropertySpec("color"),
-            "Brightness": PropertySpec("float"),
+            "Intensity": PropertySpec("float"),
             "Range": PropertySpec("float"),
         },
-        editor_only=True,
-        inspector_sections=("placeholder",),
+        has_3d_entity=True,
+        inspector_sections=("light",),
+    ))
+
+    # SpotLight reuses the exact same foundation as PointLight (position,
+    # color, intensity, range, world-membership, no physics) plus ordinary
+    # Instance Rotation for orientation (no separate look-vector API) and
+    # one extra field, Angle (cone half-angle in degrees).
+    register_object_type(ObjectTypeDefinition(
+        type_id="SpotLight",
+        display_name="SpotLight",
+        category="World",
+        description="A directional cone light source -- for fixtures, spots, and focused pools of light.",
+        icon="light",
+        default_parent="Workspace",
+        allowed_parent_types=_CONTAINER_PARENTS,
+        keywords=("light", "lamp", "spot", "cone", "fixture"),
+        default_properties={
+            "Position": [0.0, 0.0, 0.0],
+            "Rotation": [0.0, 0.0, 0.0],
+            "Color": [255, 255, 255],
+            "Intensity": 1.0,
+            "Range": 10.0,
+            "Angle": 45.0,
+        },
+        property_schema={
+            "Position": PropertySpec("vector3"),
+            "Rotation": PropertySpec("vector3"),
+            "Color": PropertySpec("color"),
+            "Intensity": PropertySpec("float"),
+            "Range": PropertySpec("float"),
+            "Angle": PropertySpec("float"),
+        },
+        has_3d_entity=True,
+        inspector_sections=("light",),
     ))
 
     register_object_type(ObjectTypeDefinition(

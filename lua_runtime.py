@@ -1319,6 +1319,14 @@ class RuntimeSceneLayer:
                 # per-class error, matching how Color/Transparency etc. are
                 # already handled uniformly across every has_3d_entity class.
                 return "string", str(overlay.get(key, base.get(key, "")))
+            if key == "Intensity":
+                # Stage 4.1 (local lighting foundation): PointLight/SpotLight
+                # only, same "harmless on other classes" reasoning as MeshId.
+                return "number", float(overlay.get(key, base.get(key, 1.0)))
+            if key == "Range":
+                return "number", float(overlay.get(key, base.get(key, 8.0)))
+            if key == "Angle":
+                return "number", float(overlay.get(key, base.get(key, 45.0)))
             return "error", f"'{key}' is not a valid member of {class_name}"
 
         # Stage 3.9: generic schema-driven property read for classes with
@@ -1498,7 +1506,12 @@ class RuntimeSceneLayer:
                     entity.enabled = True
                 except Exception:
                     pass
-            if self._physics is not None and not self._physics.has_body(instance_id):
+            from shared.object_registry import LIGHT_CLASS_NAMES
+            if (
+                self._physics is not None
+                and not self._physics.has_body(instance_id)
+                and class_name not in LIGHT_CLASS_NAMES
+            ):
                 self._physics.add_part(
                     instance_id, entity, properties.get("Position", [0.0, 0.0, 0.0]),
                     properties.get("Rotation", [0.0, 0.0, 0.0]), properties.get("Size", [1.0, 1.0, 1.0]),
@@ -1649,6 +1662,13 @@ class RuntimeSceneLayer:
                 if not isinstance(value, str):
                     return False, "MeshId must be a string"
                 self._overlay.setdefault(instance_id, {})[key] = value[:256]
+            elif key in ("Intensity", "Range", "Angle"):
+                # Stage 4.1 (local lighting foundation): PointLight/
+                # SpotLight only -- reading these on a non-light class is
+                # harmless (see get_property's own comment), and writing
+                # them is likewise stored without a class check, matching
+                # every other has_3d_entity field's uniform treatment.
+                self._overlay.setdefault(instance_id, {})[key] = float(value)
             else:
                 return False, f"'{key}' is not a valid member of {class_name}"
         except (TypeError, ValueError, IndexError):
@@ -1692,6 +1712,21 @@ class RuntimeSceneLayer:
         except (TypeError, ValueError, IndexError):
             pass
 
+        from shared.object_registry import LIGHT_CLASS_NAMES
+        class_name = self.class_name_of(instance_id)
+        if class_name in LIGHT_CLASS_NAMES:
+            # Stage 4.1 (local lighting foundation): Intensity/Range/Angle
+            # are light-specific (not part of the generic block above) --
+            # the actual Panda3D setColor(scaled)/setAttenuation()/setFov()
+            # calls live in client_studio.py (_apply_light_properties),
+            # same delegation pattern MeshId hot-swapping already uses for
+            # _apply_mesh_geometry, keeping Panda3D-light-API specifics out
+            # of this engine-agnostic-ish module.
+            try:
+                self.game._apply_light_properties(entity, class_name, merged)
+            except Exception:
+                pass
+
     def _rebuild_physics(self, instance_id: str) -> None:
         """Direct Position/Rotation/Size/Anchored/CanCollide assignment
         teleports and resets velocity (documented Stage 3.0 policy) --
@@ -1702,6 +1737,9 @@ class RuntimeSceneLayer:
             return
         entity = self._entity_for(instance_id)
         if entity is None:
+            return
+        from shared.object_registry import LIGHT_CLASS_NAMES
+        if self.class_name_of(instance_id) in LIGHT_CLASS_NAMES:
             return
         merged = self._merged_properties(instance_id)
         had_body = self._physics.has_body(instance_id)
@@ -1791,7 +1829,8 @@ class RuntimeSceneLayer:
                 if entity is not None:
                     item.entity = entity
                     self.game.parts[runtime_id] = entity
-                    if self._physics is not None:
+                    from shared.object_registry import LIGHT_CLASS_NAMES
+                    if self._physics is not None and class_name not in LIGHT_CLASS_NAMES:
                         self._physics.add_part(
                             runtime_id, entity, properties["Position"], properties["Rotation"], properties["Size"],
                             bool(properties.get("Anchored", True)), bool(properties.get("CanCollide", True)),

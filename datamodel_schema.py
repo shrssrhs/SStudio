@@ -568,6 +568,24 @@ register_class(ClassDescriptor(
             "ShadowDistance", "float", category="Shadows", default=40.0,
             minimum=1.0, maximum=500.0,
         ),
+        PropertyDescriptor(
+            # Stage 4.1 (local lighting foundation): was a hardcoded
+            # AMBIENT_LIGHT_COLOR constant in client_studio.py -- moved
+            # here so a Place can author a dark/moody ambient without a
+            # source-code change. Default [68,68,82] is the EXACT value
+            # the constant used to hold (see its own Stage 4.1 rendering-
+            # diagnosis comment), so existing appearance is preserved
+            # exactly at defaults.
+            "AmbientColor", "color3", category="Ambient", default=[68.0, 68.0, 82.0],
+        ),
+        PropertyDescriptor(
+            # Multiplies AmbientColor -- 1.0 (neutral) reproduces
+            # AmbientColor exactly; 0.0 gives genuinely dark unlit areas
+            # (ambient contributes nothing, only direct/local lights
+            # matter); values above 1.0 are allowed for a washed-out look.
+            "AmbientIntensity", "float", category="Ambient", default=1.0,
+            minimum=0.0, maximum=4.0,
+        ),
     ),
 ))
 
@@ -649,6 +667,13 @@ for _legacy_name, _legacy_base in (
     # of a primitive cube) and one extra property (MeshId) -- basing it on
     # "Part" here for the same IsA("Part") reasoning as SpawnPoint above.
     ("MeshPart", "Part"),
+    # Stage 4.1 (local lighting foundation): lights are has_3d_entity
+    # (Position, world-membership, Clone/Destroy) but NOT Part-like (no
+    # physics body ever -- see shared.object_registry.LIGHT_CLASS_NAMES),
+    # so they base on "Instance" directly, same reasoning as the Value
+    # classes below, not "Part" like SpawnPoint/MeshPart.
+    ("PointLight", "Instance"),
+    ("SpotLight", "Instance"),
     # Stage 3.9: gameplay-state primitives (see shared/object_registry.py
     # registration) -- registered here too, purely so IsA("Instance") and
     # class_chain() resolve correctly for them; their actual properties are
