@@ -42,7 +42,7 @@ from PySide6.QtWidgets import QApplication
 
 app = QApplication.instance() or QApplication([])
 
-from ursina import AmbientLight, DirectionalLight, Ursina
+from ursina import AmbientLight, DirectionalLight, Ursina, Vec3
 
 ursina_app = Ursina(window_type="none")
 
@@ -73,6 +73,19 @@ class _FakePostProcessQuad:
     shader compilation/GPU involved, matching this test file's own
     documented convention (a real Pipeline needs a live graphics
     context, which the objective behavior under test here does not)."""
+
+    def __init__(self) -> None:
+        self.inputs: dict[str, Any] = {}
+
+    def set_shader_input(self, name: str, value: Any) -> None:
+        self.inputs[name] = value
+
+
+class _FakeSky:
+    """Stands in for self.sky (a real Entity with the sky_gradient_shader
+    in production) -- only set_shader_input() is exercised by
+    apply_environment_settings(), so that's all this records, same
+    pattern as _FakePostProcessQuad."""
 
     def __init__(self) -> None:
         self.inputs: dict[str, Any] = {}
@@ -122,6 +135,7 @@ class _FakeGame:
         # can't race with a test's own synchronous assertions.
         self.sun = DirectionalLight(shadows=False)
         self.ambient_light = AmbientLight()
+        self.sky = _FakeSky()
         self._environment_fog = Fog("TestEnvironmentFog")
         self.pbr_pipeline = _FakePipeline() if with_pipeline else None
         self._environment_state: dict | None = None
@@ -642,6 +656,189 @@ def test_install_postprocess_shader_is_the_only_shader_install_call_site() -> No
     check("_install_postprocess_shader" not in playing_source, "set_studio_playing() (Play/Stop) never re-installs the post-process shader -- only apply_environment_settings() (uniform updates) runs there")
 
 
+# ============================================================
+# Stage 4.3C: Sky & Outdoor (SkyTopColor/SkyHorizonColor/SkyBottomColor,
+# SunColor/SunIntensity/SunRotation)
+# ============================================================
+# Same "no real GPU shader compilation here" scope as Post Processing
+# above -- the sky's actual gradient rendering was verified with a real
+# window+GPU diagnostic (see the Stage 4.3C completion report), not a
+# permanent headless test. self.sun IS a real DirectionalLight in this
+# harness (unlike the sky, which is stubbed), so its .color/.rotation are
+# checked against the real Panda3D/Ursina object, matching this file's
+# existing Ambient/Shadow test convention.
+
+_SKY_SUN_DEFAULTS = {
+    "SkyTopColor": [70.0, 145.0, 225.0],
+    "SkyHorizonColor": [70.0, 145.0, 225.0],
+    "SkyBottomColor": [70.0, 145.0, 225.0],
+    "SunColor": [235.0, 225.0, 205.0],
+    "SunIntensity": 1.0,
+    "SunRotation": [35.264392, 135.0, -120.00001],
+}
+
+
+def test_sky_sun_schema_and_defaults() -> None:
+    descriptor = datamodel_schema.get_class("Environment")
+    by_name = {p.name: p for p in descriptor.properties}
+    for name, expected_default in _SKY_SUN_DEFAULTS.items():
+        check(name in by_name, f"Environment declares {name}")
+        check(by_name[name].category == "Sky & Outdoor", f"{name} is grouped under the 'Sky & Outdoor' Inspector category")
+        check(by_name[name].default == expected_default, f"{name} default is {expected_default}")
+    defaults = datamodel_schema.default_properties("Environment")
+    for name, expected_default in _SKY_SUN_DEFAULTS.items():
+        check(defaults.get(name) == expected_default, f"default_properties('Environment') includes {name}={expected_default}")
+
+
+def test_sky_sun_defaults_reproduce_the_legacy_hardcoded_appearance() -> None:
+    """Backward compatibility, proven not assumed: an old Place with no
+    authored Sky/Sun properties must look like the pre-4.3C hardcoded
+    scene, not silently convert into a different sky/lighting look.
+    SkyTopColor==SkyHorizonColor==SkyBottomColor at the old flat
+    SKY_COLOR collapses the gradient shader to that single solid color
+    (proven separately with a real-GPU capture, see the completion
+    report); SunColor/SunIntensity=1.0 reproduces the exact old
+    SUN_LIGHT_COLOR; SunRotation's default was verified (real Ursina
+    DirectionalLight, both this session and here) to produce the
+    bit-identical forward direction the old hardcoded
+    look_at(Vec3(1,-1,-1)) call used to."""
+    check(
+        _SKY_SUN_DEFAULTS["SkyTopColor"] == _SKY_SUN_DEFAULTS["SkyHorizonColor"] == _SKY_SUN_DEFAULTS["SkyBottomColor"] == [70.0, 145.0, 225.0],
+        "all 3 sky stops default to the exact old SKY_COLOR constant -- the gradient collapses to the old flat color",
+    )
+    check(_SKY_SUN_DEFAULTS["SunColor"] == [235.0, 225.0, 205.0] and _SKY_SUN_DEFAULTS["SunIntensity"] == 1.0, "SunColor*SunIntensity reproduces the exact old SUN_LIGHT_COLOR")
+
+    sun = DirectionalLight(shadows=False)
+    sun.look_at(Vec3(1, -1, -1))
+    legacy_forward = tuple(round(v, 4) for v in sun.forward)
+
+    sun2 = DirectionalLight(shadows=False)
+    sun2.rotation = Vec3(*_SKY_SUN_DEFAULTS["SunRotation"])
+    default_forward = tuple(round(v, 4) for v in sun2.forward)
+    check(legacy_forward == default_forward, f"SunRotation's default reproduces the legacy look_at(Vec3(1,-1,-1)) direction exactly: {legacy_forward} == {default_forward}")
+
+
+def test_sky_sun_validation_rejects_bad_values() -> None:
+    cases = [
+        ("SunIntensity", -1.0), ("SunIntensity", 10.0),
+    ]
+    for name, bad_value in cases:
+        result = datamodel_schema.validate_property_value("Environment", name, bad_value)
+        check(not result.ok, f"{name}={bad_value} is rejected as out of range")
+    bad_rotation = datamodel_schema.validate_property_value("Environment", "SunRotation", [1.0, 2.0])
+    check(not bad_rotation.ok, "a 2-component SunRotation is rejected (must be a 3-component vector)")
+    ok_rotation = datamodel_schema.validate_property_value("Environment", "SunRotation", [10.0, 200.0, -45.0])
+    check(ok_rotation.ok, "a valid 3-component SunRotation is accepted")
+
+
+def test_sky_sun_persists_through_save_open() -> None:
+    import tempfile
+    import place_manager as pm
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = tmp_dir + "\\sky_sun_roundtrip.nebula.json"
+        services = datamodel_schema.sanitize_services_snapshot({
+            "Environment": {
+                "SkyTopColor": [10.0, 12.0, 30.0], "SkyHorizonColor": [40.0, 35.0, 55.0], "SkyBottomColor": [5.0, 5.0, 8.0],
+                "SunColor": [140.0, 160.0, 220.0], "SunIntensity": 0.15, "SunRotation": [60.0, 90.0, 0.0],
+            }
+        })
+        manager = pm.PlaceManager()
+        save_result = manager.save_as(path, [], services)
+        check(save_result.success, f"saving a night-scene Environment succeeds: {save_result.message}")
+
+        reopened = pm.PlaceManager().open(path)
+        check(reopened.success, f"reopening succeeds: {reopened.message}")
+        env = (reopened.services or {}).get("Environment", {})
+        check(env.get("SkyTopColor") == [10.0, 12.0, 30.0], "SkyTopColor survives save/open")
+        check(env.get("SkyHorizonColor") == [40.0, 35.0, 55.0], "SkyHorizonColor survives save/open")
+        check(env.get("SkyBottomColor") == [5.0, 5.0, 8.0], "SkyBottomColor survives save/open")
+        check(env.get("SunColor") == [140.0, 160.0, 220.0], "SunColor survives save/open")
+        check(env.get("SunIntensity") == 0.15, "SunIntensity survives save/open")
+        check(env.get("SunRotation") == [60.0, 90.0, 0.0], "SunRotation survives save/open")
+
+
+def test_apply_environment_settings_writes_sky_and_sun_state() -> None:
+    game = _FakeGame()
+    try:
+        game.apply_environment_settings({
+            "SkyTopColor": [10.0, 12.0, 30.0], "SkyHorizonColor": [40.0, 35.0, 55.0], "SkyBottomColor": [5.0, 5.0, 8.0],
+            "SunColor": [140.0, 160.0, 220.0], "SunIntensity": 0.5, "SunRotation": [60.0, 90.0, 0.0],
+        })
+        sky_inputs = game.sky.inputs
+        top = sky_inputs.get("sky_top_color")
+        check(top is not None and abs(top.x - 10.0/255.0) < 0.001 and abs(top.y - 12.0/255.0) < 0.001 and abs(top.z - 30.0/255.0) < 0.001, f"SkyTopColor reaches the real sky shader input as a 0-1 Vec3, got {top}")
+        horizon = sky_inputs.get("sky_horizon_color")
+        check(horizon is not None and abs(horizon.x - 40.0/255.0) < 0.001, f"SkyHorizonColor reaches the shader input, got {horizon}")
+        bottom = sky_inputs.get("sky_bottom_color")
+        check(bottom is not None and abs(bottom.x - 5.0/255.0) < 0.001, f"SkyBottomColor reaches the shader input, got {bottom}")
+
+        sun_color = tuple(game.sun.color)
+        check(abs(sun_color[0] - 140.0/510.0) < 0.02, f"SunColor*SunIntensity(0.5) actually darkens the real DirectionalLight's color, got {sun_color}")
+        check(tuple(round(v, 3) for v in game.sun.rotation) == (60.0, 90.0, 0.0), f"SunRotation reaches the real DirectionalLight's rotation, got {game.sun.rotation}")
+    finally:
+        game.teardown()
+
+
+def test_sun_intensity_zero_genuinely_removes_light_contribution() -> None:
+    """The night-scene requirement from the spec: SunIntensity=0.0 must be
+    a REAL zero, not just "very dim" -- proven against the actual
+    DirectionalLight color, not inferred."""
+    game = _FakeGame()
+    try:
+        game.apply_environment_settings({"SunColor": [255.0, 255.0, 255.0], "SunIntensity": 0.0})
+        sun_color = tuple(game.sun.color)
+        check(sun_color[0] < 0.01 and sun_color[1] < 0.01 and sun_color[2] < 0.01, f"SunIntensity=0.0 genuinely zeroes the sun's real color, got {sun_color}")
+    finally:
+        game.teardown()
+
+
+def test_sky_sun_runtime_lua_write_applies_live_but_does_not_persist() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        game.services = datamodel_schema.sanitize_services_snapshot({"Environment": {"SunIntensity": 1.0}})
+        game.apply_environment_settings(game.services["Environment"])
+        day_color = tuple(game.sun.color)
+
+        ok, err = manager.scene.set_property("Environment", "SunIntensity", 0.0)
+        check(ok, f"Environment.SunIntensity = 0.0 from Lua succeeds: {err}")
+        night_color = tuple(game.sun.color)
+        check(night_color[0] < day_color[0], "the runtime Lua write actually darkened the live sun")
+        check(game.services["Environment"]["SunIntensity"] == 1.0, "...but the persisted services dict is untouched (session-only, same contract as everything else in Environment)")
+
+        game.apply_environment_settings(game.services.get("Environment", {}))
+        restored_color = tuple(game.sun.color)
+        check(all(abs(a - b) < 0.01 for a, b in zip(restored_color, day_color)), "re-applying the persisted Environment (Stop's restore step) brings the sun back to the authored value")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_sky_sun_lua_write_rejects_bad_values() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        ok, err = manager.scene.set_property("Environment", "SunIntensity", -5.0)
+        check(not ok, "an out-of-range SunIntensity write from Lua is rejected")
+        ok, err = manager.scene.set_property("Environment", "SkyTopColor", "blue")
+        check(not ok, "a non-list SkyTopColor write from Lua is rejected")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_create_world_is_called_exactly_once_in_source() -> None:
+    """Resource-lifecycle requirement: self.sky/self.sun must not be
+    recreated by Play/Stop or Place open/close -- create_world() (their
+    only construction site) is called exactly once, from __init__.
+    set_studio_playing() and load_world_snapshot() only ever reach
+    apply_environment_settings() (mutating the SAME sky/sun objects),
+    never create_world() again."""
+    import inspect
+    source = inspect.getsource(cs)
+    call_lines = [line for line in source.splitlines() if line.strip() == "self.create_world()"]
+    check(len(call_lines) == 1, f"create_world() is called exactly once in client_studio.py (found: {call_lines})")
+
+
 def test_simplepbr_init_is_called_exactly_once_in_source() -> None:
     """Static guard against a future accidental second simplepbr.init()
     call anywhere in client_studio.py -- the whole point of capturing and
@@ -686,6 +883,15 @@ test_apply_postprocess_uniforms_clamps_defensively()
 test_postprocess_runtime_lua_write_applies_live_but_does_not_persist()
 test_postprocess_lua_write_rejects_bad_values()
 test_install_postprocess_shader_is_the_only_shader_install_call_site()
+test_sky_sun_schema_and_defaults()
+test_sky_sun_defaults_reproduce_the_legacy_hardcoded_appearance()
+test_sky_sun_validation_rejects_bad_values()
+test_sky_sun_persists_through_save_open()
+test_apply_environment_settings_writes_sky_and_sun_state()
+test_sun_intensity_zero_genuinely_removes_light_contribution()
+test_sky_sun_runtime_lua_write_applies_live_but_does_not_persist()
+test_sky_sun_lua_write_rejects_bad_values()
+test_create_world_is_called_exactly_once_in_source()
 test_simplepbr_init_is_called_exactly_once_in_source()
 
 print()

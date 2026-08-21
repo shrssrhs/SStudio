@@ -24,6 +24,7 @@ from ursina import (
     Entity,
     Grid,
     PointLight as UrsinaPointLight,
+    Shader as UrsinaShader,
     SpotLight as UrsinaSpotLight,
     Text,
     Texture as UrsinaTexture,
@@ -776,6 +777,74 @@ GRID_GROUND_COLOR = color.rgb32(58, 58, 61)
 GRID_LINE_COLOR = color.rgba32(150, 150, 158, 255)
 GRID_LINE_COUNT = 60
 GRID_LINE_SPACING = 2.0
+
+
+# ============================================================
+# STAGE 4.3C: SKY GRADIENT SHADER
+# ============================================================
+# Replaces the old single-flat-SKY_COLOR unlit_shader on self.sky with a
+# 3-color vertical gradient (SkyTopColor/SkyHorizonColor/SkyBottomColor),
+# still just a plain unlit color-only fragment shader -- no textures, no
+# cubemaps, no atmosphere simulation. Follows ursina/shaders/unlit_shader.
+# py's own construction convention exactly (a plain ursina.Shader(GLSL,
+# vertex=..., fragment=...) pair), so it drops into Entity(shader=...)
+# the same way the old sky shader did.
+#
+# The gradient factor is normalize(local vertex position).y -- correct
+# because self.sky is an UNROTATED, UNSCALED-AT-RUNTIME sphere (see
+# update_sky(), which only ever reassigns .position to follow the camera
+# every frame, never touches rotation/scale), so a vertex's own object-
+# space direction from the sphere's center already equals its true "how
+# high up the sky dome" direction; no camera-relative math needed in the
+# shader itself.
+_SKY_GRADIENT_VERT = """#version 130
+
+uniform mat4 p3d_ModelViewProjectionMatrix;
+in vec4 p3d_Vertex;
+out vec3 sky_local_dir;
+
+void main() {
+    gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
+    sky_local_dir = p3d_Vertex.xyz;
+}
+"""
+
+_SKY_GRADIENT_FRAG = """#version 140
+
+uniform vec3 sky_top_color;
+uniform vec3 sky_horizon_color;
+uniform vec3 sky_bottom_color;
+in vec3 sky_local_dir;
+out vec4 fragColor;
+
+void main() {
+    float t = normalize(sky_local_dir).y;
+    vec3 sky_color;
+    if (t > 0.0) {
+        sky_color = mix(sky_horizon_color, sky_top_color, smoothstep(0.0, 0.6, t));
+    } else {
+        sky_color = mix(sky_horizon_color, sky_bottom_color, smoothstep(0.0, 0.6, -t));
+    }
+    fragColor = vec4(sky_color, 1.0);
+}
+"""
+
+# default_input matches the old flat SKY_COLOR exactly (all 3 stops
+# equal) -- so an Entity built with this shader BEFORE
+# apply_environment_settings() ever runs (a brief window every startup)
+# still shows the correct backward-compatible color, not an unset/black
+# gradient.
+sky_gradient_shader = UrsinaShader(
+    name="sky_gradient_shader",
+    language=UrsinaShader.GLSL,
+    vertex=_SKY_GRADIENT_VERT,
+    fragment=_SKY_GRADIENT_FRAG,
+    default_input={
+        "sky_top_color": Vec3(70 / 255, 145 / 255, 225 / 255),
+        "sky_horizon_color": Vec3(70 / 255, 145 / 255, 225 / 255),
+        "sky_bottom_color": Vec3(70 / 255, 145 / 255, 225 / 255),
+    },
+)
 
 
 # ============================================================
@@ -2805,13 +2874,18 @@ class MultiplayerGame(Entity):
     def create_world(self) -> None:
         self.background_mode = "sky"
 
+        # Stage 4.3C: gradient shader replaces the old flat unlit_shader +
+        # SKY_COLOR -- see sky_gradient_shader's own comment for why the
+        # default_input already matches the old color exactly (backward
+        # compatibility before apply_environment_settings() below has run
+        # even once). color=SKY_COLOR is now unused by the shader itself
+        # but harmless to leave (Entity always has SOME .color).
         self.sky = Entity(
             model="sphere",
-            texture="white_cube",
             color=SKY_COLOR,
             scale=1000,
             double_sided=True,
-            shader=unlit_shader,
+            shader=sky_gradient_shader,
         )
 
         # Сетка на полу для Blender-style режима. Настоящий wireframe-меш
@@ -2931,6 +3005,38 @@ class MultiplayerGame(Entity):
             min(255, max(0, int(float(ambient_rgb[2]) * ambient_intensity))),
             255,
         )
+
+        # Stage 4.3C: sky gradient -- same "independent of pbr_pipeline"
+        # reasoning as ambient above (self.sky is a plain Ursina Entity
+        # with a custom GLSL shader, nothing simplepbr-owned). Defaults
+        # match the old flat SKY_COLOR exactly (see sky_gradient_shader's
+        # own default_input for why this matters even before the first
+        # call here).
+        top = properties.get("SkyTopColor", [70.0, 145.0, 225.0])
+        horizon = properties.get("SkyHorizonColor", [70.0, 145.0, 225.0])
+        bottom = properties.get("SkyBottomColor", [70.0, 145.0, 225.0])
+        self.sky.set_shader_input("sky_top_color", Vec3(float(top[0]) / 255.0, float(top[1]) / 255.0, float(top[2]) / 255.0))
+        self.sky.set_shader_input("sky_horizon_color", Vec3(float(horizon[0]) / 255.0, float(horizon[1]) / 255.0, float(horizon[2]) / 255.0))
+        self.sky.set_shader_input("sky_bottom_color", Vec3(float(bottom[0]) / 255.0, float(bottom[1]) / 255.0, float(bottom[2]) / 255.0))
+
+        # Stage 4.3C: the global directional light ("sun") -- was a
+        # hardcoded SUN_LIGHT_COLOR + look_at(Vec3(1,-1,-1)) in
+        # create_world(); now Color*Intensity (same convention as
+        # Ambient) and an authored Euler rotation (same convention
+        # SpotLight.Rotation already uses). SunIntensity=0.0 genuinely
+        # zeroes the light's contribution -- required for a real night
+        # scene with no hidden hardcoded brightness; see
+        # test_sun_intensity_zero_genuinely_removes_light_contribution().
+        sun_rgb = properties.get("SunColor", [235.0, 225.0, 205.0])
+        sun_intensity = max(0.0, float(properties.get("SunIntensity", 1.0)))
+        self.sun.color = color.rgba32(
+            min(255, max(0, int(float(sun_rgb[0]) * sun_intensity))),
+            min(255, max(0, int(float(sun_rgb[1]) * sun_intensity))),
+            min(255, max(0, int(float(sun_rgb[2]) * sun_intensity))),
+            255,
+        )
+        sun_rotation = properties.get("SunRotation", [35.264392, 135.0, -120.00001])
+        self.sun.rotation = Vec3(float(sun_rotation[0]), float(sun_rotation[1]), float(sun_rotation[2]))
 
         if self.pbr_pipeline is not None:
             fog_enabled = bool(properties.get("FogEnabled", False))

@@ -2542,6 +2542,56 @@ class InspectorPanel(QWidget):
             box.valueChanged.connect(lambda value, p=path: self._set_value(p, float(value)))
             return box
 
+        if prop.value_type == "color3":
+            # Stage 4.3C: previously this generic path had no color3 case
+            # at all (fell through to a plain QLineEdit showing e.g.
+            # "[68.0, 68.0, 82.0]" as text -- editing it would send a
+            # STRING to a property that validate_property_value() only
+            # accepts as a 3-number list, so it silently never applied).
+            # Needed for real for the new Sky/Sun colors to be authorable
+            # at all; also fixes the same pre-existing gap for
+            # AmbientColor/FogColor. Same hex<->[r,g,b] conversion
+            # _build_surface_section() already uses for Part.EmissionColor.
+            rgb = current if isinstance(current, (list, tuple)) and len(current) == 3 else [255, 255, 255]
+            hex_value = "#{:02x}{:02x}{:02x}".format(
+                max(0, min(255, int(rgb[0]))), max(0, min(255, int(rgb[1]))), max(0, min(255, int(rgb[2]))),
+            )
+            field = ColorField(hex_value)
+            field.color_selected.connect(
+                lambda value, p=path: self._set_value(
+                    p, [QColor(str(value)).red(), QColor(str(value)).green(), QColor(str(value)).blue()],
+                )
+            )
+            return field
+
+        if prop.value_type == "vector3":
+            # Deliberately NOT VectorEditor: that widget emits one
+            # value_changed(path, float) PER AXIS (e.g. "rotation.x"), a
+            # convention only the hardcoded position/rotation/size
+            # dispatch in _set_value()/the bridge understands. A generic
+            # schema vector3 (SunRotation) instead reads/writes the whole
+            # [x,y,z] in one _set_value() call, same shape as the color3
+            # case above.
+            values = current if isinstance(current, (list, tuple)) and len(current) == 3 else [0.0, 0.0, 0.0]
+            container = QWidget()
+            row = QHBoxLayout(container)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(3)
+            boxes: list[QDoubleSpinBox] = []
+            for axis, component in zip(("X", "Y", "Z"), values):
+                box = QDoubleSpinBox()
+                box.setDecimals(3)
+                box.setRange(-1_000_000.0, 1_000_000.0)
+                box.setSingleStep(0.25)
+                box.setValue(float(component))
+                box.setPrefix(axis + "  ")
+                box.setMinimumWidth(78)
+                boxes.append(box)
+                row.addWidget(box, 1)
+            for box in boxes:
+                box.valueChanged.connect(lambda _value, p=path, bs=boxes: self._set_value(p, [b.value() for b in bs]))
+            return container
+
         edit = QLineEdit(str(current))
         edit.editingFinished.connect(lambda w=edit, p=path: self._set_value(p, w.text()))
         return edit

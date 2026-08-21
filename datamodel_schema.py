@@ -625,6 +625,48 @@ register_class(ClassDescriptor(
             "GrainIntensity", "float", category="Post Processing", default=0.0,
             minimum=0.0, maximum=1.0,
         ),
+        PropertyDescriptor(
+            # Stage 4.3C: the sky was a single flat SKY_COLOR sphere;
+            # these 3 replace it with a gradient (still a plain
+            # color-only fragment shader, no textures/cubemaps). All 3
+            # defaulting to the OLD SKY_COLOR (70,145,225) is deliberate
+            # backward compatibility -- an old Place with no authored Sky
+            # properties renders a flat sky bit-identical to before
+            # (gradient collapses to a single color when top==horizon==
+            # bottom), not a silently-different look.
+            "SkyTopColor", "color3", category="Sky & Outdoor", default=[70.0, 145.0, 225.0],
+        ),
+        PropertyDescriptor(
+            "SkyHorizonColor", "color3", category="Sky & Outdoor", default=[70.0, 145.0, 225.0],
+        ),
+        PropertyDescriptor(
+            "SkyBottomColor", "color3", category="Sky & Outdoor", default=[70.0, 145.0, 225.0],
+        ),
+        PropertyDescriptor(
+            # Was a hardcoded SUN_LIGHT_COLOR constant on self.sun (a
+            # DirectionalLight) -- default here is that exact constant,
+            # so an old Place is unaffected at defaults.
+            "SunColor", "color3", category="Sky & Outdoor", default=[235.0, 225.0, 205.0],
+        ),
+        PropertyDescriptor(
+            # Multiplies SunColor -- same AmbientIntensity convention.
+            # 0.0 genuinely removes the global directional light's
+            # contribution (a real, provable "off", not just very dim) --
+            # required for a real night scene with no hidden bright sun.
+            "SunIntensity", "float", category="Sky & Outdoor", default=1.0,
+            minimum=0.0, maximum=4.0,
+        ),
+        PropertyDescriptor(
+            # Was a hardcoded self.sun.look_at(Vec3(1,-1,-1)) call --
+            # default is the EXACT Euler-angle equivalent of that same
+            # direction (verified empirically: setting .rotation to this
+            # triple reproduces the identical light-forward vector
+            # look_at() used to compute), so an old Place's lighting
+            # direction is unaffected at defaults. Same Euler-rotation
+            # convention SpotLight.Rotation already uses, not a new
+            # look-at-target API.
+            "SunRotation", "vector3", category="Sky & Outdoor", default=[35.264392, 135.0, -120.00001],
+        ),
     ),
 ))
 
