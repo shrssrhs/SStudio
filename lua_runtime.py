@@ -1000,6 +1000,11 @@ class RuntimeSceneLayer:
                 entity.enabled = True
             except Exception:
                 pass
+            # Blocker fix: re-registers a PointLight/SpotLight that a
+            # runtime :Destroy() call cleared during this session -- see
+            # MultiplayerGame._set_light_render_active(). A no-op for
+            # anything that was never disabled/never a light.
+            self.game._set_light_render_active(entity, True)
             try:
                 pos = snapshot["Position"]; rot = snapshot["Rotation"]; size = snapshot["Size"]
                 entity.position = Vec3(pos[0], pos[1], pos[2])
@@ -1027,6 +1032,16 @@ class RuntimeSceneLayer:
             # lifetime, not just within one session.
             self.game.parts.pop(runtime_id, None)
             if item.entity is not None:
+                # Blocker fix: every runtime-spawned PointLight/SpotLight
+                # (Instance.new() during Play) must stop illuminating at
+                # Stop, same as it visually disappears -- see
+                # MultiplayerGame._set_light_render_active(). Without
+                # this, every runtime light any script ever spawned
+                # across every past Play session accumulated permanently
+                # in render's LightAttrib, same "unbounded across
+                # repeated Play/Stop" class of bug game.parts.pop() above
+                # already exists to prevent for the Entity itself.
+                self.game._set_light_render_active(item.entity, False)
                 try:
                     item.entity.disable()
                 except Exception:
@@ -1521,6 +1536,13 @@ class RuntimeSceneLayer:
                     entity.enabled = True
                 except Exception:
                     pass
+                # Blocker fix: entity.enabled=True (unstash) does NOT
+                # re-register a PointLight/SpotLight with Panda3D's
+                # render -- see MultiplayerGame._set_light_render_active()'s
+                # docstring. Only reached on RE-attachment of an entity
+                # that already existed (a fresh build above self-
+                # registers via the light class's own __init__).
+                self.game._set_light_render_active(entity, True)
             from shared.object_registry import LIGHT_CLASS_NAMES
             if (
                 self._physics is not None
@@ -1534,6 +1556,9 @@ class RuntimeSceneLayer:
                 )
         else:
             if entity is not None:
+                # Blocker fix: must run before/alongside entity.enabled=
+                # False -- see MultiplayerGame._set_light_render_active().
+                self.game._set_light_render_active(entity, False)
                 try:
                     entity.enabled = False
                 except Exception:
@@ -1904,6 +1929,8 @@ class RuntimeSceneLayer:
         if item is not None:
             self.game.parts.pop(instance_id, None)
             if item.entity is not None:
+                # Blocker fix: see MultiplayerGame._set_light_render_active().
+                self.game._set_light_render_active(item.entity, False)
                 try:
                     item.entity.disable()
                 except Exception:
@@ -1916,6 +1943,8 @@ class RuntimeSceneLayer:
             # resting on a Lua-vanished Part.
             entity = self.game.parts.get(instance_id)
             if entity is not None:
+                # Blocker fix: see MultiplayerGame._set_light_render_active().
+                self.game._set_light_render_active(entity, False)
                 try:
                     entity.enabled = False
                 except Exception:

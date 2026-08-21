@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from panda3d.core import Filename, Fog, Material, Quat, Shader, TransparencyAttrib
+from panda3d.core import Filename, Fog, Material, NodePath, Quat, Shader, TransparencyAttrib
 from ursina import (
     AmbientLight,
     Cone,
@@ -5304,6 +5304,40 @@ class MultiplayerGame(Entity):
         except (TypeError, ValueError, IndexError, AttributeError):
             pass
 
+    def _set_light_render_active(self, entity: Entity, active: bool) -> None:
+        """Blocker fix (found during Stage 4.3D packaged acceptance):
+        UrsinaPointLight/UrsinaSpotLight self-register onto Panda3D's
+        render via render.setLight(...) in their OWN __init__ (see
+        ursina/lights.py) -- but neither Ursina's generic destroy()
+        (removeNode() only) nor entity.enabled=False/True (stash/unstash
+        only) ever call the matching render.clearLight()/setLight().
+        Empirically proven this session: constructing a PointLight then
+        calling Ursina's own destroy() on it, or just setting
+        entity.enabled=False, leaves it permanently active in render's
+        LightAttrib -- a real light with NO corresponding Entity/
+        Instance, invisible to Explorer/DataModel but still illuminating
+        the scene forever. This is the ONE place that gap is closed:
+        called at every point a PointLight/SpotLight Instance's Entity
+        is destroyed, hidden (Workspace detach, Lua :Destroy()), or
+        restored/reattached, so 'a light is actively illuminating the
+        scene' always exactly tracks 'a live, world-attached, enabled
+        PointLight/SpotLight Instance exists' -- never more, never less.
+        A no-op for anything that isn't a light (checked via the same
+        `_light` attribute every Ursina Light subclass exposes), so it is
+        always safe to call unconditionally on any has_3d_entity Entity.
+        setLight()/clearLight() were verified idempotent (repeated calls,
+        either direction, do not create duplicate registrations or error
+        on an already-cleared light), so callers never need to track
+        whether this was already called."""
+        light = getattr(entity, "_light", None)
+        if light is None:
+            return
+        node_path = NodePath(light)
+        if active:
+            application.base.render.setLight(node_path)
+        else:
+            application.base.render.clearLight(node_path)
+
     def _set_light_markers_visible(self, visible: bool) -> None:
         """Toggles every PointLight/SpotLight's editor-only marker sphere
         (see _build_light_entity) -- called from set_studio_playing() at
@@ -5622,6 +5656,11 @@ class MultiplayerGame(Entity):
         self.instances.pop(instance_id, None)
         entity = self.parts.pop(instance_id, None)
         if entity is not None:
+            # Blocker fix: must run BEFORE destroy() -- see
+            # _set_light_render_active()'s own docstring for why Ursina's
+            # destroy() alone leaks a PointLight/SpotLight's illumination
+            # permanently.
+            self._set_light_render_active(entity, False)
             destroy(entity)
         if instance_id == self.selected_part_id:
             self.deselect_part(notify_studio=False)

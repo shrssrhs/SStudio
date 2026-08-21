@@ -53,6 +53,7 @@ class _FakeGame:
     _apply_mesh_geometry = cs.MultiplayerGame._apply_mesh_geometry
     _build_light_entity = cs.MultiplayerGame._build_light_entity
     _apply_light_properties = cs.MultiplayerGame._apply_light_properties
+    _set_light_render_active = cs.MultiplayerGame._set_light_render_active
 
     def __init__(self) -> None:
         self.instances: dict[str, cs.InstanceRecord] = {}

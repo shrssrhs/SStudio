@@ -64,6 +64,7 @@ def check(condition: bool, message: str) -> None:
 
 class _FakeGame:
     _build_part_entity = cs.MultiplayerGame._build_part_entity
+    _set_light_render_active = cs.MultiplayerGame._set_light_render_active
     _apply_mesh_geometry = cs.MultiplayerGame._apply_mesh_geometry
 
     def __init__(self) -> None:
