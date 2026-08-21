@@ -1,0 +1,261 @@
+{
+  "format": "nebula-scene",
+  "version": 3,
+  "objects": [
+    {
+      "id": "floor",
+      "class_name": "Part",
+      "name": "Floor",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, -0.1, 0],
+        "Size": [12, 0.2, 24],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [90, 88, 84],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "concrete_floor.png",
+        "TilesPerUnit": 0.25,
+        "Roughness": 0.9,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "backdrop",
+      "class_name": "Part",
+      "name": "Backdrop",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 4, 10],
+        "Size": [12, 8, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [18, 18, 22],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "",
+        "TilesPerUnit": 1.0,
+        "Roughness": 0.95,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "diagonal_beam_1",
+      "class_name": "Part",
+      "name": "DiagonalBeam_1",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-3.5, 2.5, 4],
+        "Size": [0.15, 5.5, 0.15],
+        "Rotation": [0.0, 0.0, 22.0],
+        "Color": [235, 235, 235],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": false,
+        "TextureId": "",
+        "TilesPerUnit": 1.0,
+        "Roughness": 0.5,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "diagonal_beam_2",
+      "class_name": "Part",
+      "name": "DiagonalBeam_2",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-1.0, 2.5, 4],
+        "Size": [0.15, 5.5, 0.15],
+        "Rotation": [0.0, 0.0, -22.0],
+        "Color": [235, 235, 235],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": false,
+        "TextureId": "",
+        "TilesPerUnit": 1.0,
+        "Roughness": 0.5,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "diagonal_beam_3",
+      "class_name": "Part",
+      "name": "DiagonalBeam_3",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [1.5, 2.5, 4],
+        "Size": [0.15, 5.5, 0.15],
+        "Rotation": [0.0, 0.0, 35.0],
+        "Color": [40, 40, 44],
+        "Material": "Metal",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": false,
+        "TextureId": "metal_fixture.png",
+        "TilesPerUnit": 3.0,
+        "Roughness": 0.3,
+        "Metallic": 1.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "diagonal_beam_4",
+      "class_name": "Part",
+      "name": "DiagonalBeam_4",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [3.8, 2.5, 4],
+        "Size": [0.15, 5.5, 0.15],
+        "Rotation": [0.0, 0.0, -35.0],
+        "Color": [40, 40, 44],
+        "Material": "Metal",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": false,
+        "TextureId": "metal_fixture.png",
+        "TilesPerUnit": 3.0,
+        "Roughness": 0.3,
+        "Metallic": 1.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "perspective_rail_left",
+      "class_name": "Part",
+      "name": "PerspectiveRailLeft",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-4.5, 0.1, -6],
+        "Size": [0.12, 0.12, 24],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [230, 230, 230],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": false,
+        "TextureId": "",
+        "TilesPerUnit": 1.0,
+        "Roughness": 0.4,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "perspective_rail_right",
+      "class_name": "Part",
+      "name": "PerspectiveRailRight",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [4.5, 0.1, -6],
+        "Size": [0.12, 0.12, 24],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [230, 230, 230],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": false,
+        "TextureId": "",
+        "TilesPerUnit": 1.0,
+        "Roughness": 0.4,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "aa_prop",
+      "class_name": "MeshPart",
+      "name": "AATestProp",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 0.0, -1.0],
+        "Size": [1.6, 1.6, 1.6],
+        "Rotation": [0.0, 32.0, 0.0],
+        "Color": [255, 255, 255],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": false,
+        "MeshId": "test_prop.glb"
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "key_light",
+      "class_name": "PointLight",
+      "name": "KeyLight",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 4.0, -2],
+        "Color": [255, 245, 230],
+        "Intensity": 2.2,
+        "Range": 14.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "spawn",
+      "class_name": "SpawnPoint",
+      "name": "SpawnLocation",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 0.0, -9],
+        "Size": [2.0, 0.4, 2.0],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [0, 200, 90],
+        "Material": "Plastic",
+        "Transparency": 0.25,
+        "Anchored": true,
+        "CanCollide": false
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    }
+  ],
+  "services": {
+    "Environment": {
+      "FogEnabled": true,
+      "FogColor": [22.0, 22.0, 26.0],
+      "FogDensity": 0.015,
+      "Exposure": -0.4,
+      "ShadowsEnabled": true,
+      "ShadowDistance": 20.0,
+      "AmbientColor": [30.0, 30.0, 36.0],
+      "AmbientIntensity": 1.0,
+      "Contrast": 1.15,
+      "Saturation": 0.9,
+      "ColorTint": [255.0, 255.0, 255.0],
+      "VignetteIntensity": 0.2,
+      "GrainIntensity": 0.1,
+      "SkyTopColor": [70.0, 145.0, 225.0],
+      "SkyHorizonColor": [70.0, 145.0, 225.0],
+      "SkyBottomColor": [70.0, 145.0, 225.0],
+      "SunColor": [235.0, 225.0, 205.0],
+      "SunIntensity": 1.0,
+      "SunRotation": [35.264392, 135.0, -120.00001]
+    }
+  }
+}

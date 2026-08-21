@@ -50,6 +50,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QColor,
     QCloseEvent,
     QFont,
@@ -1006,6 +1007,17 @@ class EngineBridge(QObject):
         self.is_playing = False
         self.play_state_changed.emit(False)
         self.log("info", "Play session stopped.")
+
+    def set_graphics_quality(self, level: str) -> bool:
+        """Stage 4.3E: machine/client renderer quality (MSAA/shadow
+        resolution/grain) -- deliberately NOT routed through set_property/
+        the Environment property-write path, since it is not
+        DataModel/Place/authored state at all. Applies immediately,
+        independent of Play/Stop."""
+        return bool(self._adapter_call("set_graphics_quality", level, default=False))
+
+    def get_graphics_quality(self) -> str:
+        return str(self._adapter_call("get_graphics_quality", default="Medium"))
 
     def set_transform_mode(self, mode: str) -> None:
         self._adapter_call("set_transform_mode", mode)
@@ -4006,6 +4018,29 @@ class StudioMainWindow(QMainWindow):
         mock_view.triggered.connect(lambda: self.viewport_frame.use_mock_viewport())
         view_menu.addActions([reset_layout, mock_view])
 
+        # Stage 4.3E: machine/client renderer quality -- deliberately its
+        # own small View submenu, NOT anything inside the Explorer/
+        # Inspector (Graphics Quality describes how THIS MACHINE renders
+        # a Place, never the Place's own authored state -- see
+        # client_studio.GRAPHICS_QUALITY_PRESETS' own module docstring).
+        # Reflects the same QSettings-persisted value main() itself reads
+        # at startup (self.settings is the shared QSettings(ORG_NAME,
+        # APP_NAME) instance -- see __init__), not a live bridge query,
+        # since the adapter isn't attached yet while this menu is built.
+        quality_menu = view_menu.addMenu("Graphics Quality")
+        self._graphics_quality_actions: dict[str, QAction] = {}
+        quality_group = QActionGroup(self)
+        quality_group.setExclusive(True)
+        stored_quality = self.settings.value("graphics_quality", "Medium")
+        for level in ("Low", "Medium", "High"):
+            action = QAction(level, self)
+            action.setCheckable(True)
+            action.setChecked(level == stored_quality)
+            action.triggered.connect(lambda checked, lvl=level: self._on_graphics_quality_selected(lvl))
+            quality_group.addAction(action)
+            quality_menu.addAction(action)
+            self._graphics_quality_actions[level] = action
+
         plugins_menu = menu.addMenu("&Plugins")
         plugin_action = QAction("Plugin Manager", self)
         plugin_action.triggered.connect(
@@ -4609,6 +4644,20 @@ class StudioMainWindow(QMainWindow):
             except Exception as exc:
                 self.bridge.log("error", f"Shutdown callback failed: {exc}")
         event.accept()
+
+    def _on_graphics_quality_selected(self, level: str) -> None:
+        """Stage 4.3E: applies immediately (works in both editor and Play
+        -- there is only one window/renderer for the whole process, see
+        set_graphics_quality()'s own docstring), and persists to
+        QSettings so it survives across app restarts. Deliberately does
+        NOT go through bridge.set_property()/mark anything dirty -- this
+        is not Place/authored state, so it must never affect Save."""
+        accepted = self.bridge.set_graphics_quality(level)
+        if not accepted:
+            self.bridge.log("error", f"Graphics Quality: unknown level {level!r} was rejected.")
+            return
+        self.settings.setValue("graphics_quality", level)
+        self.bridge.log("info", f"Graphics Quality set to {level}.")
 
     def _about(self) -> None:
         QMessageBox.about(

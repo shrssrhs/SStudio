@@ -29,6 +29,7 @@ from ursina import (
     Text,
     Texture as UrsinaTexture,
     Ursina,
+    Vec2,
     Vec3,
     application,
     camera,
@@ -44,13 +45,15 @@ from ursina.shaders import unlit_shader
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt
+from PySide6.QtCore import QEvent, QObject, QPoint, QSettings, QTimer, Qt
 from PySide6.QtGui import QCursor, QWindow
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QWidget
 
 from studio_editor_live import (
+    APP_NAME as STUDIO_APP_NAME,
     DARK_STYLE,
     EngineBridge,
+    ORG_NAME as STUDIO_ORG_NAME,
     SCENE_FILE_FILTER,
     SceneObject,
     StudioMainWindow,
@@ -859,6 +862,52 @@ sky_gradient_shader = UrsinaShader(
 
 
 # ============================================================
+# STAGE 4.3E: GRAPHICS QUALITY (MSAA / shadow resolution / grain)
+# ============================================================
+# Deliberately NOT an Environment property and NEVER serialized into a
+# Place -- Environment describes the AUTHORED world (fog, exposure, sun,
+# post-processing mood); Graphics Quality describes how THIS MACHINE
+# renders it. A Place saved on "Low" must not permanently downgrade
+# every future player. See MultiplayerGame.graphics_quality/
+# set_graphics_quality() for the actual runtime state (a plain client-
+# side attribute, not DataModel-backed, not Lua-visible).
+#
+# Values below are measured, not guessed:
+#   - msaa_samples: simplepbr's own installed default is 4 (confirmed by
+#     reading simplepbr==0.13.1's Pipeline dataclass directly) --
+#     "Medium" reproduces that default exactly, which is why Medium (not
+#     High) is DEFAULT_GRAPHICS_QUALITY, for pre-4.3E backward
+#     compatibility. Setting msaa_samples=8 was empirically confirmed
+#     (a real window, this session) to be accepted without error by this
+#     Panda3D/simplepbr install; higher values were not tried and are
+#     deliberately not offered.
+#   - shadow_directional: Ursina's own DirectionalLight default
+#     (shadow_map_resolution = Vec2(1024,1024), read directly from
+#     ursina/lights.py) is what this codebase has shipped with through
+#     every prior Stage 4.3 slice -- Medium reproduces it exactly, same
+#     backward-compatibility reasoning as MSAA.
+#   - shadow_spot: SpotLight's existing hardcoded 512x512 (see
+#     _apply_light_properties(), Stage 4.1) is what has shipped through
+#     every prior slice -- Medium reproduces it exactly.
+#   - grain_multiplier: post-processing overall is effectively free
+#     (measured this session's Stage 4.3B work: ~165fps neutral vs
+#     ~165fps with the full contrast/saturation/tint/vignette/grain pass
+#     engaged, i.e. no measurable cost) -- so nothing here is disabled
+#     for a genuine performance reason. Grain specifically is the one
+#     per-pixel-noise-hash cost in that pass with no obvious visual harm
+#     from removing it on Low (unlike vignette/tint/contrast, which are
+#     core to authored mood and stay on at every level), so it is the
+#     one thing Low turns off, as a deliberately conservative, easily
+#     revisited choice -- not a real measured bottleneck.
+GRAPHICS_QUALITY_PRESETS: dict[str, dict[str, Any]] = {
+    "Low": {"msaa_samples": 0, "shadow_directional": 512, "shadow_spot": 256, "grain_multiplier": 0.0},
+    "Medium": {"msaa_samples": 4, "shadow_directional": 1024, "shadow_spot": 512, "grain_multiplier": 1.0},
+    "High": {"msaa_samples": 8, "shadow_directional": 2048, "shadow_spot": 1024, "grain_multiplier": 1.0},
+}
+DEFAULT_GRAPHICS_QUALITY = "Medium"
+
+
+# ============================================================
 # STAGE 4.3B: POST-PROCESSING (final-image treatment)
 # ============================================================
 # Architecture (see the full audit in _install_postprocess_shader()'s
@@ -1625,6 +1674,7 @@ class MultiplayerGame(Entity):
 
     def __init__(
         self, server_url: str, player_name: str, legacy_demo: bool = False, pbr_pipeline: Any = None,
+        initial_graphics_quality: str = DEFAULT_GRAPHICS_QUALITY,
     ) -> None:
         super().__init__()
 
@@ -1639,6 +1689,18 @@ class MultiplayerGame(Entity):
         # a test harness that never called main() -- every environment
         # write below is a no-op in that case, not a crash.
         self.pbr_pipeline = pbr_pipeline
+        # Stage 4.3E: machine/client renderer quality -- deliberately a
+        # PLAIN attribute, never DataModel/Environment/Lua-backed, never
+        # touched by Play/Stop, never serialized into a Place (see
+        # GRAPHICS_QUALITY_PRESETS' own module docstring for the full
+        # "authored intent vs machine quality" reasoning). Read once at
+        # startup from studio_editor_live.py's QSettings-backed
+        # persistence (or a --graphics-quality CLI override) and passed
+        # in here; changed only via set_graphics_quality().
+        self.graphics_quality: str = (
+            initial_graphics_quality if initial_graphics_quality in GRAPHICS_QUALITY_PRESETS else DEFAULT_GRAPHICS_QUALITY
+        )
+        self._graphics_quality_grain_multiplier: float = GRAPHICS_QUALITY_PRESETS[self.graphics_quality]["grain_multiplier"]
         # Stage 4.3B: installs the SStudio post-process shader (Contrast/
         # Saturation/ColorTint/Vignette/Grain) exactly once, on the same
         # quad simplepbr already owns -- see _install_postprocess_shader()
@@ -1646,6 +1708,14 @@ class MultiplayerGame(Entity):
         # self.pbr_pipeline is None (simplepbr unavailable, or a test
         # harness that never called main()).
         self._install_postprocess_shader()
+        # Deliberately NOT applied here yet: self.sun/self.parts (needed
+        # for shadow-resolution) don't exist until create_world() runs
+        # below. create_world() calls self.set_graphics_quality(self.
+        # graphics_quality) itself, once everything it needs exists --
+        # see that method's docstring for why it is always safe to call
+        # even when quality is already at its default (it only touches
+        # MSAA/shadow buffers for whatever actually differs from what is
+        # already applied).
         # Last-applied Environment properties, purely to avoid redundantly
         # re-touching the DirectionalLight's shadow buffer (see
         # apply_environment_settings()'s docstring for why that specific
@@ -2982,7 +3052,14 @@ class MultiplayerGame(Entity):
         self._environment_fog = Fog("EnvironmentFog")
         self.apply_environment_settings(self.services.get("Environment", {}))
 
-    def apply_environment_settings(self, properties: dict[str, Any]) -> None:
+        # Stage 4.3E: applies self.graphics_quality's MSAA/shadow
+        # resolutions now that self.sun exists -- safe to call
+        # unconditionally even when quality is already at its default
+        # (see set_graphics_quality()'s own docstring: it only touches
+        # what actually differs from what is already applied).
+        self.set_graphics_quality(self.graphics_quality)
+
+    def apply_environment_settings(self, properties: dict[str, Any], force: bool = False) -> None:
         """Applies Environment.* (Fog/Exposure/Shadows) to the live scene.
         The ONE place this happens -- called from create_world() (initial
         default), load_world_snapshot() (Place open/REPLACE_WORLD), Play
@@ -2996,8 +3073,18 @@ class MultiplayerGame(Entity):
         Panda3D's set_shadow_caster() reallocates its shadow buffer on
         every call, so calling it every Play/Stop even with an unchanged
         value would be a real (if slow) leak-like buffer churn, not just
-        pointless work."""
-        if properties == self._environment_state:
+        pointless work.
+
+        force=True (Stage 4.3E): bypasses that guard without touching
+        Environment/authored state at all -- used only by
+        set_graphics_quality() to re-push GrainIntensity through
+        _apply_postprocess_uniforms() after the quality-level grain
+        multiplier changes, since the Environment properties dict itself
+        is genuinely unchanged (Graphics Quality is deliberately NOT an
+        Environment/authored concept -- see GRAPHICS_QUALITY_PRESETS'
+        own module docstring) and would otherwise be silently skipped by
+        the early-return above."""
+        if properties == self._environment_state and not force:
             return
         self._environment_state = dict(properties)
 
@@ -3114,9 +3201,19 @@ class MultiplayerGame(Entity):
             "sstudio_vignette_intensity",
             max(0.0, min(1.0, float(properties.get("VignetteIntensity", 0.0)))),
         )
+        # Stage 4.3E: the ONLY place Graphics Quality is allowed to touch
+        # authored Environment appearance -- a multiplier applied here,
+        # never written back into properties["GrainIntensity"] itself, so
+        # the AUTHORED value (Place-saved, Lua-readable) is completely
+        # unaffected by which machine/quality level is rendering it. Low
+        # multiplies to 0.0 (grain measured as one of the cheapest
+        # possible things to disable, chosen for its per-pixel noise
+        # cost, not because it looks bad -- see set_graphics_quality()'s
+        # own docstring for the actual measurement).
+        grain_quality_multiplier = getattr(self, "_graphics_quality_grain_multiplier", 1.0)
         quad.set_shader_input(
             "sstudio_grain_intensity",
-            max(0.0, min(1.0, float(properties.get("GrainIntensity", 0.0)))),
+            max(0.0, min(1.0, float(properties.get("GrainIntensity", 0.0)))) * grain_quality_multiplier,
         )
 
     def _install_postprocess_shader(self) -> None:
@@ -3162,7 +3259,55 @@ class MultiplayerGame(Entity):
         sstudio_resolution uniform (used for vignette aspect-correction
         and grain pixel-scale) and sstudio_time (grain animation) -- both
         are refreshed every frame by one lightweight task, added once
-        below, alongside simplepbr's own per-frame update task."""
+        below, alongside simplepbr's own per-frame update task.
+
+        Stage 4.3E follow-up: the actual shader-compile-and-install work
+        is now in _reinstall_postprocess_shader() (this method just calls
+        it once, then registers the per-frame task), because it turned
+        out to need calling AGAIN whenever simplepbr rebuilds its quad --
+        see set_graphics_quality()'s own docstring for the empirical
+        proof that changing pipeline.msaa_samples replaces
+        _post_process_quad/_filtermgr with brand-new objects and silently
+        reverts to simplepbr's stock tonemap shader. The per-frame task
+        below was ALSO a latent bug for the same reason: it used to close
+        over the `quad` object captured at install time, so after an MSAA
+        change it would keep updating the ORPHANED old quad forever,
+        never the new one visible on screen -- now it looks up
+        self.pbr_pipeline._post_process_quad fresh every single frame
+        instead."""
+        self._reinstall_postprocess_shader()
+
+        def _update_postprocess_time(task: Any) -> int:
+            quad = getattr(self.pbr_pipeline, "_post_process_quad", None)
+            if quad is not None:
+                win = application.base.win
+                quad.set_shader_input("sstudio_resolution", (float(win.get_x_size()), float(win.get_y_size())))
+                quad.set_shader_input("sstudio_time", task.time)
+            return task.cont
+
+        # sort=50: right after simplepbr's own 'simplepbr update' task
+        # (sort=49), so grain/vignette always see this frame's final
+        # window size, not a stale one. Added exactly once for the whole
+        # process lifetime -- see this method's docstring.
+        application.base.taskMgr.add(_update_postprocess_time, "sstudio-postprocess-time", sort=50)
+
+    def _reinstall_postprocess_shader(self) -> None:
+        """Compiles and installs SStudio's Contrast/Saturation/ColorTint/
+        Vignette/Grain shader onto whatever NodePath is CURRENTLY
+        self.pbr_pipeline._post_process_quad, and resets it to neutral
+        uniform defaults. Split out of _install_postprocess_shader() in
+        Stage 4.3E specifically so it can be called AGAIN, safely and
+        idempotently, after set_graphics_quality() changes MSAA and
+        simplepbr silently swaps in a brand-new quad object -- without
+        this second call, that new quad would keep simplepbr's own stock
+        tonemap shader and every authored Contrast/Saturation/Vignette/
+        Grain setting would visibly vanish the moment AA changes. Neutral
+        defaults are intentional here too: the real caller (either
+        __init__, via _install_postprocess_shader(), or
+        set_graphics_quality()) is always immediately followed by a real
+        apply_environment_settings() call that restores the actual
+        authored values -- same contract the original one-time version
+        already had."""
         if self.pbr_pipeline is None:
             return
         quad = getattr(self.pbr_pipeline, "_post_process_quad", None)
@@ -3179,11 +3324,6 @@ class MultiplayerGame(Entity):
         quad.set_shader_input("tex", scene_tex)
         quad.set_shader_input("exposure", 2 ** self.pbr_pipeline.exposure)
 
-        # Neutral defaults (bit-identical to the pre-4.3B image); real
-        # authored values arrive via apply_environment_settings() right
-        # after this, on every path that already calls it (create_world()
-        # initial default, Place open, Play start/Stop restore, runtime
-        # Lua writes).
         quad.set_shader_input("sstudio_contrast", 1.0)
         quad.set_shader_input("sstudio_saturation", 1.0)
         quad.set_shader_input("sstudio_color_tint", Vec3(1.0, 1.0, 1.0))
@@ -3192,17 +3332,77 @@ class MultiplayerGame(Entity):
         quad.set_shader_input("sstudio_resolution", Vec3(float(window.size[0]), float(window.size[1]), 0.0).xy)
         quad.set_shader_input("sstudio_time", 0.0)
 
-        def _update_postprocess_time(task: Any) -> int:
-            win = application.base.win
-            quad.set_shader_input("sstudio_resolution", (float(win.get_x_size()), float(win.get_y_size())))
-            quad.set_shader_input("sstudio_time", task.time)
-            return task.cont
+    def set_graphics_quality(self, level: str) -> bool:
+        """Stage 4.3E: the ONE controlled choke point for Graphics
+        Quality (MSAA, directional/SpotLight shadow resolution, and the
+        grain-intensity multiplier) -- called from create_world() (once,
+        at startup, with self.graphics_quality) and from
+        MultiplayerStudioAdapter.set_graphics_quality() (the editor's
+        View > Graphics Quality menu). Returns False for an unknown
+        level (no-op), True otherwise.
 
-        # sort=50: right after simplepbr's own 'simplepbr update' task
-        # (sort=49), so grain/vignette always see this frame's final
-        # window size, not a stale one. Added exactly once for the whole
-        # process lifetime -- see this method's docstring.
-        application.base.taskMgr.add(_update_postprocess_time, "sstudio-postprocess-time", sort=50)
+        Deliberately does NOT touch Environment/authored state, DataModel,
+        or Lua -- Graphics Quality is machine/client state, not Place
+        state (see GRAPHICS_QUALITY_PRESETS' own module docstring). Never
+        called from set_studio_playing(): Play/Stop must not reset or
+        restore quality, unlike Environment's runtime-overlay contract.
+
+        MSAA lifecycle (the critical risk this slice audited): assigning
+        pipeline.msaa_samples silently replaces simplepbr's own
+        _post_process_quad/_filtermgr with BRAND NEW objects (proven
+        this session with a real window: different Python object ids
+        before/after, and the new quad reverts to simplepbr's stock
+        tonemap shader) -- so every MSAA change here is immediately
+        followed by _reinstall_postprocess_shader() to put SStudio's
+        Contrast/Saturation/Vignette/Grain shader back on whatever quad
+        now exists, and then a forced apply_environment_settings() to
+        restore the actual authored values onto it (that fresh quad
+        starts back at neutral defaults, same contract
+        _install_postprocess_shader() already documents for startup).
+
+        Shadow-resolution lifecycle: Panda3D's set_shadow_caster()
+        reallocates its shadow buffer on every call (documented and
+        guarded against elsewhere in this class for exactly this reason)
+        -- so this only ever calls it when the resolution for that light
+        class has genuinely changed from what Graphics Quality last
+        applied (tracked in self._graphics_quality_directional_resolution/
+        _spot_resolution, separate from any per-Instance authored state),
+        never redundantly on every call, so repeated Low/Medium/High/Low
+        switching cannot accumulate shadow buffers."""
+        preset = GRAPHICS_QUALITY_PRESETS.get(level)
+        if preset is None:
+            return False
+        self.graphics_quality = level
+        self._graphics_quality_grain_multiplier = preset["grain_multiplier"]
+
+        if self.pbr_pipeline is not None and self.pbr_pipeline.msaa_samples != preset["msaa_samples"]:
+            self.pbr_pipeline.msaa_samples = preset["msaa_samples"]
+            self._reinstall_postprocess_shader()
+
+        sun = getattr(self, "sun", None)
+        directional_res = int(preset["shadow_directional"])
+        if sun is not None and getattr(self, "_graphics_quality_directional_resolution", None) != directional_res:
+            self._graphics_quality_directional_resolution = directional_res
+            sun.shadow_map_resolution = Vec2(directional_res, directional_res)
+            if getattr(sun, "_shadows", False):
+                sun._light.set_shadow_caster(True, directional_res, directional_res)
+
+        spot_res = int(preset["shadow_spot"])
+        if getattr(self, "_graphics_quality_spot_resolution", None) != spot_res:
+            self._graphics_quality_spot_resolution = spot_res
+            for entity in self.parts.values():
+                light = getattr(entity, "_light", None)
+                if light is not None and getattr(entity, "_shadow_caster_enabled", False):
+                    light.setShadowCaster(True, spot_res, spot_res)
+
+        if self.pbr_pipeline is not None and self._environment_state is not None:
+            # Restores authored Contrast/Saturation/ColorTint/Vignette/
+            # Grain (with the new grain multiplier) onto whatever quad
+            # is now current -- a cheap, idempotent no-op when MSAA
+            # didn't actually change, and the thing that prevents a
+            # visible "flash to neutral" when it did.
+            self.apply_environment_settings(self._environment_state, force=True)
+        return True
 
     def toggle_background(self) -> None:
         if self.background_mode == "sky":
@@ -5302,15 +5502,35 @@ class MultiplayerGame(Entity):
                 # same "one shadow camera" shape DirectionalLight already
                 # uses successfully, unlike PointLight (which would need a
                 # 6-face cube shadow map -- genuinely more complex/costly,
-                # deliberately deferred, not implemented this pass). Small
-                # fixed 512x512 map (half DirectionalLight's 1024, since
-                # these are local/smaller-scale fixtures) -- not exposed as
-                # an authorable property, always on for SpotLight, always
-                # off for PointLight. Guarded the same way DirectionalLight
-                # is (only call setShadowCaster once) since it reallocates
-                # a real buffer every call.
+                # deliberately deferred, not implemented this pass). Not
+                # exposed as an authorable property, always on for
+                # SpotLight, always off for PointLight. Guarded the same
+                # way DirectionalLight is (only call setShadowCaster once
+                # per light) since it reallocates a real buffer every
+                # call.
+                #
+                # Stage 4.3E follow-up (post-acceptance lifecycle audit):
+                # this used to hardcode 512x512 here, meaning a SpotLight
+                # built AFTER the creator switched Graphics Quality --
+                # Insert Object, opening/replacing a Place, a runtime
+                # Instance.new("SpotLight"), or any light lazily becoming
+                # world-attached later -- would start at the OLD Medium
+                # value regardless of the currently selected quality,
+                # silently correct only if the creator happened to toggle
+                # quality again afterward. Reading
+                # GRAPHICS_QUALITY_PRESETS[self.graphics_quality] here
+                # instead means every NEWLY created SpotLight's initial
+                # shadow buffer is already correct for whatever quality is
+                # currently selected, with no separate toggle required --
+                # set_graphics_quality() (see its own docstring) remains
+                # solely responsible for updating light already-existing
+                # when quality changes; this is what makes a light built
+                # AFTER that change start correct in the first place.
                 if not getattr(entity, "_shadow_caster_enabled", False):
-                    light.setShadowCaster(True, 512, 512)
+                    current_quality = getattr(self, "graphics_quality", DEFAULT_GRAPHICS_QUALITY)
+                    preset = GRAPHICS_QUALITY_PRESETS.get(current_quality, GRAPHICS_QUALITY_PRESETS[DEFAULT_GRAPHICS_QUALITY])
+                    spot_resolution = preset["shadow_spot"]
+                    light.setShadowCaster(True, spot_resolution, spot_resolution)
                     entity._shadow_caster_enabled = True
         except (TypeError, ValueError, IndexError, AttributeError):
             pass
@@ -6472,6 +6692,12 @@ class MultiplayerStudioAdapter:
         self.game.set_studio_playing(False)
         return True
 
+    def set_graphics_quality(self, level: str) -> bool:
+        return self.game.set_graphics_quality(level)
+
+    def get_graphics_quality(self) -> str:
+        return self.game.graphics_quality
+
     def set_transform_mode(self, mode: str) -> bool:
         self.game.set_gizmo_mode(mode)
         return True
@@ -6663,6 +6889,20 @@ def parse_arguments() -> argparse.Namespace:
             "(player.glb avatar, hardcoded ground plane, 5 hardcoded test "
             "blocks) that normal SStudio mode no longer creates automatically. "
             "Not needed for template/Place workflows -- default is off."
+        ),
+    )
+    parser.add_argument(
+        "--graphics-quality",
+        choices=["Low", "Medium", "High"],
+        default=None,
+        help=(
+            "Stage 4.3E: startup Graphics Quality (MSAA/shadow resolution) -- "
+            "overrides the persisted editor preference for this launch only. "
+            "This is machine/client renderer state, not a Place/authored "
+            "setting. Defaults to the persisted QSettings value, or "
+            f"{DEFAULT_GRAPHICS_QUALITY!r} if none is stored yet. Also the "
+            "packaged player's only quality control until Stage 4.4 Game UI "
+            "adds a real in-game settings surface."
         ),
     )
     return parser.parse_args()
@@ -7029,11 +7269,24 @@ def main() -> int:
         window.fps_counter.enabled = True
     window.color = SKY_COLOR
 
+    # Stage 4.3E: --graphics-quality (this launch only) takes priority
+    # over the persisted editor preference (QSettings key shared with
+    # the View > Graphics Quality menu -- see StudioMainWindow's own
+    # handler), which takes priority over DEFAULT_GRAPHICS_QUALITY.
+    # Session-only otherwise: this is the packaged player's only quality
+    # control until Stage 4.4 Game UI exists (see parse_arguments()'s
+    # own help text).
+    initial_graphics_quality = arguments.graphics_quality
+    if initial_graphics_quality is None:
+        stored_quality = QSettings(STUDIO_ORG_NAME, STUDIO_APP_NAME).value("graphics_quality", DEFAULT_GRAPHICS_QUALITY)
+        initial_graphics_quality = stored_quality if stored_quality in GRAPHICS_QUALITY_PRESETS else DEFAULT_GRAPHICS_QUALITY
+
     game = MultiplayerGame(
         server_url=arguments.server,
         player_name=arguments.name,
         legacy_demo=arguments.legacy_demo,
         pbr_pipeline=pbr_pipeline,
+        initial_graphics_quality=initial_graphics_quality,
     )
 
     # Stage 3.3 pointer-capture fix, supplementary safety net: Qt's own
