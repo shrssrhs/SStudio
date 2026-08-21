@@ -2403,6 +2403,7 @@ class InspectorPanel(QWidget):
             "pivot": self._build_pivot_section,
             "mesh": self._build_mesh_section,
             "light": self._build_light_section,
+            "surface": self._build_surface_section,
             "script": lambda o: self._build_script_section(o, definition),
             "placeholder": lambda o: self._build_placeholder_section(o, definition),
         }
@@ -2605,6 +2606,61 @@ class InspectorPanel(QWidget):
 
         return light
 
+    def _build_surface_section(self, obj: SceneObject) -> CollapsibleSection:
+        """Stage 4.1 (materials & textures foundation): minimum texture/
+        PBR authoring for Part (never SpawnPoint/MeshPart -- see
+        shared/object_registry.py's _PART_SURFACE_SCHEMA comment). Every
+        field goes through the existing generic "properties.<key>" write
+        path, same as Mesh Id -- no new property-edit machinery. The
+        Material dropdown that ALSO affects Roughness/Metallic lives in
+        the existing Appearance section (see _on_material_preset_changed);
+        this section is for the explicit, always-authoritative PBR
+        controls a creator can fine-tune afterward."""
+        surface = CollapsibleSection("Surface")
+
+        texture_id_edit = QLineEdit(str(obj.properties.get("TextureId", "")))
+        texture_id_edit.setPlaceholderText("e.g. concrete.jpg or walls/plaster.png")
+        texture_id_edit.editingFinished.connect(
+            lambda edit=texture_id_edit: self._set_value("properties.TextureId", edit.text().strip())
+        )
+        surface.add_row("Texture Id", texture_id_edit)
+
+        hint = QLabel("Path relative to the project's assets/textures/ folder. Empty = flat Color.")
+        hint.setObjectName("MutedLabel")
+        hint.setWordWrap(True)
+        surface.add_row("", hint)
+
+        tiles = self._float_box(float(obj.properties.get("TilesPerUnit", 1.0)), 0.01, 20.0, 0.1)
+        tiles.valueChanged.connect(lambda value: self._set_value("properties.TilesPerUnit", float(value)))
+        surface.add_row("Tiles Per Unit", tiles)
+
+        roughness = self._float_box(float(obj.properties.get("Roughness", 1.0)), 0.0, 1.0, 0.05)
+        roughness.valueChanged.connect(lambda value: self._set_value("properties.Roughness", float(value)))
+        surface.add_row("Roughness", roughness)
+
+        metallic = self._float_box(float(obj.properties.get("Metallic", 0.0)), 0.0, 1.0, 0.05)
+        metallic.valueChanged.connect(lambda value: self._set_value("properties.Metallic", float(value)))
+        surface.add_row("Metallic", metallic)
+
+        emission_rgb = obj.properties.get("EmissionColor", [0, 0, 0])
+        emission_hex = "#{:02x}{:02x}{:02x}".format(
+            int(emission_rgb[0]), int(emission_rgb[1]), int(emission_rgb[2]),
+        )
+        emission_color = ColorField(emission_hex)
+        emission_color.color_selected.connect(
+            lambda value: self._set_value(
+                "properties.EmissionColor",
+                [QColor(str(value)).red(), QColor(str(value)).green(), QColor(str(value)).blue()],
+            )
+        )
+        surface.add_row("Emission Color", emission_color)
+
+        emission_strength = self._float_box(float(obj.properties.get("EmissionStrength", 0.0)), 0.0, 10.0, 0.1)
+        emission_strength.valueChanged.connect(lambda value: self._set_value("properties.EmissionStrength", float(value)))
+        surface.add_row("Emission Strength", emission_strength)
+
+        return surface
+
     def _build_mesh_section(self, obj: SceneObject) -> CollapsibleSection:
         """Stage 4.1 follow-up: minimum MeshId authoring for MeshPart --
         Insert Object always created a correct MeshPart, but there was no
@@ -2628,6 +2684,29 @@ class InspectorPanel(QWidget):
         mesh.add_row("", hint)
         return mesh
 
+    def _on_material_preset_changed(self, obj: SceneObject, value: str) -> None:
+        """Stage 4.1 (materials & textures foundation): makes the
+        pre-existing Material dropdown genuinely useful. Always writes the
+        Material string (unchanged behavior, every object type). For Part
+        specifically, ALSO applies the preset's Roughness/Metallic (and,
+        for "Neon", EmissionStrength) as a one-time default -- selecting a
+        preset is a convenience starting point, not a standing constraint;
+        nothing re-applies it later, so adjusting the Roughness/Metallic/
+        Emission sliders afterward always wins (see
+        shared/object_registry.MATERIAL_PRESETS's own docstring)."""
+        self._set_value("material", value)
+        if obj.object_type != "Part":
+            return
+        preset = object_registry.MATERIAL_PRESETS.get(value)
+        if not preset:
+            return
+        for key, preset_value in preset.items():
+            self._set_value(f"properties.{key}", float(preset_value))
+        # No manual Inspector refresh here -- the same network round trip
+        # every other property write already goes through
+        # (_external_property_changed) will refresh the Surface section's
+        # sliders once the server confirms, same as any other edit.
+
     def _build_appearance_section(self, obj: SceneObject) -> CollapsibleSection:
         appearance = CollapsibleSection("Appearance")
         color = ColorField(obj.color)
@@ -2636,7 +2715,7 @@ class InspectorPanel(QWidget):
         material = QComboBox()
         material.addItems(["Plastic", "Metal", "Wood", "Glass", "Concrete", "Neon"])
         material.setCurrentText(obj.material)
-        material.currentTextChanged.connect(lambda value: self._set_value("material", value))
+        material.currentTextChanged.connect(lambda value: self._on_material_preset_changed(obj, value))
 
         transparency = self._float_box(obj.transparency, 0.0, 1.0, 0.05)
         transparency.valueChanged.connect(lambda value: self._set_value("transparency", float(value)))

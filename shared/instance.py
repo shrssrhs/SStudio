@@ -253,4 +253,35 @@ def sanitize_part_properties(raw_properties: dict[str, Any]) -> dict[str, Any]:
     if isinstance(can_collide, bool):
         clean["CanCollide"] = can_collide
 
+    # Stage 4.1 (materials & textures foundation): Part-only (SpawnPoint
+    # never gains these -- see shared/object_registry.py's Part
+    # registration for why). Kept as hardcoded cases here, same as every
+    # other field above, rather than moving Part onto the generic
+    # object_registry.sanitize_properties_for_type() path -- Part is the
+    # most widely used class in the project; narrowly extending its
+    # already-proven sanitizer is lower-risk than changing its routing.
+    texture_id = raw_properties.get("TextureId")
+    if isinstance(texture_id, str) and len(texture_id) <= 256:
+        clean["TextureId"] = texture_id
+
+    tiles_per_unit = raw_properties.get("TilesPerUnit")
+    if isinstance(tiles_per_unit, (int, float)) and not isinstance(tiles_per_unit, bool):
+        clean["TilesPerUnit"] = max(0.01, float(tiles_per_unit))
+
+    roughness = raw_properties.get("Roughness")
+    if isinstance(roughness, (int, float)) and not isinstance(roughness, bool):
+        clean["Roughness"] = max(0.0, min(1.0, float(roughness)))
+
+    metallic = raw_properties.get("Metallic")
+    if isinstance(metallic, (int, float)) and not isinstance(metallic, bool):
+        clean["Metallic"] = max(0.0, min(1.0, float(metallic)))
+
+    emission_color = raw_properties.get("EmissionColor")
+    if is_valid_color(emission_color):
+        clean["EmissionColor"] = [int(v) for v in emission_color]
+
+    emission_strength = raw_properties.get("EmissionStrength")
+    if isinstance(emission_strength, (int, float)) and not isinstance(emission_strength, bool):
+        clean["EmissionStrength"] = max(0.0, min(10.0, float(emission_strength)))
+
     return clean

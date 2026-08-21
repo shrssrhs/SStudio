@@ -61,6 +61,7 @@ class _FakeGame:
     the same for rendering."""
 
     _build_part_entity = cs.MultiplayerGame._build_part_entity
+    _apply_part_surface = cs.MultiplayerGame._apply_part_surface
 
     def __init__(self) -> None:
         self.instances: dict[str, cs.InstanceRecord] = {}

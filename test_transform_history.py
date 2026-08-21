@@ -119,6 +119,7 @@ class _FakeGame:
     apply_property_edit = cs.MultiplayerGame.apply_property_edit
     update_instance = cs.MultiplayerGame.update_instance
     _apply_instance_properties = cs.MultiplayerGame._apply_instance_properties
+    _apply_part_surface = cs.MultiplayerGame._apply_part_surface
     process_network_messages = cs.MultiplayerGame.process_network_messages
 
     def __init__(self, network: "cs.NetworkClient") -> None:

@@ -221,6 +221,64 @@ _PART_LIKE_DEFAULTS: dict[str, Any] = dict(instance_module.DEFAULT_PART_PROPERTI
 
 _CONTAINER_PARENTS = ("Workspace", "Model", "Folder")
 
+# Stage 4.1 (materials & textures foundation): Part-ONLY surface
+# properties -- deliberately NOT folded into _PART_LIKE_SCHEMA/
+# _PART_LIKE_DEFAULTS above, which SpawnPoint and MeshPart also inherit.
+# SpawnPoint is a functional gameplay marker, not a decorative surface,
+# and MeshPart's whole point is to preserve its OWN imported GLB material
+# untouched (see MeshPart's registration comment) -- so texturing/PBR
+# controls are scoped to plain Part only, merged into ITS OWN
+# default_properties/property_schema below via **_PART_LIKE_SCHEMA
+# (unchanged) plus these six keys, the same pattern MeshPart already uses
+# for its one extra field (MeshId).
+#
+# TilesPerUnit (not a raw TextureScale Vector2): PropertySpec has no
+# vector2 kind, and a single "how many times should this repeat per world
+# unit" number is more predictable for level-building than asking a
+# creator to hand-compute a UV scale from Size. client_studio.py computes
+# the actual (u, v) texture_scale from Size's two LARGEST dimensions --
+# correct for the common "thin slab" wall/floor/ceiling Part shape, an
+# honest approximation for anything else (see its own comment for why a
+# single global UV scale can't be exactly right on all 6 faces of an
+# arbitrary box without real per-face UV authoring, which is out of scope
+# this pass).
+_PART_SURFACE_SCHEMA: dict[str, PropertySpec] = {
+    "TextureId": PropertySpec("string", 256),
+    "TilesPerUnit": PropertySpec("float"),
+    "Roughness": PropertySpec("float01"),
+    "Metallic": PropertySpec("float01"),
+    "EmissionColor": PropertySpec("color"),
+    "EmissionStrength": PropertySpec("float"),
+}
+
+_PART_SURFACE_DEFAULTS: dict[str, Any] = {
+    "TextureId": "",
+    "TilesPerUnit": 1.0,
+    "Roughness": 1.0,
+    "Metallic": 0.0,
+    "EmissionColor": [0, 0, 0],
+    "EmissionStrength": 0.0,
+}
+
+# Stage 4.1: makes the pre-existing "Material" string property (already
+# serialized, already in the Inspector's dropdown, previously purely
+# cosmetic -- see Part 4 of the materials-foundation task) genuinely
+# useful WITHOUT changing its type or breaking existing Places/API: each
+# preset supplies Roughness/Metallic (and, for "Neon", a small default
+# EmissionStrength) defaults applied when a creator explicitly PICKS that
+# preset in the Inspector -- never re-enforced afterward, so adjusting
+# Roughness/Metallic by hand right after always wins. Deliberately the
+# same six names the Inspector's Material dropdown already offered
+# (nothing new invented) and deliberately small -- not a material catalog.
+MATERIAL_PRESETS: dict[str, dict[str, float]] = {
+    "Plastic": {"Roughness": 0.5, "Metallic": 0.0},
+    "Metal": {"Roughness": 0.35, "Metallic": 1.0},
+    "Wood": {"Roughness": 0.8, "Metallic": 0.0},
+    "Glass": {"Roughness": 0.05, "Metallic": 0.0},
+    "Concrete": {"Roughness": 0.9, "Metallic": 0.0},
+    "Neon": {"Roughness": 0.3, "Metallic": 0.0, "EmissionStrength": 2.0},
+}
+
 
 def _register_defaults() -> None:
     register_object_type(ObjectTypeDefinition(
@@ -232,10 +290,14 @@ def _register_defaults() -> None:
         default_parent="Workspace",
         allowed_parent_types=_CONTAINER_PARENTS,
         keywords=("block", "cube", "brick"),
-        default_properties=dict(_PART_LIKE_DEFAULTS),
-        property_schema=dict(_PART_LIKE_SCHEMA),
+        default_properties={**_PART_LIKE_DEFAULTS, **_PART_SURFACE_DEFAULTS},
+        property_schema={**_PART_LIKE_SCHEMA, **_PART_SURFACE_SCHEMA},
         has_3d_entity=True,
-        inspector_sections=("transform", "appearance", "behavior"),
+        # "surface" (Stage 4.1 materials & textures foundation): texture/
+        # PBR authoring -- see studio_editor_live.py's
+        # InspectorPanel._build_surface_section(). Part-only, same reason
+        # the new properties above are Part-only.
+        inspector_sections=("transform", "surface", "appearance", "behavior"),
     ))
 
     # Stage 4.1 (showcase sprint): a Part-like object whose visual geometry

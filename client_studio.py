@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from panda3d.core import Filename, Fog, Quat, TransparencyAttrib
+from panda3d.core import Filename, Fog, Material, Quat, TransparencyAttrib
 from ursina import (
     AmbientLight,
     Cone,
@@ -26,6 +26,7 @@ from ursina import (
     PointLight as UrsinaPointLight,
     SpotLight as UrsinaSpotLight,
     Text,
+    Texture as UrsinaTexture,
     Ursina,
     Vec3,
     application,
@@ -402,34 +403,49 @@ PLAYER_MODEL_PATH = ASSETS_DIR / "player.glb"
 # ASSETS_DIR's root (which already holds engine assets like player.glb) so
 # user/project mesh props have one dedicated, unambiguous home.
 MESH_ASSETS_DIR = ASSETS_DIR / "meshes"
+# Stage 4.1 (materials & textures foundation): same convention, one level
+# down, for Part.TextureId -- e.g. "concrete.jpg" or "walls/plaster.png".
+TEXTURE_ASSETS_DIR = ASSETS_DIR / "textures"
 
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 MESH_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+TEXTURE_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def resolve_mesh_asset_path(mesh_id: str) -> Optional[Path]:
-    """Resolves a MeshPart.MeshId string to a real file under
-    MESH_ASSETS_DIR, or None if mesh_id is empty/malformed/escapes that
-    folder. MeshId is untrusted data (Lua-writable, Inspector-writable,
-    round-trips through Place JSON) -- rejecting absolute paths and ".."
-    segments before ever touching the filesystem is a deliberate guard
-    against it being used to read files outside the project's mesh folder,
-    not just a correctness nicety."""
-    if not mesh_id or not isinstance(mesh_id, str):
+def _resolve_asset_path(asset_id: str, base_dir: Path) -> Optional[Path]:
+    """Resolves a project-relative asset id (MeshId, TextureId, ...) to a
+    real file under `base_dir`, or None if it's empty/malformed/escapes
+    that folder. Shared by resolve_mesh_asset_path()/
+    resolve_texture_asset_path() rather than duplicated per asset kind --
+    this validation is security-relevant (the asset id is untrusted data:
+    Lua-writable, Inspector-writable, round-trips through Place JSON), so
+    one definition is safer than two that could quietly drift apart.
+    Rejecting absolute paths and ".." segments before ever touching the
+    filesystem is a deliberate guard against escaping the intended asset
+    folder, not just a correctness nicety."""
+    if not asset_id or not isinstance(asset_id, str):
         return None
-    normalized = mesh_id.strip().replace("\\", "/")
+    normalized = asset_id.strip().replace("\\", "/")
     if not normalized or normalized.startswith("/") or ":" in normalized:
         return None
     parts = [segment for segment in normalized.split("/") if segment not in ("", ".")]
     if not parts or any(segment == ".." for segment in parts):
         return None
-    candidate = MESH_ASSETS_DIR.joinpath(*parts)
+    candidate = base_dir.joinpath(*parts)
     try:
         resolved = candidate.resolve()
-        resolved.relative_to(MESH_ASSETS_DIR.resolve())
+        resolved.relative_to(base_dir.resolve())
     except (OSError, ValueError):
         return None
     return resolved
+
+
+def resolve_mesh_asset_path(mesh_id: str) -> Optional[Path]:
+    return _resolve_asset_path(mesh_id, MESH_ASSETS_DIR)
+
+
+def resolve_texture_asset_path(texture_id: str) -> Optional[Path]:
+    return _resolve_asset_path(texture_id, TEXTURE_ASSETS_DIR)
 
 
 def load_mesh_node(mesh_id: str):
@@ -464,6 +480,43 @@ def load_mesh_node(mesh_id: str):
         pass
 
     return node, ""
+
+
+# Stage 4.1 (materials & textures foundation): keyed by the RESOLVED
+# absolute path (not the bare TextureId string), so two different
+# TextureIds that happen to share a filename in different folders can
+# never collide -- unlike Ursina's own load_texture()/imported_textures
+# cache, which keys purely by name and would confuse "walls/tile.png"
+# with "floors/tile.png". Never reloaded from disk once cached; repeated
+# Play/Stop and repeated Inspector edits to unrelated properties reuse the
+# same Texture object (see _apply_part_surface()).
+_TEXTURE_CACHE: dict[str, Any] = {}
+
+
+def load_texture_cached(texture_id: str):
+    """Loads a Part's TextureId, backed by _TEXTURE_CACHE -- returns
+    (texture_or_None, error_message), same (value, error) shape as
+    load_mesh_node(). Uses ursina.Texture directly (the same class
+    ursina.load_texture() constructs internally) rather than that
+    function's own name-based recursive folder search, for the same
+    "explicit, validated path, no ambiguity" reasoning
+    resolve_texture_asset_path() already documents."""
+    path = resolve_texture_asset_path(texture_id)
+    if path is None:
+        return None, f"invalid or missing TextureId: {texture_id!r}"
+    cache_key = str(path)
+    if cache_key in _TEXTURE_CACHE:
+        return _TEXTURE_CACHE[cache_key], ""
+    if not path.exists() or not path.is_file():
+        return None, f"texture asset not found: {texture_id}"
+    if path.stat().st_size <= 0:
+        return None, f"texture asset is empty: {texture_id}"
+    try:
+        texture = UrsinaTexture(path)
+    except Exception as error:  # noqa: BLE001 -- any loader failure is a "missing/bad asset", not a crash
+        return None, f"failed to load texture {texture_id!r}: {type(error).__name__}: {error}"
+    _TEXTURE_CACHE[cache_key] = texture
+    return texture, ""
 
 
 # ============================================================
@@ -4752,6 +4805,11 @@ class MultiplayerGame(Entity):
 
         if class_name == "MeshPart":
             self._apply_mesh_geometry(root, str(properties.get("MeshId", "")))
+        elif class_name == "Part":
+            # Stage 4.1 (materials & textures foundation): Part only --
+            # never SpawnPoint (a functional marker, not a decorative
+            # surface) or MeshPart (preserves its own imported material).
+            self._apply_part_surface(root, properties)
         return root
 
     def _build_light_entity(self, class_name: str, properties: dict[str, Any]) -> Entity | None:
@@ -4861,6 +4919,67 @@ class MultiplayerGame(Entity):
             if marker is not None:
                 marker.enabled = visible
 
+    def _apply_part_surface(self, entity: Entity, properties: dict[str, Any]) -> None:
+        """The ONE place Part.TextureId/TilesPerUnit/Roughness/Metallic/
+        EmissionColor/EmissionStrength actually reach the real Entity/
+        Panda3D Material -- called from _build_part_entity (initial
+        build), _apply_instance_properties (editor/Inspector edits), and
+        RuntimeSceneLayer._apply_visual (Lua writes -- see its own
+        docstring for why this Panda3D-specific work lives here rather
+        than in lua_runtime.py, same reasoning as _apply_light_properties).
+        Part-only: never called for MeshPart (whose material is its own
+        imported GLB material -- see MeshPart's registration comment in
+        shared/object_registry.py -- left completely untouched) or
+        SpawnPoint.
+
+        TextureId empty/missing/failed-to-load -> plain flat Color, same
+        as today, with an Output warning on failure (never a crash, never
+        a placeholder texture invented) -- mirrors _apply_mesh_geometry's
+        own "missing asset" contract. TilesPerUnit is applied as a UV
+        scale computed from Size's two LARGEST dimensions (see
+        shared/object_registry.py's _PART_SURFACE_SCHEMA comment for why
+        that's the honest, predictable v1 rather than true per-face UVs).
+        Roughness/Metallic/Emission go through one Material object owned
+        by `entity` (entity._pbr_material, mutated in place and
+        re-applied -- never a fresh Material() per call, so repeated
+        Inspector edits/Play-Stop cycles don't churn Panda3D material
+        state)."""
+        texture_id = str(properties.get("TextureId", ""))
+        texture = None
+        if texture_id:
+            texture, error = load_texture_cached(texture_id)
+            if texture is None:
+                print(f"[MATERIAL] {error}")
+        entity.texture = texture  # None clears any previously-set texture (safe no-op if already clear)
+        if texture is not None:
+            size = properties.get("Size", [1.0, 1.0, 1.0])
+            try:
+                dims = sorted((abs(float(size[0])), abs(float(size[1])), abs(float(size[2]))), reverse=True)
+            except (TypeError, ValueError, IndexError):
+                dims = [1.0, 1.0, 1.0]
+            tiles_per_unit = max(0.01, float(properties.get("TilesPerUnit", 1.0)))
+            entity.texture_scale = (dims[0] * tiles_per_unit, dims[1] * tiles_per_unit)
+
+        material = getattr(entity, "_pbr_material", None)
+        if material is None:
+            material = Material(f"part-surface-{id(entity)}")
+            entity._pbr_material = material
+        try:
+            material.setRoughness(max(0.0, min(1.0, float(properties.get("Roughness", 1.0)))))
+            material.setMetallic(max(0.0, min(1.0, float(properties.get("Metallic", 0.0)))))
+            emission_rgb = properties.get("EmissionColor", [0, 0, 0])
+            emission_strength = max(0.0, float(properties.get("EmissionStrength", 0.0)))
+            material.setEmission((
+                float(emission_rgb[0]) / 255.0 * emission_strength,
+                float(emission_rgb[1]) / 255.0 * emission_strength,
+                float(emission_rgb[2]) / 255.0 * emission_strength,
+                1.0,
+            ))
+        except (TypeError, ValueError, IndexError):
+            pass
+        if entity.model:
+            entity.model.setMaterial(material)
+
     def _apply_mesh_geometry(self, entity: Entity, mesh_id: str) -> None:
         """(Re)loads a MeshPart's visual geometry onto `entity`, replacing
         whatever mesh geometry it currently carries. `entity` itself stays
@@ -4959,6 +5078,17 @@ class MultiplayerGame(Entity):
                 or "Range" in properties or "Angle" in properties
             ):
                 self._apply_light_properties(entity, record.class_name, merged)
+            if record.class_name == "Part" and (
+                replace or "TextureId" in properties or "TilesPerUnit" in properties
+                or "Roughness" in properties or "Metallic" in properties
+                or "EmissionColor" in properties or "EmissionStrength" in properties
+                # Size changes the effective UV tiling too (see
+                # _apply_part_surface's Size-derived texture_scale) --
+                # resizing a textured wall with the gizmo must not leave
+                # stale tiling behind.
+                or "Size" in properties
+            ):
+                self._apply_part_surface(entity, merged)
         except (TypeError, ValueError, IndexError, KeyError) as error:
             print(f"[WORLD] Не удалось обновить {record.id}: {error}")
 

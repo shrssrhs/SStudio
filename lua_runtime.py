@@ -1327,6 +1327,21 @@ class RuntimeSceneLayer:
                 return "number", float(overlay.get(key, base.get(key, 8.0)))
             if key == "Angle":
                 return "number", float(overlay.get(key, base.get(key, 45.0)))
+            if key == "TextureId":
+                # Stage 4.1 (materials & textures foundation): Part only,
+                # same "harmless elsewhere" reasoning as MeshId.
+                return "string", str(overlay.get(key, base.get(key, "")))
+            if key == "TilesPerUnit":
+                return "number", float(overlay.get(key, base.get(key, 1.0)))
+            if key == "Roughness":
+                return "number", float(overlay.get(key, base.get(key, 1.0)))
+            if key == "Metallic":
+                return "number", float(overlay.get(key, base.get(key, 0.0)))
+            if key == "EmissionColor":
+                value = overlay.get(key, base.get(key, [0, 0, 0]))
+                return "color3", [float(c) / 255.0 for c in value[:3]]
+            if key == "EmissionStrength":
+                return "number", float(overlay.get(key, base.get(key, 0.0)))
             return "error", f"'{key}' is not a valid member of {class_name}"
 
         # Stage 3.9: generic schema-driven property read for classes with
@@ -1669,6 +1684,25 @@ class RuntimeSceneLayer:
                 # them is likewise stored without a class check, matching
                 # every other has_3d_entity field's uniform treatment.
                 self._overlay.setdefault(instance_id, {})[key] = float(value)
+            elif key == "TextureId":
+                # Stage 4.1 (materials & textures foundation): unlike
+                # MeshId, this DOES hot-swap live -- _apply_visual() below
+                # unconditionally calls _apply_part_surface() for any Part
+                # property write, and that function is exactly "load
+                # (or clear) the texture from the current TextureId", so
+                # no separate no-hot-swap carve-out is needed here.
+                if not isinstance(value, str):
+                    return False, "TextureId must be a string"
+                self._overlay.setdefault(instance_id, {})[key] = value[:256]
+            elif key == "TilesPerUnit":
+                self._overlay.setdefault(instance_id, {})[key] = max(0.01, float(value))
+            elif key in ("Roughness", "Metallic"):
+                self._overlay.setdefault(instance_id, {})[key] = max(0.0, min(1.0, float(value)))
+            elif key == "EmissionColor":
+                rgb = [max(0, min(255, int(round(float(c) * 255.0)))) for c in value[:3]]
+                self._overlay.setdefault(instance_id, {})[key] = rgb
+            elif key == "EmissionStrength":
+                self._overlay.setdefault(instance_id, {})[key] = max(0.0, min(10.0, float(value)))
             else:
                 return False, f"'{key}' is not a valid member of {class_name}"
         except (TypeError, ValueError, IndexError):
@@ -1724,6 +1758,16 @@ class RuntimeSceneLayer:
             # of this engine-agnostic-ish module.
             try:
                 self.game._apply_light_properties(entity, class_name, merged)
+            except Exception:
+                pass
+        elif class_name == "Part":
+            # Stage 4.1 (materials & textures foundation): same
+            # delegation pattern -- the actual texture-loading/Material
+            # calls live in client_studio.py's _apply_part_surface(). Not
+            # called for MeshPart (preserves its own imported material)
+            # or SpawnPoint.
+            try:
+                self.game._apply_part_surface(entity, merged)
             except Exception:
                 pass
 

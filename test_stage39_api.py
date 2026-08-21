@@ -72,6 +72,7 @@ class _FakeGame:
     authored Parts with real Entities/physics bodies."""
 
     _build_part_entity = cs.MultiplayerGame._build_part_entity
+    _apply_part_surface = cs.MultiplayerGame._apply_part_surface
 
     def __init__(self, with_character: bool = True, gravity: float = -24.0) -> None:
         self.instances: dict[str, cs.InstanceRecord] = {}
