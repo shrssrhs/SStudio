@@ -6527,9 +6527,45 @@ def main() -> int:
     # reconfigure the first one) -- see MultiplayerGame.pbr_pipeline /
     # apply_environment_settings() for the single owned-lifecycle contract
     # this feeds into.
+    # Stage 4.3A: use_normal_maps=True unlocks per-pixel bump detail from
+    # embedded GLB normal-map textures on MeshPart geometry. Audited before
+    # enabling, not guessed: simplepbr's vertex shader builds a TBN matrix
+    # from p3d_Tangent UNCONDITIONALLY (regardless of this flag) and the
+    # fragment shader only gates whether p3d_TextureNormal actually gets
+    # sampled -- with the flag off it hardcodes normal=(0,0,1), i.e. the
+    # TBN's own untouched normal column. Empirically verified with a real
+    # window+GPU (not just source reading): toggling use_normal_maps=True
+    # live on an already-built Pipeline, a plain textured primitive cube
+    # (Ursina's procedural mesh -- confirmed via ursina/mesh.py to carry NO
+    # Tangent/Binormal vertex column) and the repo's real MeshPart
+    # (test_prop.glb) both rendered pixel-identical before/after, with no
+    # black-out or NaN artifacts, because neither had a normal-map texture
+    # bound to sample in the first place. Separately confirmed panda3d-gltf
+    # DOES write a real Tangent vertex column on both committable/personal
+    # GLBs (test_prop.glb, angel.glb) -- so MeshPart geometry is already
+    # correctly set up to receive real per-pixel bump detail with zero
+    # further plumbing. The positive case was verified too, not just
+    # "doesn't break": a same-process A/B render of the personal diagnostic
+    # asset (angel.glb, which has a real glTF normalTexture) under a raking
+    # light, toggling this flag live between two captures with the model/
+    # camera/lighting/exposure held identical, produced a pixel-diff
+    # heatmap whose signal is a clean silhouette of the statue's own edges/
+    # folds (zero diff on the untextured background) -- exactly the
+    # spatially-coherent, geometry-following pattern real per-pixel normal
+    # perturbation produces, not noise. That confirms the whole chain works
+    # end to end: glTF normalTexture -> panda3d-gltf's TextureStage(mode=
+    # M_normal) -> Panda3D's mode-based p3d_TextureNormal auto-binding ->
+    # simplepbr's get_normalmap_data() sampling -> changed final shading.
+    # Deliberately NOT extended to a Part.NormalMapId
+    # property in this pass: this Panda3D build exposes no runtime API to
+    # generate tangent data for Ursina's primitive cube/sphere/plane
+    # meshes (no NodePath.recompute_tangent_binormal or equivalent), so a
+    # primitive Part given a real normal-map texture would shade with a
+    # wrong/undefined tangent direction on at least some faces -- not a
+    # crash, but not "supports it correctly" either.
     pbr_pipeline = None
     if SIMPLEPBR_AVAILABLE:
-        pbr_pipeline = simplepbr.init()
+        pbr_pipeline = simplepbr.init(use_normal_maps=True)
         print("[MODEL] simplepbr инициализирован")
     else:
         print(

@@ -443,6 +443,40 @@ def test_meshpart_imported_material_is_a_real_pbr_material_with_textures() -> No
         check(len(geom_nodes) > 0, "the loaded mesh has real geometry")
 
 
+def test_meshpart_geometry_carries_real_tangent_data() -> None:
+    """Stage 4.3A audit finding, made permanent: panda3d-gltf writes a real
+    Tangent vertex column on GLB import (confirmed here for the repo's
+    committable diagnostic mesh), which is exactly why enabling simplepbr's
+    global use_normal_maps=True is safe for MeshPart -- its geometry is
+    already correctly set up to receive per-pixel bump detail with no
+    further plumbing needed. This is a headless, CPU-side geometry check
+    (no GPU/simplepbr involved), not a claim about how a normal map looks."""
+    node, error = cs.load_mesh_node(REAL_MESH_ID)
+    check(node is not None, f"test_prop.glb loads: {error!r}")
+    if node is not None:
+        has_tangent = False
+        for geom_node_path in node.findAllMatches("**/+GeomNode"):
+            geom_node = geom_node_path.node()
+            for i in range(geom_node.getNumGeoms()):
+                vformat = geom_node.getGeom(i).getVertexData().getFormat()
+                has_tangent = has_tangent or vformat.hasColumn("tangent")
+        check(has_tangent, "the imported GLB's GeomVertexData has a real Tangent column")
+
+
+def test_simplepbr_init_call_site_requests_normal_maps() -> None:
+    """Stage 4.3A: use_normal_maps=True is a single, easy-to-silently-revert
+    keyword at the ONE simplepbr.init() call site (main(), a real window is
+    required so it cannot run in this headless suite) -- this is a cheap
+    source-level tripwire, not a rendering test, so a future refactor that
+    drops the flag doesn't go unnoticed."""
+    import inspect
+    source = inspect.getsource(cs)
+    marker = "pbr_pipeline = simplepbr.init("
+    anchor = source.index(marker)
+    call_site = source[anchor:anchor + len(marker) + 40]
+    check("use_normal_maps=True" in call_site, f"the real simplepbr.init() call site still requests use_normal_maps=True, got: {call_site!r}")
+
+
 test_part_surface_schema_scoped_correctly()
 test_resolve_texture_asset_path_accepts_relative_and_rejects_escapes()
 test_load_texture_cached_valid_and_missing()
@@ -460,6 +494,8 @@ test_destroy_cleans_up_textured_part()
 test_repeated_play_stop_reuses_texture_cache_no_leak()
 test_meshpart_material_is_never_touched_by_part_surface_logic()
 test_meshpart_imported_material_is_a_real_pbr_material_with_textures()
+test_meshpart_geometry_carries_real_tangent_data()
+test_simplepbr_init_call_site_requests_normal_maps()
 
 print()
 if FAILURES:
