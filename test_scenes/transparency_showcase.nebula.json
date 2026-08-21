@@ -1,0 +1,368 @@
+{
+  "format": "nebula-scene",
+  "version": 3,
+  "objects": [
+    {
+      "id": "room_a_floor",
+      "class_name": "Part",
+      "name": "RoomAFloor",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, -0.1, 0],
+        "Size": [8, 0.2, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [100, 92, 80],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "concrete_floor.png",
+        "TilesPerUnit": 0.3,
+        "Roughness": 0.9,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_a_ceiling",
+      "class_name": "Part",
+      "name": "RoomACeiling",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 4.1, 0],
+        "Size": [8, 0.2, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [50, 48, 46],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "ceiling_panel.png",
+        "TilesPerUnit": 0.3,
+        "Roughness": 0.75,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_a_wall_left",
+      "class_name": "Part",
+      "name": "RoomAWallLeft",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-4.1, 2, 0],
+        "Size": [0.2, 4, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [130, 124, 112],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "plaster_wall.png",
+        "TilesPerUnit": 0.4,
+        "Roughness": 0.85,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_a_wall_right",
+      "class_name": "Part",
+      "name": "RoomAWallRight",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [4.1, 2, 0],
+        "Size": [0.2, 4, 8],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [130, 124, 112],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "plaster_wall.png",
+        "TilesPerUnit": 0.4,
+        "Roughness": 0.85,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_a_wall_back",
+      "class_name": "Part",
+      "name": "RoomAWallBack",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 2, -4.1],
+        "Size": [8, 4, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [130, 124, 112],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "plaster_wall.png",
+        "TilesPerUnit": 0.4,
+        "Roughness": 0.85,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "dividing_wall_left",
+      "class_name": "Part",
+      "name": "DividingWallLeft",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-2.75, 2, 4.1],
+        "Size": [2.5, 4, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [130, 124, 112],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "plaster_wall.png",
+        "TilesPerUnit": 0.4,
+        "Roughness": 0.85,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "dividing_wall_right",
+      "class_name": "Part",
+      "name": "DividingWallRight",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [2.75, 2, 4.1],
+        "Size": [2.5, 4, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [130, 124, 112],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "plaster_wall.png",
+        "TilesPerUnit": 0.4,
+        "Roughness": 0.85,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "glass_window",
+      "class_name": "Part",
+      "name": "GlassWindow",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 2, 4.1],
+        "Size": [3, 4, 0.15],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [150, 190, 220],
+        "Material": "Glass",
+        "Transparency": 0.55,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "",
+        "TilesPerUnit": 1.0,
+        "Roughness": 0.05,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_b_floor",
+      "class_name": "Part",
+      "name": "RoomBFloor",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, -0.1, 7],
+        "Size": [5, 0.2, 6],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [90, 84, 74],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "concrete_floor.png",
+        "TilesPerUnit": 0.3,
+        "Roughness": 0.9,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_b_wall_back",
+      "class_name": "Part",
+      "name": "RoomBWallBack",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 2, 9.9],
+        "Size": [5, 4, 0.2],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [140, 100, 80],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "dark_beam.png",
+        "TilesPerUnit": 0.5,
+        "Roughness": 0.88,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "room_b_light",
+      "class_name": "PointLight",
+      "name": "RoomBLight",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 3.0, 7.5],
+        "Color": [255, 225, 180],
+        "Intensity": 2.0,
+        "Range": 9.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "color_divider",
+      "class_name": "Part",
+      "name": "ColorDivider",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-2.8, 1.3, 1.5],
+        "Size": [0.1, 2.2, 2.0],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [210, 70, 70],
+        "Material": "Glass",
+        "Transparency": 0.3,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "",
+        "TilesPerUnit": 1.0,
+        "Roughness": 0.1,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "opaque_pedestal",
+      "class_name": "Part",
+      "name": "OpaqueBaselinePedestal",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [2.6, 0.4, 1.0],
+        "Size": [0.8, 0.8, 0.8],
+        "Rotation": [0.0, 15.0, 0.0],
+        "Color": [90, 88, 84],
+        "Material": "Concrete",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": true,
+        "TextureId": "dark_beam.png",
+        "TilesPerUnit": 0.8,
+        "Roughness": 0.9,
+        "Metallic": 0.0,
+        "EmissionColor": [0, 0, 0],
+        "EmissionStrength": 0.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "alpha_mode_panels",
+      "class_name": "MeshPart",
+      "name": "AlphaModePanels",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [-3.4, 0.0, -1.5],
+        "Size": [0.9, 0.9, 0.9],
+        "Rotation": [0.0, 25.0, 0.0],
+        "Color": [255, 255, 255],
+        "Material": "Plastic",
+        "Transparency": 0.0,
+        "Anchored": true,
+        "CanCollide": false,
+        "MeshId": "alpha_test.glb"
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "showcase_fixture",
+      "class_name": "SpotLight",
+      "name": "ShowcaseFixture",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 3.8, -1],
+        "Rotation": [90.0, 0.0, 0.0],
+        "Color": [255, 240, 215],
+        "Intensity": 2.0,
+        "Range": 8.0,
+        "Angle": 65.0
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    },
+    {
+      "id": "spawn",
+      "class_name": "SpawnPoint",
+      "name": "SpawnLocation",
+      "parent_id": "Workspace",
+      "properties": {
+        "Position": [0, 0.0, -2.5],
+        "Size": [2.0, 0.4, 2.0],
+        "Rotation": [0.0, 0.0, 0.0],
+        "Color": [0, 200, 90],
+        "Material": "Plastic",
+        "Transparency": 0.25,
+        "Anchored": true,
+        "CanCollide": false
+      },
+      "tags": [], "attributes": {}, "enabled": true
+    }
+  ],
+  "services": {
+    "Environment": {
+      "FogEnabled": true,
+      "FogColor": [60.0, 58.0, 62.0],
+      "FogDensity": 0.02,
+      "Exposure": -0.3,
+      "ShadowsEnabled": true,
+      "ShadowDistance": 20.0,
+      "AmbientColor": [35.0, 34.0, 40.0],
+      "AmbientIntensity": 1.0,
+      "Contrast": 1.1,
+      "Saturation": 0.9,
+      "ColorTint": [245.0, 240.0, 235.0],
+      "VignetteIntensity": 0.25,
+      "GrainIntensity": 0.08,
+      "SkyTopColor": [70.0, 145.0, 225.0],
+      "SkyHorizonColor": [70.0, 145.0, 225.0],
+      "SkyBottomColor": [70.0, 145.0, 225.0],
+      "SunColor": [235.0, 225.0, 205.0],
+      "SunIntensity": 0.5,
+      "SunRotation": [35.264392, 135.0, -120.00001]
+    }
+  }
+}

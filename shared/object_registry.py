@@ -274,7 +274,13 @@ MATERIAL_PRESETS: dict[str, dict[str, float]] = {
     "Plastic": {"Roughness": 0.5, "Metallic": 0.0},
     "Metal": {"Roughness": 0.35, "Metallic": 1.0},
     "Wood": {"Roughness": 0.8, "Metallic": 0.0},
-    "Glass": {"Roughness": 0.05, "Metallic": 0.0},
+    # Stage 4.3D: Transparency=0.6 gives Glass a useful starting look
+    # instead of silently staying fully opaque -- still a ONE-SHOT
+    # initializer like every other preset field (see
+    # _on_material_preset_changed()'s own docstring): a creator can
+    # freely readjust Transparency afterward and nothing re-applies
+    # this value later.
+    "Glass": {"Roughness": 0.05, "Metallic": 0.0, "Transparency": 0.6},
     "Concrete": {"Roughness": 0.9, "Metallic": 0.0},
     "Neon": {"Roughness": 0.3, "Metallic": 0.0, "EmissionStrength": 2.0},
 }

@@ -2751,7 +2751,17 @@ class InspectorPanel(QWidget):
         if not preset:
             return
         for key, preset_value in preset.items():
-            self._set_value(f"properties.{key}", float(preset_value))
+            # Stage 4.3D: Transparency is a top-level SceneObject field
+            # (obj.transparency, written via _set_value("transparency",
+            # ...) -- see the Appearance section's own Transparency row
+            # a few lines below), NOT a properties.* entry like Roughness/
+            # Metallic/EmissionStrength -- writing it as
+            # "properties.Transparency" would silently miss the real
+            # property.
+            if key == "Transparency":
+                self._set_value("transparency", float(preset_value))
+            else:
+                self._set_value(f"properties.{key}", float(preset_value))
         # No manual Inspector refresh here -- the same network round trip
         # every other property write already goes through
         # (_external_property_changed) will refresh the Surface section's
@@ -2767,8 +2777,6 @@ class InspectorPanel(QWidget):
         material.setCurrentText(obj.material)
         material.currentTextChanged.connect(lambda value: self._on_material_preset_changed(obj, value))
 
-        transparency = self._float_box(obj.transparency, 0.0, 1.0, 0.05)
-        transparency.valueChanged.connect(lambda value: self._set_value("transparency", float(value)))
         reflectance = self._float_box(obj.reflectance, 0.0, 1.0, 0.05)
         reflectance.valueChanged.connect(lambda value: self._set_value("reflectance", float(value)))
 
@@ -2776,7 +2784,24 @@ class InspectorPanel(QWidget):
         surface.addItems(["Smooth", "Studs", "Inlet", "Universal"])
         appearance.add_row("Color", color)
         appearance.add_row("Material", material)
-        appearance.add_row("Transparency", transparency)
+        # Stage 4.3D API-surface check: MeshPart inherits a Transparency
+        # schema entry from the shared Part/SpawnPoint/MeshPart base
+        # (test_transparency.py's test_meshpart_does_not_get_a_
+        # transparency_override() proves _apply_mesh_geometry() never
+        # reads it), so it is genuinely dormant -- a MeshPart's visible
+        # transparency comes entirely from its own imported glTF material
+        # (Option A, deliberately no SStudio-level override this pass).
+        # Showing a Transparency slider here would silently do nothing
+        # when dragged, which is worse than not offering it at all --
+        # excluded specifically for MeshPart so the Inspector never
+        # exposes a control that looks functional but isn't. Part/
+        # SpawnPoint both build a real primitive Entity (model="cube",
+        # unlike MeshPart's model=None root) where Transparency already
+        # works, so they keep this row.
+        if obj.object_type != "MeshPart":
+            transparency = self._float_box(obj.transparency, 0.0, 1.0, 0.05)
+            transparency.valueChanged.connect(lambda value: self._set_value("transparency", float(value)))
+            appearance.add_row("Transparency", transparency)
         appearance.add_row("Reflectance", reflectance)
         appearance.add_row("Surface", surface)
         return appearance

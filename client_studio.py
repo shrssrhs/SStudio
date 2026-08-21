@@ -475,6 +475,17 @@ def load_mesh_node(mesh_id: str):
     if node is None or node.isEmpty():
         return None, f"failed to load mesh {mesh_id!r}: loader returned no geometry"
 
+    # Stage 4.3D audit: this NodePath-level override was verified (this
+    # session, via direct RenderState introspection before/after this
+    # exact call, plus a real render) to be harmless to embedded glTF
+    # alphaMode -- panda3d-gltf attaches MASK's AlphaTestAttrib and
+    # BLEND's TransparencyAttrib at the PER-GEOM level (GeomNode.
+    # set_geom_state()), which composes OVER a node-level setTransparency()
+    # override rather than being erased by it. Both MASK (hard cutoff)
+    # and BLEND (smooth alpha blend) were confirmed rendering correctly
+    # in a real window with this call still in place. Left in place
+    # (unproven to be doing anything useful, but also proven not to be
+    # doing anything harmful) rather than removed for no clear benefit.
     try:
         node.setTransparency(TransparencyAttrib.MNone)
     except Exception:
