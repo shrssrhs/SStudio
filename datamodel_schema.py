@@ -586,6 +586,45 @@ register_class(ClassDescriptor(
             "AmbientIntensity", "float", category="Ambient", default=1.0,
             minimum=0.0, maximum=4.0,
         ),
+        PropertyDescriptor(
+            # Stage 4.3B: final-image contrast, applied AFTER simplepbr's
+            # own exposure+filmic tonemap (see client_studio.py's custom
+            # post-process shader) via a centered formula
+            # (color-0.5)*Contrast+0.5, not a naive multiply -- 1.0 is
+            # neutral/reproduces the pre-4.3B image exactly.
+            "Contrast", "float", category="Post Processing", default=1.0,
+            minimum=0.0, maximum=3.0,
+        ),
+        PropertyDescriptor(
+            # Luminance-based saturation (mix toward Rec.709 grayscale),
+            # not per-channel scaling -- 1.0 neutral, 0.0 grayscale, >1.0
+            # oversaturated.
+            "Saturation", "float", category="Post Processing", default=1.0,
+            minimum=0.0, maximum=3.0,
+        ),
+        PropertyDescriptor(
+            # A single multiplicative color grade on the final image --
+            # deliberately the smallest coherent color-tone model (chosen
+            # over a separate Temperature+Tint pair): white (255,255,255)
+            # is neutral/no-op, and a cold/warm/sickly mood is just picking
+            # an appropriate tint color (e.g. a pale blue for a cold night,
+            # a pale amber for a warm interior).
+            "ColorTint", "color3", category="Post Processing", default=[255.0, 255.0, 255.0],
+        ),
+        PropertyDescriptor(
+            # Aspect-ratio-independent radial edge darkening -- 0.0 (default)
+            # is a true no-op (bit-identical to no vignette), not just "very
+            # faint"; see the shader for why this can't paint flat black
+            # circles even at 1.0.
+            "VignetteIntensity", "float", category="Post Processing", default=0.0,
+            minimum=0.0, maximum=1.0,
+        ),
+        PropertyDescriptor(
+            # Procedural, shader-generated, time-varying film grain -- no
+            # texture asset involved. 0.0 (default) is a true no-op.
+            "GrainIntensity", "float", category="Post Processing", default=0.0,
+            minimum=0.0, maximum=1.0,
+        ),
     ),
 ))
 

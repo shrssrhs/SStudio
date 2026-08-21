@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from panda3d.core import Filename, Fog, Material, Quat, TransparencyAttrib
+from panda3d.core import Filename, Fog, Material, Quat, Shader, TransparencyAttrib
 from ursina import (
     AmbientLight,
     Cone,
@@ -777,6 +777,174 @@ GRID_LINE_COLOR = color.rgba32(150, 150, 158, 255)
 GRID_LINE_COUNT = 60
 GRID_LINE_SPACING = 2.0
 
+
+# ============================================================
+# STAGE 4.3B: POST-PROCESSING (final-image treatment)
+# ============================================================
+# Architecture (see the full audit in _install_postprocess_shader()'s
+# docstring): simplepbr already renders the scene into an offscreen
+# float texture and displays it through ONE fullscreen quad
+# (pipeline._post_process_quad) running its own tonemap.frag (exposure +
+# filmic curve). That quad IS the "final color texture -> compositor ->
+# display" hook the sprint asked to look for -- so instead of building a
+# second competing FilterManager (which would fight simplepbr's for
+# ownership of the main camera's render target, exactly the conflict this
+# sprint's brief warned about), SStudio's Contrast/Saturation/ColorTint/
+# Vignette/Grain are folded into ONE replacement shader on that SAME
+# quad. The exposure+tonemap math below is copied verbatim from
+# simplepbr==0.13.1's own tonemap.frag (read directly from the installed
+# package, not reconstructed from memory) so that all-neutral defaults
+# reproduce the pre-4.3B image bit-for-bit. SDR LUT support is
+# deliberately dropped -- grep-confirmed unused anywhere in this
+# codebase, so there is nothing to preserve.
+#
+# Targets GLSL 120 (this app never sets the `gl-version` Config.prc
+# variable, so simplepbr's own use_330 detection -- confirmed via
+# _get_default_330() -- is False at runtime); a 330 variant is included
+# and selected the same way simplepbr itself picks between the two, for
+# the same forward-compatibility reason, not because this app currently
+# needs it.
+_POSTPROCESS_VERT_120 = """#version 120
+
+uniform mat4 p3d_ModelViewProjectionMatrix;
+
+attribute vec4 p3d_Vertex;
+attribute vec2 p3d_MultiTexCoord0;
+
+varying vec2 v_texcoord;
+
+void main() {
+    v_texcoord = p3d_MultiTexCoord0;
+    gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
+}
+"""
+
+_POSTPROCESS_FRAG_120 = """#version 120
+
+uniform sampler2D tex;
+uniform float exposure;
+uniform float sstudio_contrast;
+uniform float sstudio_saturation;
+uniform vec3 sstudio_color_tint;
+uniform float sstudio_vignette_intensity;
+uniform float sstudio_grain_intensity;
+uniform vec2 sstudio_resolution;
+uniform float sstudio_time;
+
+varying vec2 v_texcoord;
+
+float sstudio_grain_hash(vec2 uv, float t) {
+    return fract(sin(dot(uv, vec2(12.9898, 78.233)) + t * 43.7585) * 43758.5453);
+}
+
+void main() {
+    vec4 tex_color = texture2D(tex, v_texcoord);
+    vec3 color = tex_color.rgb;
+
+    // Exposure + filmic tonemap: identical to simplepbr's own
+    // tonemap.frag, preserved exactly so all-neutral Post Processing
+    // settings reproduce the pre-4.3B image bit-for-bit.
+    color *= exposure;
+    color = max(vec3(0.0), color - vec3(0.004));
+    color = (color * (vec3(6.2) * color + vec3(0.5))) / (color * (vec3(6.2) * color + vec3(1.7)) + vec3(0.06));
+
+    // Contrast: centered around mid-gray, not a naive multiply (which
+    // would actually be brightness, not contrast).
+    color = (color - vec3(0.5)) * sstudio_contrast + vec3(0.5);
+
+    // Saturation: luminance-based mix toward Rec.709 grayscale, not
+    // per-channel scaling.
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    color = mix(vec3(luma), color, sstudio_saturation);
+
+    // Color tone: one multiplicative tint (white = no-op).
+    color *= sstudio_color_tint;
+
+    // Vignette: aspect-ratio-corrected radial falloff. At intensity=0
+    // this is an exact no-op (vig == 1.0 everywhere); it darkens only
+    // toward the frame edges via a smooth falloff, never a hard/flat
+    // black circle.
+    vec2 centered = v_texcoord - vec2(0.5);
+    centered.x *= sstudio_resolution.x / max(1.0, sstudio_resolution.y);
+    float dist = length(centered) * 1.4142135;
+    float vig = 1.0 - smoothstep(0.3, 0.9, dist) * sstudio_vignette_intensity;
+    color *= vig;
+
+    // Film grain: procedural per-pixel hash noise, time-varying, no
+    // texture asset involved. At intensity=0 this is an exact no-op.
+    float grain = sstudio_grain_hash(v_texcoord * sstudio_resolution, sstudio_time) - 0.5;
+    color += grain * sstudio_grain_intensity * 0.15;
+
+    color = clamp(color, vec3(0.0), vec3(1.0));
+
+    gl_FragColor = vec4(color, tex_color.a);
+}
+"""
+
+_POSTPROCESS_VERT_330 = """#version 330
+
+uniform mat4 p3d_ModelViewProjectionMatrix;
+
+in vec4 p3d_Vertex;
+in vec2 p3d_MultiTexCoord0;
+
+out vec2 v_texcoord;
+
+void main() {
+    v_texcoord = p3d_MultiTexCoord0;
+    gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
+}
+"""
+
+_POSTPROCESS_FRAG_330 = """#version 330
+
+uniform sampler2D tex;
+uniform float exposure;
+uniform float sstudio_contrast;
+uniform float sstudio_saturation;
+uniform vec3 sstudio_color_tint;
+uniform float sstudio_vignette_intensity;
+uniform float sstudio_grain_intensity;
+uniform vec2 sstudio_resolution;
+uniform float sstudio_time;
+
+in vec2 v_texcoord;
+out vec4 o_color;
+
+float sstudio_grain_hash(vec2 uv, float t) {
+    return fract(sin(dot(uv, vec2(12.9898, 78.233)) + t * 43.7585) * 43758.5453);
+}
+
+void main() {
+    vec4 tex_color = texture(tex, v_texcoord);
+    vec3 color = tex_color.rgb;
+
+    color *= exposure;
+    color = max(vec3(0.0), color - vec3(0.004));
+    color = (color * (vec3(6.2) * color + vec3(0.5))) / (color * (vec3(6.2) * color + vec3(1.7)) + vec3(0.06));
+
+    color = (color - vec3(0.5)) * sstudio_contrast + vec3(0.5);
+
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    color = mix(vec3(luma), color, sstudio_saturation);
+
+    color *= sstudio_color_tint;
+
+    vec2 centered = v_texcoord - vec2(0.5);
+    centered.x *= sstudio_resolution.x / max(1.0, sstudio_resolution.y);
+    float dist = length(centered) * 1.4142135;
+    float vig = 1.0 - smoothstep(0.3, 0.9, dist) * sstudio_vignette_intensity;
+    color *= vig;
+
+    float grain = sstudio_grain_hash(v_texcoord * sstudio_resolution, sstudio_time) - 0.5;
+    color += grain * sstudio_grain_intensity * 0.15;
+
+    color = clamp(color, vec3(0.0), vec3(1.0));
+
+    o_color = vec4(color, tex_color.a);
+}
+"""
+
 PLACEHOLDER_BODY_COLOR = color.rgb32(30, 130, 240)
 PLACEHOLDER_HEAD_COLOR = color.rgb32(195, 195, 195)
 PLACEHOLDER_FRONT_COLOR = color.rgb32(25, 25, 25)
@@ -1391,6 +1559,13 @@ class MultiplayerGame(Entity):
         # a test harness that never called main() -- every environment
         # write below is a no-op in that case, not a crash.
         self.pbr_pipeline = pbr_pipeline
+        # Stage 4.3B: installs the SStudio post-process shader (Contrast/
+        # Saturation/ColorTint/Vignette/Grain) exactly once, on the same
+        # quad simplepbr already owns -- see _install_postprocess_shader()
+        # for the full render-pipeline audit this relies on. A no-op when
+        # self.pbr_pipeline is None (simplepbr unavailable, or a test
+        # harness that never called main()).
+        self._install_postprocess_shader()
         # Last-applied Environment properties, purely to avoid redundantly
         # re-touching the DirectionalLight's shadow buffer (see
         # apply_environment_settings()'s docstring for why that specific
@@ -2772,6 +2947,8 @@ class MultiplayerGame(Entity):
 
             self.pbr_pipeline.exposure = float(properties.get("Exposure", 0.0))
 
+            self._apply_postprocess_uniforms(properties)
+
         shadows_enabled = bool(properties.get("ShadowsEnabled", True))
         # getattr(..., None), not self.sun.shadows: DirectionalLight's own
         # `shadows` default is applied via a ONE-FRAME-DEFERRED invoke()
@@ -2795,6 +2972,120 @@ class MultiplayerGame(Entity):
             lens = self.sun._light.get_lens()
             lens.set_near_far(-distance, distance)
             lens.set_film_size(distance * 2.0, distance * 2.0)
+
+    def _apply_postprocess_uniforms(self, properties: dict[str, Any]) -> None:
+        """Stage 4.3B: pushes Contrast/Saturation/ColorTint/VignetteIntensity/
+        GrainIntensity onto the SStudio post-process shader's uniforms --
+        called only from apply_environment_settings() (guarded by
+        self.pbr_pipeline is not None there), so this never runs with no
+        pipeline. Deliberately just set_shader_input() calls: values
+        update live on the ONE quad _install_postprocess_shader() built
+        once at startup, never recreating anything here (see that
+        method's docstring for the full "exactly one owned pipeline"
+        contract Play/Stop must not violate)."""
+        quad = getattr(self.pbr_pipeline, "_post_process_quad", None)
+        if quad is None:
+            return
+        quad.set_shader_input("sstudio_contrast", max(0.0, float(properties.get("Contrast", 1.0))))
+        quad.set_shader_input("sstudio_saturation", max(0.0, float(properties.get("Saturation", 1.0))))
+        tint = properties.get("ColorTint", [255.0, 255.0, 255.0])
+        quad.set_shader_input(
+            "sstudio_color_tint",
+            Vec3(float(tint[0]) / 255.0, float(tint[1]) / 255.0, float(tint[2]) / 255.0),
+        )
+        quad.set_shader_input(
+            "sstudio_vignette_intensity",
+            max(0.0, min(1.0, float(properties.get("VignetteIntensity", 0.0)))),
+        )
+        quad.set_shader_input(
+            "sstudio_grain_intensity",
+            max(0.0, min(1.0, float(properties.get("GrainIntensity", 0.0)))),
+        )
+
+    def _install_postprocess_shader(self) -> None:
+        """Stage 4.3B: installs SStudio's own Contrast/Saturation/ColorTint/
+        Vignette/Grain shader on simplepbr's EXISTING post-process quad,
+        called exactly once from __init__ (never from Play/Stop -- see
+        set_studio_playing(), which only ever calls
+        apply_environment_settings() to update this shader's uniforms,
+        the same live-update path Fog/Exposure/Ambient already use).
+
+        Render-pipeline audit this relies on (read directly from the
+        installed simplepbr==0.13.1 source, not assumed): simplepbr's
+        Pipeline.__post_init__() creates ONE FilterManager
+        (self._filtermgr) and, in _setup_tonemapping(), calls
+        self._filtermgr.render_scene_into(colortex=scene_tex, ...) --
+        this reroutes the real window's main camera to render the whole
+        PBR scene into an offscreen float16 texture (scene_tex), and
+        returns a fullscreen quad (postquad) that simplepbr displays to
+        the actual window running its own tonemap.frag (exposure + a
+        filmic curve). That quad is captured as
+        pipeline._post_process_quad -- i.e. simplepbr ALREADY implements
+        the exact "final color texture -> compositor -> display"
+        architecture this sprint asked for; there is nothing to build a
+        second FilterManager for. _setup_tonemapping() only runs again if
+        one of Pipeline's camera_node/msaa_samples/sdr_lut/window fields
+        is reassigned after init -- grep-confirmed nothing in this
+        codebase ever does that (only .enable_fog and .exposure are ever
+        touched post-init), so this quad and its shader live for the
+        whole process, safely.
+
+        Editor and Play share this exact same pipeline/quad -- there is
+        only one Ursina/Panda3D window and one camera for the whole
+        process (Play does not open a second window), so "visible in the
+        editor immediately, Play uses the same authored image treatment"
+        falls out of the architecture for free rather than needing
+        special-casing.
+
+        Window resize: the offscreen buffer FilterManager.render_scene_into()
+        creates auto-tracks the window's real size (stock Panda3D
+        FilterManager behavior -- simplepbr's own exposure/tonemap already
+        depends on this working, so it is a pre-existing guarantee, not a
+        new one introduced here). What does need explicit handling is the
+        sstudio_resolution uniform (used for vignette aspect-correction
+        and grain pixel-scale) and sstudio_time (grain animation) -- both
+        are refreshed every frame by one lightweight task, added once
+        below, alongside simplepbr's own per-frame update task."""
+        if self.pbr_pipeline is None:
+            return
+        quad = getattr(self.pbr_pipeline, "_post_process_quad", None)
+        if quad is None:
+            return
+
+        use_330 = bool(getattr(self.pbr_pipeline, "use_330", False))
+        vert_src = _POSTPROCESS_VERT_330 if use_330 else _POSTPROCESS_VERT_120
+        frag_src = _POSTPROCESS_FRAG_330 if use_330 else _POSTPROCESS_FRAG_120
+        shader = Shader.make(Shader.SL_GLSL, vert_src, frag_src)
+        quad.set_shader(shader)
+
+        scene_tex = quad.get_shader_input("tex").get_texture()
+        quad.set_shader_input("tex", scene_tex)
+        quad.set_shader_input("exposure", 2 ** self.pbr_pipeline.exposure)
+
+        # Neutral defaults (bit-identical to the pre-4.3B image); real
+        # authored values arrive via apply_environment_settings() right
+        # after this, on every path that already calls it (create_world()
+        # initial default, Place open, Play start/Stop restore, runtime
+        # Lua writes).
+        quad.set_shader_input("sstudio_contrast", 1.0)
+        quad.set_shader_input("sstudio_saturation", 1.0)
+        quad.set_shader_input("sstudio_color_tint", Vec3(1.0, 1.0, 1.0))
+        quad.set_shader_input("sstudio_vignette_intensity", 0.0)
+        quad.set_shader_input("sstudio_grain_intensity", 0.0)
+        quad.set_shader_input("sstudio_resolution", Vec3(float(window.size[0]), float(window.size[1]), 0.0).xy)
+        quad.set_shader_input("sstudio_time", 0.0)
+
+        def _update_postprocess_time(task: Any) -> int:
+            win = application.base.win
+            quad.set_shader_input("sstudio_resolution", (float(win.get_x_size()), float(win.get_y_size())))
+            quad.set_shader_input("sstudio_time", task.time)
+            return task.cont
+
+        # sort=50: right after simplepbr's own 'simplepbr update' task
+        # (sort=49), so grain/vignette always see this frame's final
+        # window size, not a stale one. Added exactly once for the whole
+        # process lifetime -- see this method's docstring.
+        application.base.taskMgr.add(_update_postprocess_time, "sstudio-postprocess-time", sort=50)
 
     def toggle_background(self) -> None:
         if self.background_mode == "sky":

@@ -33,6 +33,7 @@ whatever Pipeline it owns, not simplepbr's own correctness.
 """
 import os
 import sys
+from typing import Any
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, '.')
@@ -65,13 +66,29 @@ def check(condition: bool, message: str) -> None:
         print(f"ok: {message}")
 
 
+class _FakePostProcessQuad:
+    """Stands in for simplepbr's real post-process NodePath -- records
+    every set_shader_input() call by name, exactly like the existing
+    _FakePipeline stubs the two Pipeline attributes it needs. No real
+    shader compilation/GPU involved, matching this test file's own
+    documented convention (a real Pipeline needs a live graphics
+    context, which the objective behavior under test here does not)."""
+
+    def __init__(self) -> None:
+        self.inputs: dict[str, Any] = {}
+
+    def set_shader_input(self, name: str, value: Any) -> None:
+        self.inputs[name] = value
+
+
 class _FakePipeline:
-    """Stands in for simplepbr.Pipeline -- only the two attributes
+    """Stands in for simplepbr.Pipeline -- only the attributes
     apply_environment_settings() actually writes to."""
 
     def __init__(self) -> None:
         self.enable_fog = False
         self.exposure = 0.0
+        self._post_process_quad = _FakePostProcessQuad()
 
 
 class _FakeGame:
@@ -82,6 +99,7 @@ class _FakeGame:
 
     apply_environment_settings = cs.MultiplayerGame.apply_environment_settings
     apply_runtime_service_write = cs.MultiplayerGame.apply_runtime_service_write
+    _apply_postprocess_uniforms = cs.MultiplayerGame._apply_postprocess_uniforms
     _build_part_entity = cs.MultiplayerGame._build_part_entity
 
     def __init__(self, with_pipeline: bool = True) -> None:
@@ -435,6 +453,195 @@ def test_environment_lua_write_rejects_bad_types() -> None:
 # Pipeline ownership does not multiply
 # ============================================================
 
+# ============================================================
+# Stage 4.3B: post-processing (Contrast/Saturation/ColorTint/
+# VignetteIntensity/GrainIntensity)
+# ============================================================
+# The real GLSL shader (compiled against a live GPU) is deliberately NOT
+# exercised here -- same "a real Pipeline needs a live graphics context"
+# reasoning as the rest of this file. What IS objectively testable
+# headlessly, and is tested below: schema/defaults, validation/ranges,
+# save/open, that _apply_postprocess_uniforms() pushes the RIGHT values
+# to whatever quad it's given (via _FakePostProcessQuad), Lua read/write,
+# and the session-only runtime-overlay/Stop-restore contract every other
+# Environment property already has. The real shader's actual visual
+# behavior (tex binding survives set_shader(), neutral vs authored is an
+# obvious difference, grain is genuinely time-varying, FPS impact,
+# resize survival) was verified with a real window+GPU diagnostic; see
+# the Stage 4.3B completion report for that evidence -- it is
+# intentionally not a permanent automated test, matching this project's
+# established convention that pixel-perfect rendering facts live in a
+# one-time audit, not a headless test file.
+
+_POSTPROCESS_DEFAULTS = {
+    "Contrast": 1.0,
+    "Saturation": 1.0,
+    "ColorTint": [255.0, 255.0, 255.0],
+    "VignetteIntensity": 0.0,
+    "GrainIntensity": 0.0,
+}
+
+
+def test_postprocess_schema_and_defaults() -> None:
+    descriptor = datamodel_schema.get_class("Environment")
+    by_name = {p.name: p for p in descriptor.properties}
+    for name, expected_default in _POSTPROCESS_DEFAULTS.items():
+        check(name in by_name, f"Environment declares {name}")
+        check(by_name[name].category == "Post Processing", f"{name} is grouped under the 'Post Processing' Inspector category")
+        check(by_name[name].default == expected_default, f"{name} default is {expected_default} (a true no-op)")
+    defaults = datamodel_schema.default_properties("Environment")
+    for name, expected_default in _POSTPROCESS_DEFAULTS.items():
+        check(defaults.get(name) == expected_default, f"default_properties('Environment') includes {name}={expected_default}")
+
+
+def test_postprocess_validation_rejects_out_of_range_values() -> None:
+    cases = [
+        ("Contrast", -0.5), ("Contrast", 3.5),
+        ("Saturation", -1.0), ("Saturation", 10.0),
+        ("VignetteIntensity", -0.1), ("VignetteIntensity", 1.5),
+        ("GrainIntensity", -0.1), ("GrainIntensity", 2.0),
+    ]
+    for name, bad_value in cases:
+        result = datamodel_schema.validate_property_value("Environment", name, bad_value)
+        check(not result.ok, f"{name}={bad_value} is rejected as out of range")
+    ok_contrast = datamodel_schema.validate_property_value("Environment", "Contrast", 2.0)
+    check(ok_contrast.ok and ok_contrast.value == 2.0, "an in-range Contrast value is accepted")
+    ok_tint = datamodel_schema.validate_property_value("Environment", "ColorTint", [200.0, 210.0, 255.0])
+    check(ok_tint.ok, "a 3-component ColorTint is accepted")
+
+
+def test_postprocess_persists_through_save_open() -> None:
+    import tempfile
+    import place_manager as pm
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = tmp_dir + "\\postprocess_roundtrip.nebula.json"
+        services = datamodel_schema.sanitize_services_snapshot({
+            "Environment": {
+                "Contrast": 1.3, "Saturation": 0.6, "ColorTint": [210.0, 220.0, 255.0],
+                "VignetteIntensity": 0.4, "GrainIntensity": 0.2,
+            }
+        })
+        manager = pm.PlaceManager()
+        save_result = manager.save_as(path, [], services)
+        check(save_result.success, f"saving custom Post Processing settings succeeds: {save_result.message}")
+
+        reopened = pm.PlaceManager().open(path)
+        check(reopened.success, f"reopening succeeds: {reopened.message}")
+        env = (reopened.services or {}).get("Environment", {})
+        check(env.get("Contrast") == 1.3, "Contrast survives save/open")
+        check(env.get("Saturation") == 0.6, "Saturation survives save/open")
+        check(env.get("ColorTint") == [210.0, 220.0, 255.0], "ColorTint survives save/open")
+        check(env.get("VignetteIntensity") == 0.4, "VignetteIntensity survives save/open")
+        check(env.get("GrainIntensity") == 0.2, "GrainIntensity survives save/open")
+
+
+def test_apply_postprocess_uniforms_writes_correct_values_to_the_quad() -> None:
+    game = _FakeGame()
+    try:
+        game.apply_environment_settings({
+            "Contrast": 1.4, "Saturation": 0.5, "ColorTint": [200.0, 210.0, 255.0],
+            "VignetteIntensity": 0.6, "GrainIntensity": 0.3,
+        })
+        inputs = game.pbr_pipeline._post_process_quad.inputs
+        check(inputs.get("sstudio_contrast") == 1.4, "Contrast reaches the real quad's shader input")
+        check(inputs.get("sstudio_saturation") == 0.5, "Saturation reaches the real quad's shader input")
+        tint = inputs.get("sstudio_color_tint")
+        check(tint is not None and abs(tint.x - 200.0/255.0) < 0.001 and abs(tint.y - 210.0/255.0) < 0.001 and abs(tint.z - 1.0) < 0.001, f"ColorTint is converted from 0-255 to a 0-1 Vec3, got {tint}")
+        check(abs(inputs.get("sstudio_vignette_intensity", -1) - 0.6) < 0.001, "VignetteIntensity reaches the quad")
+        check(abs(inputs.get("sstudio_grain_intensity", -1) - 0.3) < 0.001, "GrainIntensity reaches the quad")
+    finally:
+        game.teardown()
+
+
+def test_apply_postprocess_uniforms_neutral_defaults_are_true_noop() -> None:
+    game = _FakeGame()
+    try:
+        game.apply_environment_settings(dict(_POSTPROCESS_DEFAULTS, FogEnabled=False))
+        inputs = game.pbr_pipeline._post_process_quad.inputs
+        check(inputs.get("sstudio_contrast") == 1.0, "neutral Contrast is exactly 1.0")
+        check(inputs.get("sstudio_saturation") == 1.0, "neutral Saturation is exactly 1.0")
+        tint = inputs.get("sstudio_color_tint")
+        check(tint is not None and tint.x == 1.0 and tint.y == 1.0 and tint.z == 1.0, "neutral ColorTint is exactly white (1,1,1), a true shader no-op")
+        check(inputs.get("sstudio_vignette_intensity") == 0.0, "neutral VignetteIntensity is exactly 0.0 (disable path)")
+        check(inputs.get("sstudio_grain_intensity") == 0.0, "neutral GrainIntensity is exactly 0.0 (disable path)")
+    finally:
+        game.teardown()
+
+
+def test_apply_postprocess_uniforms_clamps_defensively() -> None:
+    """Belt-and-suspenders clamp inside apply_environment_settings() itself
+    (same precedent as AmbientIntensity's max(0.0, ...)) -- schema
+    validation already rejects out-of-range values on every real entry
+    path (Inspector/Lua/save-open), but this is a second, independent
+    guard against a bad value ever reaching the live shader uniform."""
+    game = _FakeGame()
+    try:
+        game.apply_environment_settings({"VignetteIntensity": 5.0, "GrainIntensity": -3.0, "Contrast": -1.0, "Saturation": -1.0})
+        inputs = game.pbr_pipeline._post_process_quad.inputs
+        check(inputs.get("sstudio_vignette_intensity") == 1.0, "an out-of-range VignetteIntensity is clamped to 1.0, not passed through raw")
+        check(inputs.get("sstudio_grain_intensity") == 0.0, "an out-of-range negative GrainIntensity is clamped to 0.0")
+        check(inputs.get("sstudio_contrast") == 0.0, "a negative Contrast is clamped to 0.0 (no negative-contrast inversion)")
+        check(inputs.get("sstudio_saturation") == 0.0, "a negative Saturation is clamped to 0.0")
+    finally:
+        game.teardown()
+
+
+def test_postprocess_runtime_lua_write_applies_live_but_does_not_persist() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        game.services = datamodel_schema.sanitize_services_snapshot({"Environment": {"Contrast": 1.0, "VignetteIntensity": 0.0}})
+        game.apply_environment_settings(game.services["Environment"])
+        neutral_vignette = game.pbr_pipeline._post_process_quad.inputs.get("sstudio_vignette_intensity")
+
+        ok, err = manager.scene.set_property("Environment", "VignetteIntensity", 0.8)
+        check(ok, f"Environment.VignetteIntensity = 0.8 from Lua succeeds: {err}")
+        live_vignette = game.pbr_pipeline._post_process_quad.inputs.get("sstudio_vignette_intensity")
+        check(live_vignette == 0.8, "the runtime Lua write reaches the live shader uniform immediately")
+        check(game.services["Environment"]["VignetteIntensity"] == 0.0, "...but the persisted services dict is untouched (session-only, same contract as Fog/Exposure/Ambient)")
+
+        # Simulate Stop's restore step.
+        game.apply_environment_settings(game.services.get("Environment", {}))
+        restored_vignette = game.pbr_pipeline._post_process_quad.inputs.get("sstudio_vignette_intensity")
+        check(restored_vignette == neutral_vignette == 0.0, "re-applying the persisted Environment (Stop's restore step) brings VignetteIntensity back to the authored neutral value")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_postprocess_lua_write_rejects_bad_values() -> None:
+    game = _FakeGame()
+    manager, ctx = make_context(game)
+    try:
+        ok, err = manager.scene.set_property("Environment", "Contrast", 10.0)
+        check(not ok, "an out-of-range Contrast write from Lua is rejected")
+        ok, err = manager.scene.set_property("Environment", "GrainIntensity", "heavy")
+        check(not ok, "a non-numeric GrainIntensity write from Lua is rejected")
+    finally:
+        teardown(game, manager, ctx)
+
+
+def test_install_postprocess_shader_is_the_only_shader_install_call_site() -> None:
+    """Stage 4.3B resource-lifecycle requirement: exactly one owned
+    post-process pipeline for the whole process. _install_postprocess_shader()
+    is called exactly once (from __init__, right after self.pbr_pipeline
+    is set) -- Play/Stop (set_studio_playing()) only ever call
+    apply_environment_settings() to update uniforms on the SAME quad,
+    never rebuilding/reinstalling the shader. A source-level guard, not a
+    real-GPU test, matching this file's existing
+    test_simplepbr_init_is_called_exactly_once_in_source() precedent."""
+    import inspect
+    source = inspect.getsource(cs)
+    call_lines = [
+        line for line in source.splitlines()
+        if line.strip() == "self._install_postprocess_shader()"
+    ]
+    check(len(call_lines) == 1, f"_install_postprocess_shader() is called exactly once in client_studio.py (found: {call_lines})")
+
+    playing_source = inspect.getsource(cs.MultiplayerGame.set_studio_playing)
+    check("_install_postprocess_shader" not in playing_source, "set_studio_playing() (Play/Stop) never re-installs the post-process shader -- only apply_environment_settings() (uniform updates) runs there")
+
+
 def test_simplepbr_init_is_called_exactly_once_in_source() -> None:
     """Static guard against a future accidental second simplepbr.init()
     call anywhere in client_studio.py -- the whole point of capturing and
@@ -470,6 +677,15 @@ test_repeated_identical_apply_does_not_retouch_shadow_caster()
 test_changed_shadow_distance_does_retouch_lens_but_not_necessarily_caster()
 test_environment_runtime_write_applies_live_but_does_not_persist()
 test_environment_lua_write_rejects_bad_types()
+test_postprocess_schema_and_defaults()
+test_postprocess_validation_rejects_out_of_range_values()
+test_postprocess_persists_through_save_open()
+test_apply_postprocess_uniforms_writes_correct_values_to_the_quad()
+test_apply_postprocess_uniforms_neutral_defaults_are_true_noop()
+test_apply_postprocess_uniforms_clamps_defensively()
+test_postprocess_runtime_lua_write_applies_live_but_does_not_persist()
+test_postprocess_lua_write_rejects_bad_values()
+test_install_postprocess_shader_is_the_only_shader_install_call_site()
 test_simplepbr_init_is_called_exactly_once_in_source()
 
 print()
